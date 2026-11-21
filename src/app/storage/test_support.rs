@@ -44,5 +44,5 @@ pub(crate) async fn seed_dedicated_instance(
     InstanceRepository::new(pool.clone())
         .upsert(&metadata)
         .await
-        .unwrap();
+        .expect("upsert should succeed");
 }

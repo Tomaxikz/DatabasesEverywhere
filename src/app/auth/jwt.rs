@@ -205,39 +205,40 @@ mod tests {
     use crate::auth::scopes;
 
     #[test]
-    fn accepts_required_scope_and_instance() {
+    fn accepts_required_scope_and_instance() -> anyhow::Result<()> {
         let secret = b"secret";
         let token = encode(
             &Header::default(),
             &claims(scopes::MONITOR_READ, "inst_abc", 3600),
-            &EncodingKey::from_secret(secret).unwrap(),
-        )
-        .unwrap();
+            &EncodingKey::from_secret(secret)?,
+        )?;
 
-        let claims =
-            validate_ws_token(&token, secret, scopes::MONITOR_READ, Some("inst_abc")).unwrap();
+        let claims = validate_ws_token(&token, secret, scopes::MONITOR_READ, Some("inst_abc"))?;
 
         assert_eq!(claims.sub, "admin");
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_missing_scope() {
+    fn rejects_missing_scope() -> anyhow::Result<()> {
         let secret = b"secret";
         let token = encode(
             &Header::default(),
             &claims(scopes::LOGS_READ, "inst_abc", 3600),
-            &EncodingKey::from_secret(secret).unwrap(),
-        )
-        .unwrap();
+            &EncodingKey::from_secret(secret)?,
+        )?;
 
-        let error =
-            validate_ws_token(&token, secret, scopes::MONITOR_READ, Some("inst_abc")).unwrap_err();
+        let error = validate_ws_token(&token, secret, scopes::MONITOR_READ, Some("inst_abc"))
+            .expect_err("validate ws token should return an error");
 
         assert!(matches!(error, JwtAuthError::MissingScope { .. }));
+
+        Ok(())
     }
 
     #[test]
-    fn instance_scope_rejects_foreign_and_empty_instance_claims() {
+    fn instance_scope_rejects_foreign_and_empty_instance_claims() -> anyhow::Result<()> {
         let secret = b"secret";
         for instances in [vec!["inst_abc".to_string()], Vec::new()] {
             let mut claims = claims(scopes::LOGS_READ, "inst_abc", 3600);
@@ -245,18 +246,19 @@ mod tests {
             let token = encode(
                 &Header::default(),
                 &claims,
-                &EncodingKey::from_secret(secret).unwrap(),
-            )
-            .unwrap();
+                &EncodingKey::from_secret(secret)?,
+            )?;
             assert!(matches!(
                 validate_ws_token(&token, secret, scopes::LOGS_READ, Some("inst_other")),
                 Err(JwtAuthError::MissingInstance { .. })
             ));
         }
+
+        Ok(())
     }
 
     #[test]
-    fn explicit_node_wide_claim_allows_other_instances() {
+    fn explicit_node_wide_claim_allows_other_instances() -> anyhow::Result<()> {
         let secret = b"secret";
         let mut claims = claims(scopes::LOGS_READ, "inst_abc", 3600);
         claims.instances.clear();
@@ -264,44 +266,47 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(secret).unwrap(),
-        )
-        .unwrap();
+            &EncodingKey::from_secret(secret)?,
+        )?;
 
-        validate_ws_token(&token, secret, scopes::LOGS_READ, Some("inst_other")).unwrap();
+        validate_ws_token(&token, secret, scopes::LOGS_READ, Some("inst_other"))?;
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_expired_token_without_clock_skew_leeway() {
+    fn rejects_expired_token_without_clock_skew_leeway() -> anyhow::Result<()> {
         let secret = b"secret";
         let token = encode(
             &Header::default(),
             &claims(scopes::MONITOR_READ, "inst_abc", -1),
-            &EncodingKey::from_secret(secret).unwrap(),
-        )
-        .unwrap();
+            &EncodingKey::from_secret(secret)?,
+        )?;
 
-        let error =
-            validate_ws_token(&token, secret, scopes::MONITOR_READ, Some("inst_abc")).unwrap_err();
+        let error = validate_ws_token(&token, secret, scopes::MONITOR_READ, Some("inst_abc"))
+            .expect_err("validate ws token should return an error");
 
         assert!(matches!(error, JwtAuthError::Invalid(_)));
+
+        Ok(())
     }
 
     #[test]
-    fn rate_limit_identity_requires_a_valid_signature() {
+    fn rate_limit_identity_requires_a_valid_signature() -> anyhow::Result<()> {
         let claims = claims(scopes::MONITOR_READ, "inst_abc", 60);
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"other-secret").unwrap(),
-        )
-        .unwrap();
+            &EncodingKey::from_secret(b"other-secret")?,
+        )?;
 
         assert!(validated_token_jti(&token, b"secret").is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn issued_token_validates() {
+    fn issued_token_validates() -> anyhow::Result<()> {
         let secret = b"secret";
         let (token, exp) = issue_ws_token(
             secret,
@@ -316,14 +321,14 @@ mod tests {
                 )])),
             },
             60,
-        )
-        .unwrap();
+        )?;
 
-        let claims =
-            validate_ws_token(&token, secret, scopes::MONITOR_READ, Some("inst_abc")).unwrap();
+        let claims = validate_ws_token(&token, secret, scopes::MONITOR_READ, Some("inst_abc"))?;
 
         assert_eq!(claims.sub, "panel");
         assert_eq!(claims.exp, exp);
+
+        Ok(())
     }
 
     fn claims(scope: &str, instance_id: &str, ttl_seconds: i64) -> Claims {

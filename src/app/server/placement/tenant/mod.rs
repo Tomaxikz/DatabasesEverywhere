@@ -319,11 +319,13 @@ pub(crate) enum TenantEngineError {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn storage_output_is_strict_and_ordered() {
-        assert_eq!(parse_storage("12\n0\n", 2).unwrap(), vec![12, 0]);
+    fn storage_output_is_strict_and_ordered() -> anyhow::Result<()> {
+        assert_eq!(parse_storage("12\n0\n", 2)?, vec![12, 0]);
         assert!(matches!(
             parse_storage("column\n12\n", 1),
             Err(TenantEngineError::InvalidStorage(_))
@@ -335,30 +337,41 @@ mod tests {
                 actual: 1
             })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn rollback_gap_output_is_one_strict_count() {
-        assert_eq!(parse_rollback_gap("0\n").unwrap(), 0);
-        assert_eq!(parse_rollback_gap("12\n").unwrap(), 12);
+    fn rollback_gap_output_is_one_strict_count() -> anyhow::Result<()> {
+        assert_eq!(parse_rollback_gap("0\n")?, 0);
+        assert_eq!(parse_rollback_gap("12\n")?, 12);
         for invalid in ["", "-1", "1\n2", "count\n0"] {
             assert!(matches!(
                 parse_rollback_gap(invalid),
                 Err(TenantEngineError::InvalidRollbackObjectCount(_))
             ));
         }
+
+        Ok(())
     }
 
     #[test]
-    fn clickhouse_window_captures_cutoff_before_flushing_and_bounds_the_client() {
+    fn clickhouse_window_captures_cutoff_before_flushing_and_bounds_the_client()
+    -> anyhow::Result<()> {
         let script = clickhouse_telemetry_script(
             None,
             "SELECT 1 WHERE x > {dbe_previous:Int64} AND x <= {dbe_cutoff:Int64}",
         );
         let command = telemetry_command(script.clone());
-        let cutoff = script.find("toUnixTimestamp64Micro(now64(6))").unwrap();
-        let flush = script.find("SYSTEM FLUSH LOGS").unwrap();
-        let aggregate = script.find("--param_dbe_previous").unwrap();
+        let cutoff = script
+            .find("toUnixTimestamp64Micro(now64(6))")
+            .context("expected a value from find")?;
+        let flush = script
+            .find("SYSTEM FLUSH LOGS")
+            .context("expected a value from find")?;
+        let aggregate = script
+            .find("--param_dbe_previous")
+            .context("expected a value from find")?;
 
         assert!(command.starts_with("exec timeout -k 1s 6s sh -c "));
         assert!(cutoff < flush && flush < aggregate);
@@ -366,6 +379,8 @@ mod tests {
         assert!(script.contains("previous=\"$cutoff\""));
         assert!(script.contains("--max_execution_time 3"));
         assert!(script.contains("--timeout_before_checking_execution_speed 0"));
+
+        Ok(())
     }
 
     #[test]

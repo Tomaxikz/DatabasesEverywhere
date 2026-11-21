@@ -360,18 +360,17 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[tokio::test]
-    async fn server_advertises_a_finite_concurrent_stream_limit() {
+    async fn server_advertises_a_finite_concurrent_stream_limit() -> anyhow::Result<()> {
         let (client_io, server_io) = tokio::io::duplex(1024);
         let server_task = tokio::spawn(async move {
-            let mut server = server_handshake(server_io).await.unwrap();
+            let mut server = server_handshake(server_io)
+                .await
+                .expect("server handshake should succeed");
             let _ = server.accept().await;
         });
-        let (client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (client, connection) = h2::client::handshake(client_io).await?;
         let client_driver = tokio::spawn(connection);
-        let client = timeout(TEST_TIMEOUT, client.ready())
-            .await
-            .unwrap()
-            .unwrap();
+        let client = timeout(TEST_TIMEOUT, client.ready()).await??;
         timeout(TEST_TIMEOUT, async {
             while client.current_max_send_streams() == usize::MAX {
                 tokio::task::yield_now().await;
@@ -388,18 +387,22 @@ mod tests {
         drop(client);
         client_driver.abort();
         server_task.abort();
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn server_rejects_header_lists_over_the_configured_limit() {
+    async fn server_rejects_header_lists_over_the_configured_limit() -> anyhow::Result<()> {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server_task = tokio::spawn(async move {
-            let mut server = server_handshake(server_io).await.unwrap();
+            let mut server = server_handshake(server_io)
+                .await
+                .expect("server handshake should succeed");
             server.accept().await
         });
-        let (client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (client, connection) = h2::client::handshake(client_io).await?;
         let client_driver = tokio::spawn(connection);
-        let mut client = client.ready().await.unwrap();
+        let mut client = client.ready().await?;
         let request = Request::builder()
             .method("POST")
             .uri("http://qdrant.test/qdrant.Points/Upsert")
@@ -408,8 +411,7 @@ mod tests {
                 "x-oversized-metadata",
                 "x".repeat(MAX_HEADER_LIST_SIZE as usize + 1024),
             )
-            .body(())
-            .unwrap();
+            .body(())?;
 
         match client.send_request(request, true) {
             Ok((response, _)) => {
@@ -429,6 +431,8 @@ mod tests {
         }
 
         client_driver.abort();
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -448,26 +452,36 @@ mod tests {
         });
 
         timeout(TEST_TIMEOUT, async move {
-            let (client, connection) = h2::client::handshake(client_io).await.unwrap();
+            let (client, connection) = h2::client::handshake(client_io)
+                .await
+                .expect("handshake should succeed");
             let client_driver = tokio::spawn(connection);
-            let mut client = client.ready().await.unwrap();
+            let mut client = client.ready().await.expect("ready should succeed");
             let request = Request::builder()
                 .method("POST")
                 .uri("http://qdrant.test/qdrant.Points/Upsert")
                 .version(Version::HTTP_2)
                 .header(API_KEY_HEADER, "secret")
                 .body(())
-                .unwrap();
-            let (response, mut body) = client.send_request(request, false).unwrap();
+                .expect("body should succeed");
+            let (response, mut body) = client
+                .send_request(request, false)
+                .expect("send request should succeed");
             send_with_backpressure(&mut body, Bytes::from(request_body), true, TEST_TIMEOUT)
                 .await
-                .unwrap();
+                .expect("send with backpressure should succeed");
 
-            let response = response.await.unwrap();
+            let response = response.await.expect(
+                "proxy releases flow control for large request and response bodies should succeed",
+            );
             assert_eq!(read_body(response.into_body()).await, response_body);
 
-            proxy_task.await.unwrap();
-            backend_task.await.unwrap();
+            proxy_task.await.expect(
+                "proxy releases flow control for large request and response bodies should succeed",
+            );
+            backend_task.await.expect(
+                "proxy releases flow control for large request and response bodies should succeed",
+            );
             client_driver.abort();
         })
         .await
@@ -484,20 +498,26 @@ mod tests {
             backend_io,
             move |request, mut respond| async move {
                 let mut request_body = request.into_body();
-                let first = request_body.data().await.unwrap().unwrap();
+                let first = request_body
+                    .data()
+                    .await
+                    .expect("expected a value from data")
+                    .expect("data should succeed");
                 let received = first.len();
                 assert_eq!(first, Bytes::from_static(b"request-before-response"));
                 request_body
                     .flow_control()
                     .release_capacity(received)
-                    .unwrap();
+                    .expect("release capacity should succeed");
 
                 let response = Response::builder()
                     .status(400)
                     .version(Version::HTTP_2)
                     .body(())
-                    .unwrap();
-                let mut response_body = respond.send_response(response, false).unwrap();
+                    .expect("body should succeed");
+                let mut response_body = respond
+                    .send_response(response, false)
+                    .expect("send response should succeed");
                 send_with_backpressure(
                     &mut response_body,
                     Bytes::from_static(b"rejected"),
@@ -505,12 +525,14 @@ mod tests {
                     TEST_TIMEOUT,
                 )
                 .await
-                .unwrap();
+                .expect("from static should succeed");
                 // Keep the backend request handle alive until the client has
                 // consumed the early response and closed its upload. Dropping
                 // it here would manufacture a stream-wide NO_ERROR reset that
                 // can legally race the queued response DATA.
-                upload_closed_rx.await.unwrap();
+                upload_closed_rx.await.expect(
+                    "proxy forwards an early rejection before the request ends should succeed",
+                );
                 drop(request_body);
             },
         ));
@@ -520,17 +542,21 @@ mod tests {
         ));
 
         timeout(TEST_TIMEOUT, async move {
-            let (client, connection) = h2::client::handshake(client_io).await.unwrap();
+            let (client, connection) = h2::client::handshake(client_io)
+                .await
+                .expect("handshake should succeed");
             let client_driver = tokio::spawn(connection);
-            let mut client = client.ready().await.unwrap();
+            let mut client = client.ready().await.expect("ready should succeed");
             let request = Request::builder()
                 .method("POST")
                 .uri("http://qdrant.test/qdrant.Points/Upsert")
                 .version(Version::HTTP_2)
                 .header(API_KEY_HEADER, "secret")
                 .body(())
-                .unwrap();
-            let (response, mut request_body) = client.send_request(request, false).unwrap();
+                .expect("body should succeed");
+            let (response, mut request_body) = client
+                .send_request(request, false)
+                .expect("send request should succeed");
             send_with_backpressure(
                 &mut request_body,
                 Bytes::from_static(b"request-before-response"),
@@ -538,18 +564,24 @@ mod tests {
                 TEST_TIMEOUT,
             )
             .await
-            .unwrap();
+            .expect("from static should succeed");
 
             // Waiting for this response before ending the request deadlocked
             // when the proxy serialized request and response forwarding.
-            let response = response.await.unwrap();
+            let response = response
+                .await
+                .expect("proxy forwards an early rejection before the request ends should succeed");
             assert_eq!(response.status(), 400);
             assert_eq!(read_body(response.into_body()).await, b"rejected");
             drop(request_body);
-            upload_closed_tx.send(()).unwrap();
+            upload_closed_tx.send(()).expect("send should succeed");
 
-            proxy_task.await.unwrap();
-            backend_task.await.unwrap();
+            proxy_task
+                .await
+                .expect("proxy forwards an early rejection before the request ends should succeed");
+            backend_task
+                .await
+                .expect("proxy forwards an early rejection before the request ends should succeed");
             client_driver.abort();
         })
         .await
@@ -565,20 +597,26 @@ mod tests {
             backend_io,
             |request, mut respond| async move {
                 let mut request_body = request.into_body();
-                let first = request_body.data().await.unwrap().unwrap();
+                let first = request_body
+                    .data()
+                    .await
+                    .expect("expected a value from data")
+                    .expect("data should succeed");
                 let received = first.len();
                 assert_eq!(first, Bytes::from_static(b"request-one"));
                 request_body
                     .flow_control()
                     .release_capacity(received)
-                    .unwrap();
+                    .expect("release capacity should succeed");
 
                 let response = Response::builder()
                     .status(200)
                     .version(Version::HTTP_2)
                     .body(())
-                    .unwrap();
-                let mut response_body = respond.send_response(response, false).unwrap();
+                    .expect("body should succeed");
+                let mut response_body = respond
+                    .send_response(response, false)
+                    .expect("send response should succeed");
                 send_with_backpressure(
                     &mut response_body,
                     Bytes::from_static(b"response-one"),
@@ -586,7 +624,7 @@ mod tests {
                     TEST_TIMEOUT,
                 )
                 .await
-                .unwrap();
+                .expect("from static should succeed");
 
                 assert_eq!(read_body(request_body).await, b"request-two");
                 send_with_backpressure(
@@ -596,23 +634,27 @@ mod tests {
                     TEST_TIMEOUT,
                 )
                 .await
-                .unwrap();
+                .expect("from static should succeed");
             },
         ));
         let proxy_task = tokio::spawn(run_proxy_once(proxy_client_io, proxy_backend_io));
 
         timeout(TEST_TIMEOUT, async move {
-            let (client, connection) = h2::client::handshake(client_io).await.unwrap();
+            let (client, connection) = h2::client::handshake(client_io)
+                .await
+                .expect("handshake should succeed");
             let client_driver = tokio::spawn(connection);
-            let mut client = client.ready().await.unwrap();
+            let mut client = client.ready().await.expect("ready should succeed");
             let request = Request::builder()
                 .method("POST")
                 .uri("http://qdrant.test/qdrant.Points/Upsert")
                 .version(Version::HTTP_2)
                 .header(API_KEY_HEADER, "secret")
                 .body(())
-                .unwrap();
-            let (response, mut request_body) = client.send_request(request, false).unwrap();
+                .expect("body should succeed");
+            let (response, mut request_body) = client
+                .send_request(request, false)
+                .expect("send request should succeed");
             send_with_backpressure(
                 &mut request_body,
                 Bytes::from_static(b"request-one"),
@@ -620,17 +662,23 @@ mod tests {
                 TEST_TIMEOUT,
             )
             .await
-            .unwrap();
+            .expect("from static should succeed");
 
-            let response = response.await.unwrap();
+            let response = response
+                .await
+                .expect("proxy pumps bidirectional stream bodies concurrently should succeed");
             let mut response_body = response.into_body();
-            let first = response_body.data().await.unwrap().unwrap();
+            let first = response_body
+                .data()
+                .await
+                .expect("expected a value from data")
+                .expect("data should succeed");
             let received = first.len();
             assert_eq!(first, Bytes::from_static(b"response-one"));
             response_body
                 .flow_control()
                 .release_capacity(received)
-                .unwrap();
+                .expect("release capacity should succeed");
 
             send_with_backpressure(
                 &mut request_body,
@@ -639,11 +687,15 @@ mod tests {
                 TEST_TIMEOUT,
             )
             .await
-            .unwrap();
+            .expect("from static should succeed");
             assert_eq!(read_body(response_body).await, b"response-two");
 
-            proxy_task.await.unwrap();
-            backend_task.await.unwrap();
+            proxy_task
+                .await
+                .expect("proxy pumps bidirectional stream bodies concurrently should succeed");
+            backend_task
+                .await
+                .expect("proxy pumps bidirectional stream bodies concurrently should succeed");
             client_driver.abort();
         })
         .await
@@ -657,14 +709,28 @@ mod tests {
         let stall_timeout = Duration::from_millis(25);
 
         let backend_task = tokio::spawn(async move {
-            let mut server = server_handshake(backend_io).await.unwrap();
-            let _request = server.accept().await.unwrap().unwrap();
+            let mut server = server_handshake(backend_io)
+                .await
+                .expect("server handshake should succeed");
+            let _request = server
+                .accept()
+                .await
+                .expect("expected a value from accept")
+                .expect("accept should succeed");
             std::future::pending::<()>().await;
         });
         let proxy_task = tokio::spawn(async move {
-            let mut server = server_handshake(proxy_client_io).await.unwrap();
-            let (request, respond) = server.accept().await.unwrap().unwrap();
-            let mut backend = client_handshake(proxy_backend_io).await.unwrap();
+            let mut server = server_handshake(proxy_client_io)
+                .await
+                .expect("server handshake should succeed");
+            let (request, respond) = server
+                .accept()
+                .await
+                .expect("expected a value from accept")
+                .expect("accept should succeed");
+            let mut backend = client_handshake(proxy_backend_io)
+                .await
+                .expect("client handshake should succeed");
             let proxy = proxy_request_timed(request, respond, &mut backend, stall_timeout);
             tokio::pin!(proxy);
 
@@ -681,17 +747,21 @@ mod tests {
         });
 
         timeout(TEST_TIMEOUT, async move {
-            let (client, connection) = h2::client::handshake(client_io).await.unwrap();
+            let (client, connection) = h2::client::handshake(client_io)
+                .await
+                .expect("handshake should succeed");
             let client_driver = tokio::spawn(connection);
-            let mut client = client.ready().await.unwrap();
+            let mut client = client.ready().await.expect("ready should succeed");
             let request = Request::builder()
                 .method("POST")
                 .uri("http://qdrant.test/qdrant.Points/Upsert")
                 .version(Version::HTTP_2)
                 .header(API_KEY_HEADER, "secret")
                 .body(())
-                .unwrap();
-            let (response, request_body) = client.send_request(request, false).unwrap();
+                .expect("body should succeed");
+            let (response, request_body) = client
+                .send_request(request, false)
+                .expect("send request should succeed");
 
             tokio::time::sleep(stall_timeout * 3).await;
             assert!(
@@ -728,9 +798,17 @@ mod tests {
         backend_io: tokio::io::DuplexStream,
         allow_stream_local_failure: bool,
     ) {
-        let mut server = server_handshake(client_io).await.unwrap();
-        let (request, respond) = server.accept().await.unwrap().unwrap();
-        let mut backend = client_handshake(backend_io).await.unwrap();
+        let mut server = server_handshake(client_io)
+            .await
+            .expect("server handshake should succeed");
+        let (request, respond) = server
+            .accept()
+            .await
+            .expect("expected a value from accept")
+            .expect("accept should succeed");
+        let mut backend = client_handshake(backend_io)
+            .await
+            .expect("client handshake should succeed");
         let proxy = proxy_request_timed(request, respond, &mut backend, TEST_TIMEOUT);
         tokio::pin!(proxy);
 
@@ -769,11 +847,13 @@ mod tests {
                 .status(200)
                 .version(Version::HTTP_2)
                 .body(())
-                .unwrap();
-            let mut body = respond.send_response(response, false).unwrap();
+                .expect("body should succeed");
+            let mut body = respond
+                .send_response(response, false)
+                .expect("send response should succeed");
             send_with_backpressure(&mut body, Bytes::from(response_body), true, TEST_TIMEOUT)
                 .await
-                .unwrap();
+                .expect("send with backpressure should succeed");
         })
         .await;
     }
@@ -783,8 +863,14 @@ mod tests {
         F: FnOnce(Request<RecvStream>, SendResponse<Bytes>) -> Fut,
         Fut: Future<Output = ()>,
     {
-        let mut server = server_handshake(backend_io).await.unwrap();
-        let (request, respond) = server.accept().await.unwrap().unwrap();
+        let mut server = server_handshake(backend_io)
+            .await
+            .expect("server handshake should succeed");
+        let (request, respond) = server
+            .accept()
+            .await
+            .expect("expected a value from accept")
+            .expect("accept should succeed");
         let handler = handler(request, respond);
         tokio::pin!(handler);
 
@@ -811,12 +897,14 @@ mod tests {
     async fn read_body(mut body: RecvStream) -> Vec<u8> {
         let mut bytes = Vec::new();
         while let Some(chunk) = body.data().await {
-            let chunk = chunk.unwrap();
+            let chunk = chunk.expect("read body should succeed");
             let received = chunk.len();
             bytes.extend_from_slice(&chunk);
-            body.flow_control().release_capacity(received).unwrap();
+            body.flow_control()
+                .release_capacity(received)
+                .expect("release capacity should succeed");
         }
-        let _ = body.trailers().await.unwrap();
+        let _ = body.trailers().await.expect("trailers should succeed");
         bytes
     }
 }

@@ -294,7 +294,10 @@ impl<I: SqlInput> SqlLexer<I> {
         let mut oversized = false;
         push_identifier_byte(&mut bytes, first, &mut oversized)?;
         while self.input.peek()?.is_some_and(is_word_byte) {
-            let byte = self.input.next()?.expect("peeked byte exists");
+            let byte = self
+                .input
+                .next()?
+                .ok_or(InspectionError::Invalid("unexpected end of SQL input"))?;
             push_identifier_byte(&mut bytes, byte, &mut oversized)?;
         }
         if oversized {
@@ -313,7 +316,11 @@ impl<I: SqlInput> SqlLexer<I> {
             };
             if byte == b'$' {
                 for _ in 0..=index {
-                    delimiter.push(self.input.next()?.expect("peeked byte exists"));
+                    delimiter.push(
+                        self.input
+                            .next()?
+                            .ok_or(InspectionError::Invalid("unexpected end of SQL input"))?,
+                    );
                 }
                 return Ok(Some(delimiter));
             }

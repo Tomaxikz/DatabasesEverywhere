@@ -80,14 +80,15 @@ pub(super) async fn read_mongodb_prefix(
         return Ok(None);
     }
     reader.read_exact(&mut header[1..]).await?;
-    let message_len = i32::from_le_bytes(header[..4].try_into().unwrap());
+    let message_len =
+        i32::from_le_bytes(*header.first_chunk().ok_or_else(malformed_mongodb_message)?);
     if !(16..=crate::gateway::protocols::mongodb::MAX_WIRE_MESSAGE_BYTES as i32)
         .contains(&message_len)
     {
         return Err(malformed_mongodb_message());
     }
     let message_len = message_len as usize;
-    let opcode = i32::from_le_bytes(header[12..16].try_into().unwrap());
+    let opcode = i32::from_le_bytes(*header.last_chunk().ok_or_else(malformed_mongodb_message)?);
     if opcode == MONGODB_OP_COMPRESSED {
         return Err(ListenerError::IdentitySwitchRejected {
             protocol: "mongodb",
@@ -129,11 +130,15 @@ async fn read_mongodb_command_key(
 ) -> Result<Range<usize>, ListenerError> {
     let start = prefix.len();
     append_exact(reader, prefix, 5, message_len).await?;
-    let document_len = i32::from_le_bytes(prefix[start..start + 4].try_into().unwrap());
+    let &[a, b, c, d, element_type] = prefix
+        .get(start..)
+        .and_then(|section| section.first_chunk())
+        .ok_or_else(malformed_mongodb_message)?;
+    let document_len = i32::from_le_bytes([a, b, c, d]);
     if document_len < 5 || document_len as usize > message_len - start {
         return Err(malformed_mongodb_message());
     }
-    if prefix[start + 4] == 0 {
+    if element_type == 0 {
         return Err(malformed_mongodb_message());
     }
     append_cstring(reader, prefix, message_len).await

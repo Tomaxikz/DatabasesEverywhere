@@ -83,13 +83,13 @@ mod tests {
 
     fn tree() -> PathBufGuard {
         let path = std::env::temp_dir().join(format!("dbev-pg-restore-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(path.join("pg_wal")).unwrap();
-        fs::create_dir_all(path.join("pg_tblspc")).unwrap();
-        fs::write(path.join("PG_VERSION"), "18\n").unwrap();
-        fs::write(path.join("backup_label"), "LABEL: keep\n").unwrap();
-        fs::write(path.join("backup_manifest"), "{}\n").unwrap();
-        fs::write(path.join("postmaster.pid"), "1\n").unwrap();
-        fs::write(path.join("postmaster.opts"), "postgres\n").unwrap();
+        fs::create_dir_all(path.join("pg_wal")).expect("create dir all should succeed");
+        fs::create_dir_all(path.join("pg_tblspc")).expect("create dir all should succeed");
+        fs::write(path.join("PG_VERSION"), "18\n").expect("write should succeed");
+        fs::write(path.join("backup_label"), "LABEL: keep\n").expect("write should succeed");
+        fs::write(path.join("backup_manifest"), "{}\n").expect("write should succeed");
+        fs::write(path.join("postmaster.pid"), "1\n").expect("write should succeed");
+        fs::write(path.join("postmaster.opts"), "postgres\n").expect("write should succeed");
         PathBufGuard(path)
     }
 
@@ -102,40 +102,44 @@ mod tests {
     }
 
     #[test]
-    fn restores_a_directory_backup_and_keeps_the_label() {
+    fn restores_a_directory_backup_and_keeps_the_label() -> anyhow::Result<()> {
         let root = tree();
-        prepare_basebackup_restore(&root.0).unwrap();
+        prepare_basebackup_restore(&root.0).map_err(anyhow::Error::msg)?;
         assert!(!root.0.join("postmaster.pid").exists());
         assert!(!root.0.join("postmaster.opts").exists());
         assert_eq!(
-            fs::read_to_string(root.0.join("backup_label")).unwrap(),
+            fs::read_to_string(root.0.join("backup_label"))?,
             "LABEL: keep\n"
         );
         assert!(root.0.join("backup_manifest").is_file());
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_the_wrong_version_tablespaces_and_standby_signals() {
+    fn rejects_the_wrong_version_tablespaces_and_standby_signals() -> anyhow::Result<()> {
         let missing = tree();
-        fs::remove_file(missing.0.join("backup_label")).unwrap();
+        fs::remove_file(missing.0.join("backup_label"))?;
         assert!(prepare_basebackup_restore(&missing.0).is_err());
 
         let old = tree();
-        fs::write(old.0.join("PG_VERSION"), "13\n").unwrap();
+        fs::write(old.0.join("PG_VERSION"), "13\n")?;
         assert!(prepare_basebackup_restore(&old.0).is_err());
 
         let spaced = tree();
-        fs::write(spaced.0.join("pg_tblspc").join("16384"), "link").unwrap();
+        fs::write(spaced.0.join("pg_tblspc").join("16384"), "link")?;
         assert!(prepare_basebackup_restore(&spaced.0).is_err());
 
         let standby = tree();
-        fs::write(standby.0.join("standby.signal"), "").unwrap();
+        fs::write(standby.0.join("standby.signal"), "")?;
         assert!(prepare_basebackup_restore(&standby.0).is_err());
 
         let linked = tree();
         symlink("somewhere", linked.0.join("pg_wal").join("unused")).ok();
-        fs::remove_dir_all(linked.0.join("pg_wal")).unwrap();
-        symlink("/tmp", linked.0.join("pg_wal")).unwrap();
+        fs::remove_dir_all(linked.0.join("pg_wal"))?;
+        symlink("/tmp", linked.0.join("pg_wal"))?;
         assert!(prepare_basebackup_restore(&linked.0).is_err());
+
+        Ok(())
     }
 }

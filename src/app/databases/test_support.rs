@@ -48,7 +48,7 @@ pub(super) fn exec_mysql_family_with_input(
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("expected a value from take")
         .write_all(input)
         .expect("write database client input");
     child.wait_with_output().expect("wait for database client")

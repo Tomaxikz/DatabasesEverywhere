@@ -414,7 +414,7 @@ mod tests {
             "size": 0_i32,
             "type": "collection",
         })
-        .unwrap()
+        .expect("to vec should succeed")
     }
 
     fn archive_documents(documents: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
@@ -426,7 +426,7 @@ mod tests {
                 "server_version": "8.0.0",
                 "tool_version": "100.12.2",
             })
-            .unwrap(),
+            .expect("to vec should succeed"),
         );
         for document in documents {
             bytes.extend(document);
@@ -439,7 +439,11 @@ mod tests {
         body.push(0x02);
         body.extend(key.as_bytes());
         body.push(0);
-        body.extend(i32::try_from(value.len() + 1).unwrap().to_le_bytes());
+        body.extend(
+            i32::try_from(value.len() + 1)
+                .expect("len should succeed")
+                .to_le_bytes(),
+        );
         body.extend(value.as_bytes());
         body.push(0);
     }
@@ -452,7 +456,7 @@ mod tests {
     }
 
     fn test_document(body: Vec<u8>) -> Vec<u8> {
-        let length = i32::try_from(body.len() + 5).unwrap();
+        let length = i32::try_from(body.len() + 5).expect("len should succeed");
         let mut bytes = Vec::with_capacity(length as usize);
         bytes.extend(length.to_le_bytes());
         bytes.extend(body);
@@ -463,7 +467,11 @@ mod tests {
     fn deeply_nested_document(depth: usize) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(5 + 8 * depth);
         for remaining in (1..=depth).rev() {
-            bytes.extend(i32::try_from(5 + 8 * remaining).unwrap().to_le_bytes());
+            bytes.extend(
+                i32::try_from(5 + 8 * remaining)
+                    .expect("try from should succeed")
+                    .to_le_bytes(),
+            );
             bytes.extend([0x03, b'x', 0]);
         }
         bytes.extend(5_i32.to_le_bytes());
@@ -480,12 +488,12 @@ mod tests {
     }
 
     fn assert_invalid_contains(bytes: &[u8], expected: &str) {
-        let error = inspect(bytes).unwrap_err();
+        let error = inspect(bytes).expect_err("inspect should return an error");
         assert!(error.to_string().contains(expected), "{error}");
     }
 
     #[test]
-    fn catalog_semantics_cover_official_safe_system_and_unsafe_databases() {
+    fn catalog_semantics_cover_official_safe_system_and_unsafe_databases() -> anyhow::Result<()> {
         let bytes = archive(&[
             ("zeta", "events"),
             ("admin", "system.users"),
@@ -497,38 +505,37 @@ mod tests {
         ]);
         assert_eq!(&bytes[..4], &[0x6d, 0xe2, 0x99, 0x81]);
 
-        let result = inspect(&bytes).unwrap();
+        let result = inspect(&bytes)?;
         assert_eq!(result.databases, ["alpha", "zeta"]);
         assert!(result.complete);
 
-        let incomplete = inspect(&archive(&[("safe", "users"), ("bad.name", "secrets")])).unwrap();
+        let incomplete = inspect(&archive(&[("safe", "users"), ("bad.name", "secrets")]))?;
         assert_eq!(incomplete.databases, ["safe"]);
         assert!(!incomplete.complete);
+
+        Ok(())
     }
 
     #[test]
-    fn malformed_magic_version_and_bson_fail_closed() {
+    fn malformed_magic_version_and_bson_fail_closed() -> anyhow::Result<()> {
         let mut invalid_magic = archive(&[("tenant", "users")]);
         invalid_magic[0] ^= 0xff;
         assert_invalid_contains(&invalid_magic, "native");
 
         let mut unsupported = ARCHIVE_MAGIC.to_vec();
-        unsupported.extend(
-            bson::Document::to_vec(&bson::doc! {
-                "concurrent_collections": 1_i32,
-                "version": "999",
-                "server_version": "8.0",
-                "tool_version": "100",
-            })
-            .unwrap(),
-        );
+        unsupported.extend(bson::Document::to_vec(&bson::doc! {
+            "concurrent_collections": 1_i32,
+            "version": "999",
+            "server_version": "8.0",
+            "tool_version": "100",
+        })?);
         unsupported.extend(ARCHIVE_TERMINATOR.to_le_bytes());
         assert_invalid_contains(&unsupported, "unsupported");
 
         let empty_archive = archive(&[]);
         let mut missing_collection = ARCHIVE_MAGIC.to_vec();
         missing_collection.extend(&empty_archive[4..empty_archive.len() - 4]);
-        missing_collection.extend(bson::Document::to_vec(&bson::doc! { "db": "tenant" }).unwrap());
+        missing_collection.extend(bson::Document::to_vec(&bson::doc! { "db": "tenant" })?);
         missing_collection.extend(ARCHIVE_TERMINATOR.to_le_bytes());
         assert_invalid_contains(&missing_collection, "collection metadata");
 
@@ -560,6 +567,8 @@ mod tests {
             inspect(&archive_documents([test_document(invalid_element)])),
             Err(InspectionError::Invalid(_))
         ));
+
+        Ok(())
     }
 
     #[test]
@@ -570,7 +579,8 @@ mod tests {
         metadata.push(0x03);
         metadata.extend(b"payload\0");
         metadata.extend(deeply_nested_document(20_000));
-        let error = inspect(&archive_documents([test_document(metadata)])).unwrap_err();
+        let error = inspect(&archive_documents([test_document(metadata)]))
+            .expect_err("test document should return an error");
         assert!(matches!(error, InspectionError::Limit(_)));
     }
 
@@ -578,7 +588,8 @@ mod tests {
     fn excessive_metadata_count_is_bounded() {
         let documents = (0..=MAX_METADATA_DOCUMENTS)
             .map(|index| metadata_document("tenant", &format!("c{index}")));
-        let error = inspect(&archive_documents(documents)).unwrap_err();
+        let error = inspect(&archive_documents(documents))
+            .expect_err("archive documents should return an error");
         assert!(matches!(error, InspectionError::Limit(_)));
     }
 }

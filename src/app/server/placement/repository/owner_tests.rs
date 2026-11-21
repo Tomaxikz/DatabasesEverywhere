@@ -10,21 +10,23 @@ use crate::{
 };
 
 #[tokio::test]
-async fn every_shared_engine_enforces_server_and_panel_ownership() {
+async fn every_shared_engine_enforces_server_and_panel_ownership() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     for protocol in Protocol::ALL
         .into_iter()
         .filter(|protocol| DeploymentMode::Shared.supports(*protocol))
     {
-        let dir = tempfile::tempdir().unwrap();
-        let db = sqlite::connect(dir.path()).await.unwrap();
+        let dir = tempfile::tempdir()?;
+        let db = sqlite::connect(dir.path()).await?;
         let pools = PlacementRepository::new(db.clone());
         let mut first = runtime("pool-a", protocol, "test-image");
         first.owner = Some(owner("server-a"));
         first.limits.disk_mib = 4096;
         let mut second = runtime("pool-b", protocol, "test-image");
         second.owner = Some(owner("server-b"));
-        pools.save(&first).await.unwrap();
-        pools.save(&second).await.unwrap();
+        pools.save(&first).await?;
+        pools.save(&second).await?;
         let limits = InstanceLimits {
             disk_mib: 128,
             ..InstanceLimits::default()
@@ -51,13 +53,7 @@ async fn every_shared_engine_enforces_server_and_panel_ownership() {
                     .is_err(),
                 "{protocol}"
             );
-            assert!(
-                pools
-                    .get_reservation("wrong-tenant")
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(pools.get_reservation("wrong-tenant").await?.is_none());
         }
         let reserved = pools
             .reserve(ReserveTenant {
@@ -68,8 +64,7 @@ async fn every_shared_engine_enforces_server_and_panel_ownership() {
                 username: "tenant_user",
                 limits: &limits,
             })
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(
             reserved.limits, first.limits,
             "{protocol}: creation changed pool limits"
@@ -92,8 +87,8 @@ async fn every_shared_engine_enforces_server_and_panel_ownership() {
             "{protocol}: foreign metadata accepted"
         );
         tenant.owner = Some(owner("server-a"));
-        pools.mark_provisioned("tenant-a").await.unwrap();
-        instances.upsert(&tenant).await.unwrap();
+        pools.mark_provisioned("tenant-a").await?;
+        instances.upsert(&tenant).await?;
         let mut reassigned = tenant.clone();
         reassigned.owner = second.owner.clone();
         reassigned.runtime_id = second.runtime_id.clone();
@@ -101,8 +96,11 @@ async fn every_shared_engine_enforces_server_and_panel_ownership() {
             instances.upsert(&reassigned).await.is_err(),
             "{protocol}: tenant ownership changed"
         );
-        instances.delete("tenant-a").await.unwrap();
-        let after_delete = pools.get(&first.runtime_id).await.unwrap().unwrap();
+        instances.delete("tenant-a").await?;
+        let after_delete = pools
+            .get(&first.runtime_id)
+            .await?
+            .context("get should provide a value")?;
         assert_eq!(
             after_delete.limits, first.limits,
             "{protocol}: delete resized pool"
@@ -114,7 +112,7 @@ async fn every_shared_engine_enforces_server_and_panel_ownership() {
             panel_id: "other-panel".into(),
             server_id: "server-a".into(),
         });
-        pools.save(&other_panel).await.unwrap();
+        pools.save(&other_panel).await?;
         let mut duplicate = runtime("duplicate", protocol, "different-image");
         duplicate.owner = first.owner.clone();
         assert!(
@@ -128,18 +126,20 @@ async fn every_shared_engine_enforces_server_and_panel_ownership() {
             "{protocol}: owner changed"
         );
         first.status = EngineRuntimeStatus::Stopped;
-        pools.save(&first).await.unwrap();
+        pools.save(&first).await?;
         assert!(
             pools.save(&duplicate).await.is_err(),
             "{protocol}: stopped pool allowed replacement"
         );
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn racing_first_pools_have_one_durable_winner() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = sqlite::connect(dir.path()).await.unwrap();
+async fn racing_first_pools_have_one_durable_winner() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = sqlite::connect(dir.path()).await?;
     let pools = PlacementRepository::new(db);
     let mut tasks = tokio::task::JoinSet::new();
     for number in 0..8 {
@@ -153,20 +153,24 @@ async fn racing_first_pools_have_one_durable_winner() {
     }
     let mut winners = 0;
     while let Some(result) = tasks.join_next().await {
-        winners += usize::from(result.unwrap());
+        winners += usize::from(result?);
     }
     assert_eq!(winners, 1);
-    assert_eq!(pools.list().await.unwrap().len(), 1);
+    assert_eq!(pools.list().await?.len(), 1);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn pool_disk_budget_is_fixed_even_when_memory_reservations_would_fit() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = sqlite::connect(dir.path()).await.unwrap();
+async fn pool_disk_budget_is_fixed_even_when_memory_reservations_would_fit() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let db = sqlite::connect(dir.path()).await?;
     let pools = PlacementRepository::new(db);
     let mut pool = runtime("disk-pool", Protocol::Mysql, "mysql:8.4");
     pool.limits.disk_mib = 1600; // 512 MiB engine + two 512 MiB tenants + spill.
-    pools.save(&pool).await.unwrap();
+    pools.save(&pool).await?;
     let limits = InstanceLimits {
         disk_mib: 512,
         ..InstanceLimits::default()
@@ -174,7 +178,7 @@ async fn pool_disk_budget_is_fixed_even_when_memory_reservations_would_fit() {
     for (id, accepted) in [("first", true), ("second", true), ("third", false)] {
         let result = pools
             .reserve(ReserveTenant {
-                owner: pool.owner.clone().unwrap(),
+                owner: pool.owner.clone().context("expected a value from clone")?,
                 instance_id: id,
                 runtime_id: &pool.runtime_id,
                 database: id,
@@ -187,18 +191,20 @@ async fn pool_disk_budget_is_fixed_even_when_memory_reservations_would_fit() {
     assert_eq!(
         pools
             .get(&pool.runtime_id)
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get should provide a value")?
             .limits
             .disk_mib,
         1600
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn unowned_pools_are_quarantined_without_deleting_data_or_blocking_containment() {
-    let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+async fn unowned_pools_are_quarantined_without_deleting_data_or_blocking_containment()
+-> anyhow::Result<()> {
+    let db = sqlx::SqlitePool::connect("sqlite::memory:").await?;
     sqlx::raw_sql(r#"
         CREATE TABLE engine_runtimes(runtime_id TEXT PRIMARY KEY, protocol TEXT, deployment_mode TEXT, status TEXT, tenant_count INTEGER, reserved_cpu_cores REAL, reserved_memory_mib INTEGER, reserved_disk_mib INTEGER);
         CREATE INDEX uq_engine_runtimes_shared_compatibility ON engine_runtimes(runtime_id);
@@ -209,25 +215,24 @@ async fn unowned_pools_are_quarantined_without_deleting_data_or_blocking_contain
         INSERT INTO engine_runtimes VALUES ('old-pool','mysql','shared','running',1,1,1024,512);
         INSERT INTO instance_metadata VALUES ('old-tenant','old-pool','shared','running','{"status":"running"}');
         INSERT INTO engine_runtime_reservations VALUES ('old-tenant','old-pool',512);
-    "#).execute(&db).await.unwrap();
+    "#).execute(&db).await?;
     sqlx::raw_sql(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/migrations/20260905120000_server_private_pools.sql"
     )))
     .execute(&db)
-    .await
-    .unwrap();
+    .await?;
     for query in [
         "SELECT status FROM engine_runtimes",
         "SELECT status FROM instance_metadata",
     ] {
-        let status: String = sqlx::query_scalar(query).fetch_one(&db).await.unwrap();
+        let status: String = sqlx::query_scalar(query).fetch_one(&db).await?;
         assert_eq!(status, "quarantined");
     }
     sqlx::query("INSERT INTO engine_runtimes(runtime_id,protocol,deployment_mode,status) VALUES ('old-pool','mysql','shared','quarantined') ON CONFLICT(runtime_id) DO UPDATE SET status=excluded.status")
-        .execute(&db).await.unwrap();
+        .execute(&db).await?;
     sqlx::query("INSERT INTO instance_metadata(instance_id,runtime_id,deployment_mode,status,metadata_json) VALUES ('old-tenant','old-pool','shared','quarantined','{\"status\":\"quarantined\"}') ON CONFLICT(instance_id) DO UPDATE SET status=excluded.status,metadata_json=excluded.metadata_json")
-        .execute(&db).await.unwrap();
+        .execute(&db).await?;
     assert!(
         sqlx::query("UPDATE engine_runtimes SET status='running' WHERE runtime_id='old-pool'")
             .execute(&db)
@@ -245,8 +250,9 @@ async fn unowned_pools_are_quarantined_without_deleting_data_or_blocking_contain
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM engine_runtime_reservations")
             .fetch_one(&db)
-            .await
-            .unwrap(),
+            .await?,
         1
     );
+
+    Ok(())
 }

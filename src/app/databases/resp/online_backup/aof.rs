@@ -77,63 +77,69 @@ mod tests {
     use super::*;
 
     fn staged(header: &[u8]) -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().expect("tempdir should succeed");
         let directory = root.path().join(AOF_DIRECTORY);
-        fs::create_dir(&directory).unwrap();
+        fs::create_dir(&directory).expect("create dir should succeed");
         let mut rdb = header.to_vec();
         rdb.extend_from_slice(&[0xff; 9]);
-        fs::write(directory.join(BASE_FILE), rdb).unwrap();
+        fs::write(directory.join(BASE_FILE), rdb).expect("write should succeed");
         root
     }
 
     #[test]
-    fn redis_and_valkey_headers_are_recognised() {
+    fn redis_and_valkey_headers_are_recognised() -> anyhow::Result<()> {
         for (header, format) in [
             (&b"REDIS0012"[..], "REDIS0012"),
             (b"VALKEY080", "VALKEY080"),
         ] {
             let root = staged(header);
             let path = root.path().join(AOF_DIRECTORY).join(BASE_FILE);
-            assert_eq!(read_rdb_format(&path).unwrap(), format);
+            assert_eq!(read_rdb_format(&path).map_err(anyhow::Error::msg)?, format);
         }
         for header in [&b"REDIS00x2"[..], b"SQLite fo", b"REDIS"] {
             let root = staged(header);
             let path = root.path().join(AOF_DIRECTORY).join(BASE_FILE);
             assert!(read_rdb_format(&path).is_err());
         }
+
+        Ok(())
     }
 
     #[test]
-    fn a_sealed_directory_restores_and_anything_else_is_refused() {
+    fn a_sealed_directory_restores_and_anything_else_is_refused() -> anyhow::Result<()> {
         let root = staged(b"REDIS0012");
         let directory = root.path().join(AOF_DIRECTORY);
         assert!(check_layout(&directory).is_err(), "manifest is missing");
-        write_manifest(&directory).unwrap();
+        write_manifest(&directory).map_err(anyhow::Error::msg)?;
         assert!(
             write_manifest(&directory).is_err(),
             "manifest is written once"
         );
-        prepare_aof_restore(&directory).unwrap();
+        prepare_aof_restore(&directory).map_err(anyhow::Error::msg)?;
         assert_eq!(
-            fs::read_to_string(directory.join(MANIFEST_FILE)).unwrap(),
+            fs::read_to_string(directory.join(MANIFEST_FILE))?,
             "file appendonly.aof.1.base.rdb seq 1 type b\n"
         );
 
-        fs::write(directory.join("appendonly.aof.2.incr.aof"), b"").unwrap();
+        fs::write(directory.join("appendonly.aof.2.incr.aof"), b"")?;
         assert!(prepare_aof_restore(&directory).is_err(), "stray AOF part");
-        fs::remove_file(directory.join("appendonly.aof.2.incr.aof")).unwrap();
+        fs::remove_file(directory.join("appendonly.aof.2.incr.aof"))?;
 
-        fs::write(directory.join(MANIFEST_FILE), b"file other seq 1 type b\n").unwrap();
+        fs::write(directory.join(MANIFEST_FILE), b"file other seq 1 type b\n")?;
         assert!(prepare_aof_restore(&directory).is_err(), "foreign manifest");
+
+        Ok(())
     }
 
     #[test]
-    fn linked_parts_are_refused() {
+    fn linked_parts_are_refused() -> anyhow::Result<()> {
         let root = staged(b"REDIS0012");
         let directory = root.path().join(AOF_DIRECTORY);
-        write_manifest(&directory).unwrap();
-        fs::remove_file(directory.join(BASE_FILE)).unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", directory.join(BASE_FILE)).unwrap();
+        write_manifest(&directory).map_err(anyhow::Error::msg)?;
+        fs::remove_file(directory.join(BASE_FILE))?;
+        std::os::unix::fs::symlink("/etc/passwd", directory.join(BASE_FILE))?;
         assert!(prepare_aof_restore(&directory).is_err());
+
+        Ok(())
     }
 }

@@ -520,8 +520,11 @@ mod tests {
             ] {
                 wizard.step = step;
                 for (width, height) in [(120, 40), (60, 16), (20, 8)] {
-                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                    terminal.draw(|frame| draw(frame, &wizard)).unwrap();
+                    let mut terminal = Terminal::new(TestBackend::new(width, height))
+                        .expect("expected a value from new");
+                    terminal
+                        .draw(|frame| draw(frame, &wizard))
+                        .expect("expected a value from draw");
                 }
             }
             wizard.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -529,8 +532,11 @@ mod tests {
     }
 
     fn screen(wizard: &Wizard) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        terminal.draw(|frame| draw(frame, wizard)).unwrap();
+        let mut terminal =
+            Terminal::new(TestBackend::new(140, 40)).expect("expected a value from new");
+        terminal
+            .draw(|frame| draw(frame, wizard))
+            .expect("expected a value from draw");
         terminal
             .backend()
             .buffer()
@@ -588,8 +594,11 @@ mod tests {
             NodeIdentity::generate(),
         );
         wizard.step = Step::Summary;
-        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        terminal.draw(|frame| draw(frame, &wizard)).unwrap();
+        let mut terminal =
+            Terminal::new(TestBackend::new(140, 40)).expect("expected a value from new");
+        terminal
+            .draw(|frame| draw(frame, &wizard))
+            .expect("expected a value from draw");
         let screen: String = terminal
             .backend()
             .buffer()

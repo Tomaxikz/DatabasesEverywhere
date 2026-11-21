@@ -340,6 +340,8 @@ fn read_bounded(path: &Path) -> Result<String, CgroupStatsError> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     const ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -352,18 +354,18 @@ mod tests {
     }
 
     fn write_unified(directory: &Path) {
-        std::fs::create_dir_all(directory).unwrap();
+        std::fs::create_dir_all(directory).expect("create dir all should succeed");
         std::fs::write(
             directory.join("cpu.stat"),
             "usage_usec 1500\nuser_usec 1000\nsystem_usec 500\n",
         )
-        .unwrap();
-        std::fs::write(directory.join("memory.current"), "4096\n").unwrap();
+        .expect("write should succeed");
+        std::fs::write(directory.join("memory.current"), "4096\n").expect("write should succeed");
         std::fs::write(
             directory.join("memory.stat"),
             "anon 1024\nfile 3072\nactive_file 2048\ninactive_file 1024\n",
         )
-        .unwrap();
+        .expect("write should succeed");
     }
 
     #[test]
@@ -388,8 +390,8 @@ mod tests {
     }
 
     #[test]
-    fn unified_counters_match_docker_and_podman_compat_fields() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn unified_counters_match_docker_and_podman_compat_fields() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let mount = temporary.path().join("cgroup");
         let scope = format!("system.slice/docker-{ID}.scope");
         write_unified(&mount.join(&scope));
@@ -398,9 +400,8 @@ mod tests {
             &format!("0::/{scope}/init.scope\n"),
             &unified_mountinfo(&mount),
             ID,
-        )
-        .unwrap()
-        .unwrap();
+        )?
+        .context("unified mountinfo should provide a value")?;
         assert_eq!(layout, CgroupLayout::Unified(mount.join(&scope)));
 
         let docker = CgroupStatsReader {
@@ -408,7 +409,7 @@ mod tests {
             engine: DaemonEngine::Docker,
         };
         assert_eq!(
-            docker.read().unwrap(),
+            docker.read()?,
             CgroupCounters {
                 cpu_total_usage_ns: 1_500_000,
                 memory_usage_bytes: 4096,
@@ -421,32 +422,33 @@ mod tests {
             engine: DaemonEngine::Podman,
         };
         assert_eq!(
-            podman.read().unwrap(),
+            podman.read()?,
             CgroupCounters {
                 cpu_total_usage_ns: 1_500_000,
                 memory_usage_bytes: 4096,
                 memory_inactive_file_bytes: None,
             }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn legacy_hierarchies_take_precedence_on_hybrid_hosts() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn legacy_hierarchies_take_precedence_on_hybrid_hosts() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let cpu_mount = temporary.path().join("cpu,cpuacct");
         let memory_mount = temporary.path().join("memory");
         let unified_mount = temporary.path().join("unified");
         let cpuacct = cpu_mount.join(format!("docker/{ID}"));
         let memory = memory_mount.join(format!("docker/{ID}"));
-        std::fs::create_dir_all(&cpuacct).unwrap();
-        std::fs::create_dir_all(&memory).unwrap();
-        std::fs::write(cpuacct.join("cpuacct.usage"), "123456789\n").unwrap();
-        std::fs::write(memory.join("memory.usage_in_bytes"), "8192\n").unwrap();
+        std::fs::create_dir_all(&cpuacct)?;
+        std::fs::create_dir_all(&memory)?;
+        std::fs::write(cpuacct.join("cpuacct.usage"), "123456789\n")?;
+        std::fs::write(memory.join("memory.usage_in_bytes"), "8192\n")?;
         std::fs::write(
             memory.join("memory.stat"),
             "inactive_file 100\ntotal_inactive_file 2048\n",
-        )
-        .unwrap();
+        )?;
         let mountinfo = format!(
             "30 25 0:26 / {} rw - cgroup2 cgroup2 rw\n\
              31 25 0:27 / {} rw - cgroup cgroup rw,cpu,cpuacct\n\
@@ -458,7 +460,8 @@ mod tests {
         let cgroups =
             format!("4:cpu,cpuacct:/docker/{ID}\n3:memory:/docker/{ID}\n0::/docker/{ID}\n");
 
-        let layout = resolve_layout(&cgroups, &mountinfo, ID).unwrap().unwrap();
+        let layout = resolve_layout(&cgroups, &mountinfo, ID)?
+            .context("resolve layout should provide a value")?;
         assert_eq!(
             layout,
             CgroupLayout::Legacy {
@@ -471,49 +474,55 @@ mod tests {
             engine: DaemonEngine::Docker,
         };
         assert_eq!(
-            reader.read().unwrap(),
+            reader.read()?,
             CgroupCounters {
                 cpu_total_usage_ns: 123_456_789,
                 memory_usage_bytes: 8192,
                 memory_inactive_file_bytes: Some(2048),
             }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn foreign_or_traversing_memberships_do_not_bind() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn foreign_or_traversing_memberships_do_not_bind() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let mountinfo = unified_mountinfo(temporary.path());
         assert_eq!(
-            resolve_layout("0::/user.slice/session-2.scope\n", &mountinfo, ID).unwrap(),
+            resolve_layout("0::/user.slice/session-2.scope\n", &mountinfo, ID)?,
             None
         );
         assert!(resolve_layout(&format!("0::/../docker-{ID}.scope\n"), &mountinfo, ID).is_err());
         // A v2 host without a cgroup2 mount in view cannot resolve the directory.
         assert_eq!(
-            resolve_layout(&format!("0::/docker-{ID}.scope\n"), "", ID).unwrap(),
+            resolve_layout(&format!("0::/docker-{ID}.scope\n"), "", ID)?,
             None
         );
+
+        Ok(())
     }
 
     #[test]
-    fn missing_memory_controller_fails_the_read() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn missing_memory_controller_fails_the_read() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let directory = temporary.path().join("scope");
         write_unified(&directory);
-        std::fs::remove_file(directory.join("memory.current")).unwrap();
+        std::fs::remove_file(directory.join("memory.current"))?;
         let reader = CgroupStatsReader {
             layout: CgroupLayout::Unified(directory),
             engine: DaemonEngine::Docker,
         };
         assert!(matches!(reader.read(), Err(CgroupStatsError::Io { .. })));
+
+        Ok(())
     }
 
     #[test]
     fn bind_rejects_a_pid_outside_the_container_cgroup() {
         // This test process is never inside a cgroup named for the fake container ID.
-        let error =
-            CgroupStatsReader::bind(std::process::id(), ID, DaemonEngine::Docker).unwrap_err();
+        let error = CgroupStatsReader::bind(std::process::id(), ID, DaemonEngine::Docker)
+            .expect_err("id should return an error");
         assert!(matches!(
             error,
             CgroupStatsError::NotContainerCgroup { .. }
@@ -524,25 +533,26 @@ mod tests {
     /// Read-only: inspects an existing running container and never changes it.
     #[tokio::test]
     #[ignore = "requires DBE_DOCKER_STATS_CONTAINER naming a running container on a local Docker engine"]
-    async fn live_docker_counters_track_the_engine_stats_api() {
+    async fn live_docker_counters_track_the_engine_stats_api() -> anyhow::Result<()> {
         use futures::StreamExt;
 
         let container = std::env::var("DBE_DOCKER_STATS_CONTAINER")
             .expect("DBE_DOCKER_STATS_CONTAINER must name a running container");
-        let docker = bollard::Docker::connect_with_local_defaults().unwrap();
-        let inspection = docker.inspect_container(&container, None).await.unwrap();
-        let id = inspection.id.clone().unwrap();
+        let docker = bollard::Docker::connect_with_local_defaults()?;
+        let inspection = docker.inspect_container(&container, None).await?;
+        let id = inspection
+            .id
+            .clone()
+            .context("expected a value from clone")?;
         let pid = inspection
             .state
             .and_then(|state| state.pid)
             .and_then(|pid| u32::try_from(pid).ok())
-            .unwrap();
+            .context("expected a value from and_then")?;
         let reader = tokio::task::spawn_blocking(move || {
             CgroupStatsReader::bind(pid, &id, DaemonEngine::Docker)
         })
-        .await
-        .unwrap()
-        .unwrap();
+        .await??;
 
         let engine = docker
             .stats(
@@ -556,17 +566,18 @@ mod tests {
             )
             .next()
             .await
-            .unwrap()
-            .unwrap();
-        let direct = reader.read().unwrap();
+            .context("expected a value from next")??;
+        let direct = reader.read()?;
         let engine_cpu = engine
             .cpu_stats
-            .unwrap()
+            .context("live docker counters track the engine stats api should provide a value")?
             .cpu_usage
-            .unwrap()
+            .context("live docker counters track the engine stats api should provide a value")?
             .total_usage
-            .unwrap();
-        let engine_memory = engine.memory_stats.unwrap();
+            .context("live docker counters track the engine stats api should provide a value")?;
+        let engine_memory = engine
+            .memory_stats
+            .context("live docker counters track the engine stats api should provide a value")?;
         let engine_inactive = engine_memory
             .stats
             .as_ref()
@@ -585,11 +596,15 @@ mod tests {
         // Read after the engine sample, so the monotonic counter can only be equal or ahead.
         assert!(direct.cpu_total_usage_ns >= engine_cpu);
         assert!(direct.cpu_total_usage_ns - engine_cpu < 5_000_000_000);
-        let engine_usage = engine_memory.usage.unwrap();
+        let engine_usage = engine_memory
+            .usage
+            .context("live docker counters track the engine stats api should provide a value")?;
         assert!(direct.memory_usage_bytes.abs_diff(engine_usage) < 64 * 1024 * 1024);
         assert_eq!(
             direct.memory_inactive_file_bytes.is_some(),
             engine_inactive.is_some()
         );
+
+        Ok(())
     }
 }

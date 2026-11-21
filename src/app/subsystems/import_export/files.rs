@@ -496,26 +496,20 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn logical_staging_root_preserves_0700_on_docker_and_grants_0710_on_rootless_podman() {
-        let temp = tempfile::tempdir().unwrap();
-        let metadata = std::fs::metadata(temp.path()).unwrap();
+    async fn logical_staging_root_preserves_0700_on_docker_and_grants_0710_on_rootless_podman()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let metadata = std::fs::metadata(temp.path())?;
         crate::io::ownership::allow_directory_traversal(
             temp.path(),
             metadata.uid(),
             metadata.gid(),
-        )
-        .unwrap();
+        )?;
 
         let docker_tmp = temp.path().join("docker-tmp");
-        let docker_staging = prepare_logical_staging_root(&docker_tmp, None)
-            .await
-            .unwrap();
+        let docker_staging = prepare_logical_staging_root(&docker_tmp, None).await?;
         assert_eq!(
-            std::fs::metadata(&docker_staging)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            std::fs::metadata(&docker_staging)?.permissions().mode() & 0o777,
             0o700
         );
 
@@ -527,16 +521,14 @@ mod tests {
                 .await
                 .is_err()
         );
-        std::fs::create_dir(&rootless_tmp).unwrap();
+        std::fs::create_dir(&rootless_tmp)?;
         let rootless_uid = metadata.uid().max(1);
         let rootless_gid = metadata.gid();
         let rootless_staging =
-            prepare_logical_staging_root(&rootless_tmp, Some((rootless_uid, rootless_gid)))
-                .await
-                .unwrap();
+            prepare_logical_staging_root(&rootless_tmp, Some((rootless_uid, rootless_gid))).await?;
         for directory in [&rootless_tmp, &rootless_staging] {
             assert_eq!(
-                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(directory)?.permissions().mode() & 0o777,
                 0o710,
                 "{}",
                 directory.display()
@@ -546,11 +538,9 @@ mod tests {
         // Later calls on the registered root and its parent (job staging,
         // copies, rollback dumps) must not strip the grant, not even briefly.
         for directory in [&rootless_tmp, &rootless_staging] {
-            prepare_private_dir(directory, "logical import staging directory")
-                .await
-                .unwrap();
+            prepare_private_dir(directory, "logical import staging directory").await?;
             assert_eq!(
-                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(directory)?.permissions().mode() & 0o777,
                 0o710,
                 "{}",
                 directory.display()
@@ -558,32 +548,26 @@ mod tests {
         }
         // An unregistered sibling stays strictly private.
         let sibling = rootless_tmp.join("unrelated");
-        std::fs::create_dir(&sibling).unwrap();
-        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o710)).unwrap();
-        prepare_private_dir(&sibling, "unrelated directory")
-            .await
-            .unwrap();
+        std::fs::create_dir(&sibling)?;
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o710))?;
+        prepare_private_dir(&sibling, "unrelated directory").await?;
         assert_eq!(
-            std::fs::metadata(&sibling).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&sibling)?.permissions().mode() & 0o777,
             0o700
         );
 
         let source = temp.path().join("dump.sql");
-        std::fs::write(&source, b"SELECT 1;").unwrap();
+        std::fs::write(&source, b"SELECT 1;")?;
         let digest: [u8; 32] = Sha256::digest(b"SELECT 1;").into();
         let pinned =
-            super::super::shared_restore::pin_input(&source, &rootless_staging, 9, &digest)
-                .await
-                .unwrap();
+            super::super::shared_restore::pin_input(&source, &rootless_staging, 9, &digest).await?;
         assert_eq!(
-            std::fs::metadata(&pinned.root)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            std::fs::metadata(&pinned.root)?.permissions().mode() & 0o777,
             0o700
         );
-        crate::io::ownership::ensure_traversable(&pinned.root, rootless_uid, rootless_gid).unwrap();
-        pinned.cleanup().await.unwrap();
+        crate::io::ownership::ensure_traversable(&pinned.root, rootless_uid, rootless_gid)?;
+        pinned.cleanup().await?;
+
+        Ok(())
     }
 }

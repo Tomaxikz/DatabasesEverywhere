@@ -8,8 +8,10 @@ async fn commit_test_backup(
 ) -> StoredBackup {
     let bundle = BackupBundle::create(root, "inst_one", backup_id)
         .await
-        .unwrap();
-    tokio::fs::write(&bundle.archive, b"archive").await.unwrap();
+        .expect("create should succeed");
+    tokio::fs::write(&bundle.archive, b"archive")
+        .await
+        .expect("write should succeed");
     let mut manifest = build_manifest(
         backup_id.to_string(),
         "inst_one".to_string(),
@@ -20,28 +22,31 @@ async fn commit_test_backup(
         test_details(BackupLayout::Physical),
     )
     .await
-    .unwrap();
+    .expect("test details should succeed");
     manifest.created_at_unix = created_at_unix;
     manifest.created_at = OffsetDateTime::from_unix_timestamp(created_at_unix)
-        .unwrap()
+        .expect("from unix timestamp should succeed")
         .format(&Rfc3339)
-        .unwrap();
-    bundle.write_metadata(&manifest).await.unwrap();
+        .expect("format should succeed");
+    bundle
+        .write_metadata(&manifest)
+        .await
+        .expect("write metadata should succeed");
     storage
         .commit(&bundle, &manifest, &drivers::DiscardJournal)
         .await
-        .unwrap();
+        .expect("commit should succeed");
     bundle.cleanup().await;
     manifest
 }
 
 #[tokio::test]
-async fn storage_facade_round_trips_backups_and_lists_newest_first() {
-    let temp = tempfile::tempdir().unwrap();
+async fn storage_facade_round_trips_backups_and_lists_newest_first() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let root = temp.path().join("backups");
     let storage = BackupStorage::Local(drivers::local::LocalBackupDriver::new(root.clone()));
-    storage.preflight().await.unwrap();
-    assert!(storage.list("inst_one").await.unwrap().is_empty());
+    storage.preflight().await?;
+    assert!(storage.list("inst_one").await?.is_empty());
 
     for (backup_id, timestamp) in [
         ("a-old.physical.tar.gz", 100),
@@ -49,13 +54,13 @@ async fn storage_facade_round_trips_backups_and_lists_newest_first() {
         ("c-middle.physical.tar.gz", 200),
     ] {
         let manifest = commit_test_backup(&storage, &root, backup_id, timestamp).await;
-        let found = storage.find("inst_one", backup_id).await.unwrap();
+        let found = storage.find("inst_one", backup_id).await?;
         assert_eq!(found.backup_id, manifest.backup_id);
         assert_eq!(found.sha256, manifest.sha256);
         assert_eq!(found.created_at_unix, timestamp);
     }
 
-    let listed = storage.list("inst_one").await.unwrap();
+    let listed = storage.list("inst_one").await?;
     assert_eq!(
         listed
             .iter()
@@ -67,19 +72,21 @@ async fn storage_facade_round_trips_backups_and_lists_newest_first() {
             "a-old.physical.tar.gz"
         ]
     );
-    assert!(storage.list("inst_other").await.unwrap().is_empty());
+    assert!(storage.list("inst_other").await?.is_empty());
     for backup in listed {
-        storage.delete("inst_one", &backup.backup_id).await.unwrap();
+        storage.delete("inst_one", &backup.backup_id).await?;
     }
-    assert!(storage.list("inst_one").await.unwrap().is_empty());
+    assert!(storage.list("inst_one").await?.is_empty());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn storage_facade_preserves_validation_and_missing_backup_errors() {
-    let temp = tempfile::tempdir().unwrap();
+async fn storage_facade_preserves_validation_and_missing_backup_errors() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let root = temp.path().join("backups");
     let storage = BackupStorage::Local(drivers::local::LocalBackupDriver::new(root.clone()));
-    storage.preflight().await.unwrap();
+    storage.preflight().await?;
     let manifest = commit_test_backup(&storage, &root, "valid.physical.tar.gz", 100).await;
 
     for backup_id in ["../outside", "valid.physical.tar.gz.metadata.json"] {
@@ -104,31 +111,28 @@ async fn storage_facade_preserves_validation_and_missing_backup_errors() {
         storage.delete("inst_one", "missing.physical.tar.gz").await,
         Err(BackupStoreError::NotFound)
     ));
-    assert_eq!(storage.list("inst_one").await.unwrap().len(), 1);
+    assert_eq!(storage.list("inst_one").await?.len(), 1);
     assert_eq!(
-        storage
-            .find("inst_one", &manifest.backup_id)
-            .await
-            .unwrap()
-            .sha256,
+        storage.find("inst_one", &manifest.backup_id).await?.sha256,
         manifest.sha256
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn storage_facade_preserves_corrupt_manifest_errors() {
-    let temp = tempfile::tempdir().unwrap();
+async fn storage_facade_preserves_corrupt_manifest_errors() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let root = temp.path().join("backups");
     let storage = BackupStorage::Local(drivers::local::LocalBackupDriver::new(root.clone()));
-    storage.preflight().await.unwrap();
+    storage.preflight().await?;
     let manifest = commit_test_backup(&storage, &root, "valid.physical.tar.gz", 100).await;
     tokio::fs::write(
         root.join("inst_one")
             .join(metadata_file_name(&manifest.backup_id)),
         b"invalid metadata",
     )
-    .await
-    .unwrap();
+    .await?;
 
     assert!(matches!(
         storage.find("inst_one", &manifest.backup_id).await,
@@ -138,18 +142,20 @@ async fn storage_facade_preserves_corrupt_manifest_errors() {
         storage.list("inst_one").await,
         Err(BackupStoreError::Corrupt(_))
     ));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn materialized_guard_cleans_only_temporary_files() {
-    let temp = tempfile::tempdir().unwrap();
+async fn materialized_guard_cleans_only_temporary_files() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     for temporary in [true, false] {
         let path = temp.path().join(if temporary {
             "remote.dump"
         } else {
             "local.dump"
         });
-        tokio::fs::write(&path, b"backup").await.unwrap();
+        tokio::fs::write(&path, b"backup").await?;
         drop(MaterializedBackup {
             path: path.clone(),
             temporary,
@@ -157,13 +163,15 @@ async fn materialized_guard_cleans_only_temporary_files() {
         });
         assert_eq!(path.exists(), !temporary);
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn cancelled_download_waiter_leaves_cleanup_with_the_worker() {
-    let temp = tempfile::tempdir().unwrap();
+async fn cancelled_download_waiter_leaves_cleanup_with_the_worker() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let path = temp.path().join("spool.dump");
-    tokio::fs::write(&path, b"partial").await.unwrap();
+    tokio::fs::write(&path, b"partial").await?;
     let guard = MaterializedBackup {
         path: path.clone(),
         temporary: true,
@@ -172,29 +180,36 @@ async fn cancelled_download_waiter_leaves_cleanup_with_the_worker() {
     let (release, resume) = tokio::sync::oneshot::channel();
     let (started, waiting) = tokio::sync::oneshot::channel();
     let worker = tokio::spawn(async move {
-        started.send(()).unwrap();
-        resume.await.unwrap();
-        tokio::fs::write(&guard.path, b"complete").await.unwrap();
+        started.send(()).expect("send should succeed");
+        resume
+            .await
+            .expect("cancelled download waiter leaves cleanup with the worker should succeed");
+        tokio::fs::write(&guard.path, b"complete")
+            .await
+            .expect("write should succeed");
         guard
     });
     let completed = worker.abort_handle();
     let waiter = tokio::spawn(worker);
-    waiting.await.unwrap();
+    waiting.await?;
     waiter.abort();
     let _ = waiter.await;
     assert!(path.exists(), "spool belongs to the still-running worker");
-    release.send(()).unwrap();
+    release
+        .send(())
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while !completed.is_finished() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
+    .await?;
     assert!(
         !path.exists(),
         "unobserved worker result must clean its spool"
     );
+
+    Ok(())
 }
 
 #[test]
@@ -207,7 +222,7 @@ fn backup_ids_cannot_address_internal_sidecars() {
 }
 
 #[test]
-fn old_manifests_default_to_physical_while_new_ids_mark_logical_backups() {
+fn old_manifests_default_to_physical_while_new_ids_mark_logical_backups() -> anyhow::Result<()> {
     let old: StoredBackup = serde_json::from_value(serde_json::json!({
         "schema_version": manifest::LEGACY_MANIFEST_SCHEMA_VERSION,
         "backup_id": "old.physical.tar.gz",
@@ -218,10 +233,11 @@ fn old_manifests_default_to_physical_while_new_ids_mark_logical_backups() {
         "created_at_unix": 1767225600,
         "sha256": "0".repeat(64),
         "catalog_available": false
-    }))
-    .unwrap();
+    }))?;
     assert_eq!(old.layout, BackupLayout::Physical);
     assert!(new_backup_id(BackupLayout::Logical).ends_with(".logical.dump"));
+
+    Ok(())
 }
 
 fn legacy_manifest_json(layout: &str) -> serde_json::Value {
@@ -240,7 +256,7 @@ fn legacy_manifest_json(layout: &str) -> serde_json::Value {
 }
 
 #[test]
-fn legacy_manifests_restore_by_layout_without_invented_guarantees() {
+fn legacy_manifests_restore_by_layout_without_invented_guarantees() -> anyhow::Result<()> {
     for (layout, expected) in [
         (
             "physical",
@@ -251,23 +267,24 @@ fn legacy_manifests_restore_by_layout_without_invented_guarantees() {
             manifest::RestoreFormat::LogicalDump { legacy: true },
         ),
     ] {
-        let bytes = serde_json::to_vec(&legacy_manifest_json(layout)).unwrap();
-        let legacy = StoredBackup::from_json(&bytes, "inst_old", "metadata").unwrap();
+        let bytes = serde_json::to_vec(&legacy_manifest_json(layout))?;
+        let legacy = StoredBackup::from_json(&bytes, "inst_old", "metadata")?;
         assert_eq!(legacy.restore_format(), expected);
         assert_eq!(legacy.consistency(), None);
         // Re-serializing a legacy record must not upgrade it.
-        let round_trip = serde_json::to_value(&legacy).unwrap();
+        let round_trip = serde_json::to_value(&legacy)?;
         assert_eq!(round_trip["schema_version"], 1);
         assert!(round_trip.get("details").is_none());
     }
+
+    Ok(())
 }
 
 #[test]
-fn schema_versions_and_details_must_agree() {
+fn schema_versions_and_details_must_agree() -> anyhow::Result<()> {
     let mut legacy_with_details = legacy_manifest_json("physical");
-    legacy_with_details["details"] =
-        serde_json::to_value(test_details(BackupLayout::Physical)).unwrap();
-    let bytes = serde_json::to_vec(&legacy_with_details).unwrap();
+    legacy_with_details["details"] = serde_json::to_value(test_details(BackupLayout::Physical))?;
+    let bytes = serde_json::to_vec(&legacy_with_details)?;
     assert!(matches!(
         StoredBackup::from_json(&bytes, "inst_old", "metadata"),
         Err(BackupStoreError::Corrupt(_))
@@ -275,18 +292,20 @@ fn schema_versions_and_details_must_agree() {
 
     let mut v2_without_details = legacy_manifest_json("physical");
     v2_without_details["schema_version"] = serde_json::json!(2);
-    let bytes = serde_json::to_vec(&v2_without_details).unwrap();
+    let bytes = serde_json::to_vec(&v2_without_details)?;
     assert!(matches!(
         StoredBackup::from_json(&bytes, "inst_old", "metadata"),
         Err(BackupStoreError::Corrupt(_))
     ));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn current_manifests_round_trip_their_restore_contract() {
-    let temp = tempfile::tempdir().unwrap();
+async fn current_manifests_round_trip_their_restore_contract() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let archive = temp.path().join("archive");
-    tokio::fs::write(&archive, b"archive").await.unwrap();
+    tokio::fs::write(&archive, b"archive").await?;
     let manifest = build_manifest(
         "new.logical.dump".to_string(),
         "inst_one".to_string(),
@@ -296,11 +315,9 @@ async fn current_manifests_round_trip_their_restore_contract() {
         false,
         test_details(BackupLayout::Logical),
     )
-    .await
-    .unwrap();
+    .await?;
     assert_eq!(manifest.schema_version, BACKUP_MANIFEST_SCHEMA_VERSION);
-    let parsed =
-        StoredBackup::from_json(&manifest.to_json().unwrap(), "inst_one", "metadata").unwrap();
+    let parsed = StoredBackup::from_json(&manifest.to_json()?, "inst_one", "metadata")?;
     assert_eq!(parsed.details, manifest.details);
     assert_eq!(
         parsed.restore_format(),
@@ -324,41 +341,35 @@ async fn current_manifests_round_trip_their_restore_contract() {
         .await
         .is_err()
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn startup_cleanup_removes_only_incomplete_staging() {
-    let temp = tempfile::tempdir().unwrap();
+async fn startup_cleanup_removes_only_incomplete_staging() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let staging = temp.path().join(".staging").join("inst_one");
-    tokio::fs::create_dir_all(&staging).await.unwrap();
-    tokio::fs::write(staging.join("partial"), b"data")
-        .await
-        .unwrap();
-    tokio::fs::write(temp.path().join("published.physical.tar.gz"), b"backup")
-        .await
-        .unwrap();
+    tokio::fs::create_dir_all(&staging).await?;
+    tokio::fs::write(staging.join("partial"), b"data").await?;
+    tokio::fs::write(temp.path().join("published.physical.tar.gz"), b"backup").await?;
 
-    assert!(cleanup_staging(temp.path()).await.unwrap());
+    assert!(cleanup_staging(temp.path()).await?);
     assert!(!staging.exists());
     assert!(temp.path().join("published.physical.tar.gz").exists());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn startup_cleanup_leaves_online_capture_staging_to_recovery() {
-    let temp = tempfile::tempdir().unwrap();
+async fn startup_cleanup_leaves_online_capture_staging_to_recovery() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let staging = temp.path().join(".staging").join("inst_one");
     let capture = staging.join(".0123456789abcdef0123456789abcdef.capture");
-    tokio::fs::create_dir_all(capture.join("pgdata"))
-        .await
-        .unwrap();
-    tokio::fs::create_dir_all(staging.join(".bundle-id.bundle"))
-        .await
-        .unwrap();
-    tokio::fs::create_dir_all(temp.path().join(".staging/.kopia-manifests"))
-        .await
-        .unwrap();
+    tokio::fs::create_dir_all(capture.join("pgdata")).await?;
+    tokio::fs::create_dir_all(staging.join(".bundle-id.bundle")).await?;
+    tokio::fs::create_dir_all(temp.path().join(".staging/.kopia-manifests")).await?;
 
-    assert!(cleanup_staging(temp.path()).await.unwrap());
+    assert!(cleanup_staging(temp.path()).await?);
     assert!(capture.join("pgdata").exists());
     assert!(!staging.join(".bundle-id.bundle").exists());
     assert!(!temp.path().join(".staging/.kopia-manifests").exists());
@@ -366,21 +377,19 @@ async fn startup_cleanup_leaves_online_capture_staging_to_recovery() {
         ".0123456789abcdef0123456789abcdef.capture"
     )));
     assert!(!is_capture_dir_name(std::ffi::OsStr::new(".x.capture")));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn startup_cleanup_removes_backup_materializations_only() {
-    let temp = tempfile::tempdir().unwrap();
-    tokio::fs::create_dir_all(temp.path().join("backup-materialized"))
-        .await
-        .unwrap();
-    tokio::fs::create_dir_all(temp.path().join("backup-catalogs"))
-        .await
-        .unwrap();
-    tokio::fs::create_dir_all(temp.path().join("remote-import"))
-        .await
-        .unwrap();
+async fn startup_cleanup_removes_backup_materializations_only() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    tokio::fs::create_dir_all(temp.path().join("backup-materialized")).await?;
+    tokio::fs::create_dir_all(temp.path().join("backup-catalogs")).await?;
+    tokio::fs::create_dir_all(temp.path().join("remote-import")).await?;
 
-    assert_eq!(cleanup_materializations(temp.path()).await.unwrap(), 2);
+    assert_eq!(cleanup_materializations(temp.path()).await?, 2);
     assert!(temp.path().join("remote-import").exists());
+
+    Ok(())
 }

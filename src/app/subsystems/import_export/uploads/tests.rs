@@ -20,18 +20,16 @@ use super::super::inspection::DumpArchiveFormat;
 use std::sync::atomic::Ordering;
 
 #[tokio::test]
-async fn configured_inspection_limit_is_shared_and_bounded_by_upload_workers() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect_lazy("sqlite::memory:")
-        .unwrap();
+async fn configured_inspection_limit_is_shared_and_bounded_by_upload_workers() -> anyhow::Result<()>
+{
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().connect_lazy("sqlite::memory:")?;
     let service =
         ImportUploadService::with_limits(ImportUploadRepository::new(pool.clone()), 8, 2, 3);
     let other = service.clone();
     let held = service
         .inspection_admission
         .clone()
-        .try_acquire_many_owned(3)
-        .unwrap();
+        .try_acquire_many_owned(3)?;
     assert!(
         other
             .inspection_admission
@@ -49,29 +47,24 @@ async fn configured_inspection_limit_is_shared_and_bounded_by_upload_workers() {
     );
     let service = ImportUploadService::with_limits(ImportUploadRepository::new(pool), 2, 2, 8);
     assert_eq!(service.inspection_admission.available_permits(), 2);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn output_reservations_share_capacity_without_consuming_staging_slots() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect_lazy("sqlite::memory:")
-        .unwrap();
+async fn output_reservations_share_capacity_without_consuming_staging_slots() -> anyhow::Result<()>
+{
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().connect_lazy("sqlite::memory:")?;
     let service = ImportUploadService::new(ImportUploadRepository::new(pool), 1);
-    let directory = tempfile::tempdir().unwrap();
-    let staging = service
-        .staging_admission
-        .clone()
-        .try_acquire_owned()
-        .unwrap();
+    let directory = tempfile::tempdir()?;
+    let staging = service.staging_admission.clone().try_acquire_owned()?;
 
     let first = service
         .reserve_output_capacity(directory.path(), 1024)
-        .await
-        .unwrap();
+        .await?;
     let second = service
         .reserve_output_capacity(directory.path(), 2048)
-        .await
-        .unwrap();
+        .await?;
     assert_eq!(reserved_total(&service), 3072);
     assert!(
         service
@@ -85,24 +78,25 @@ async fn output_reservations_share_capacity_without_consuming_staging_slots() {
     drop(second);
     assert_eq!(reserved_total(&service), 0);
     drop(staging);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn output_roots_on_the_same_device_are_identified_as_one_filesystem() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect_lazy("sqlite::memory:")
-        .unwrap();
+async fn output_roots_on_the_same_device_are_identified_as_one_filesystem() -> anyhow::Result<()> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().connect_lazy("sqlite::memory:")?;
     let service = ImportUploadService::new(ImportUploadRepository::new(pool), 1);
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir()?;
     let staging = directory.path().join("staging");
-    tokio::fs::create_dir(&staging).await.unwrap();
+    tokio::fs::create_dir(&staging).await?;
 
     assert!(
         service
             .output_roots_share_filesystem(directory.path(), &staging)
-            .await
-            .unwrap()
+            .await?
     );
+
+    Ok(())
 }
 
 fn reserved_total(service: &ImportUploadService) -> u64 {
@@ -110,21 +104,11 @@ fn reserved_total(service: &ImportUploadService) -> u64 {
 }
 
 #[tokio::test]
-async fn expensive_upload_work_has_separate_small_global_limits() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect_lazy("sqlite::memory:")
-        .unwrap();
+async fn expensive_upload_work_has_separate_small_global_limits() -> anyhow::Result<()> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().connect_lazy("sqlite::memory:")?;
     let service = ImportUploadService::new(ImportUploadRepository::new(pool), 32);
-    let first = service
-        .inspection_admission
-        .clone()
-        .try_acquire_owned()
-        .unwrap();
-    let second = service
-        .inspection_admission
-        .clone()
-        .try_acquire_owned()
-        .unwrap();
+    let first = service.inspection_admission.clone().try_acquire_owned()?;
+    let second = service.inspection_admission.clone().try_acquire_owned()?;
     assert!(
         service
             .inspection_admission
@@ -135,16 +119,8 @@ async fn expensive_upload_work_has_separate_small_global_limits() {
     assert!(service.admission.clone().try_acquire_owned().is_ok());
     drop((first, second));
 
-    let first = service
-        .staging_admission
-        .clone()
-        .try_acquire_owned()
-        .unwrap();
-    let second = service
-        .staging_admission
-        .clone()
-        .try_acquire_owned()
-        .unwrap();
+    let first = service.staging_admission.clone().try_acquire_owned()?;
+    let second = service.staging_admission.clone().try_acquire_owned()?;
     assert!(
         service
             .staging_admission
@@ -154,14 +130,16 @@ async fn expensive_upload_work_has_separate_small_global_limits() {
     );
     drop((first, second));
     tokio::task::yield_now().await;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn cancelled_inspection_waiter_does_not_release_worker_guards() {
+async fn cancelled_inspection_waiter_does_not_release_worker_guards() -> anyhow::Result<()> {
     let locks = crate::server::locks::InstanceLocks::default();
     let instance_operation = locks.lock("inst_inspection").await;
     let admission = Arc::new(Semaphore::new(1));
-    let inspection_permit = admission.clone().try_acquire_owned().unwrap();
+    let inspection_permit = admission.clone().try_acquire_owned()?;
     let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
     let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
     let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -176,9 +154,16 @@ async fn cancelled_inspection_waiter_does_not_release_worker_guards() {
         })
         .await
     });
-    started_receiver.await.unwrap();
+    started_receiver.await?;
     caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(
+        caller
+            .await
+            .expect_err(
+                "cancelled inspection waiter does not release worker guards should return an error"
+            )
+            .is_cancelled()
+    );
 
     assert!(admission.clone().try_acquire_owned().is_err());
     assert!(
@@ -187,14 +172,15 @@ async fn cancelled_inspection_waiter_does_not_release_worker_guards() {
             .is_err()
     );
 
-    release_sender.send(()).unwrap();
+    release_sender
+        .send(())
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     tokio::time::timeout(Duration::from_secs(1), async {
         while !completed.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
+    .await?;
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if let Ok(permit) = admission.clone().try_acquire_owned() {
@@ -204,16 +190,15 @@ async fn cancelled_inspection_waiter_does_not_release_worker_guards() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), locks.lock("inst_inspection"))
-        .await
-        .unwrap();
+    .await?;
+    tokio::time::timeout(Duration::from_secs(1), locks.lock("inst_inspection")).await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn upload_body_idle_timeout_returns_request_timeout() {
-    let dir = tempfile::tempdir().unwrap();
+async fn upload_body_idle_timeout_returns_request_timeout() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     let partial = dir.path().join("upload.partial");
     let body = Body::from_stream(futures::stream::pending::<
         Result<bytes::Bytes, std::io::Error>,
@@ -221,17 +206,19 @@ async fn upload_body_idle_timeout_returns_request_timeout() {
 
     let error = receive_upload_body(body, &partial, 1, None, Duration::from_millis(20))
         .await
-        .unwrap_err();
+        .expect_err("from millis should return an error");
 
     assert!(matches!(
         error,
         ApiError::RequestRejected { status, .. } if status == StatusCode::REQUEST_TIMEOUT
     ));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn upload_body_chunk_before_idle_deadline_succeeds() {
-    let dir = tempfile::tempdir().unwrap();
+async fn upload_body_chunk_before_idle_deadline_succeeds() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     let partial = dir.path().join("upload.partial");
     let stream = futures::stream::once(async {
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -245,25 +232,26 @@ async fn upload_body_chunk_before_idle_deadline_succeeds() {
         None,
         Duration::from_millis(100),
     )
-    .await
-    .unwrap();
+    .await?;
 
     assert_eq!(
         digest,
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
-    assert_eq!(tokio::fs::read(partial).await.unwrap(), b"abc");
+    assert_eq!(tokio::fs::read(partial).await?, b"abc");
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
+async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() -> anyhow::Result<()> {
     let (repository, upload, directory, partial_path, final_path) = upload_worker_fixture().await;
     let admission = Arc::new(Semaphore::new(1));
-    let admission_permit = admission.clone().try_acquire_owned().unwrap();
+    let admission_permit = admission.clone().try_acquire_owned()?;
     let locks = crate::server::locks::InstanceLocks::default();
     let instance_operation = locks.lock("inst").await;
     let disk_capacity = DiskCapacityService::default();
-    let disk_reservation = disk_capacity.reserve(directory.path(), 3).await.unwrap();
+    let disk_reservation = disk_capacity.reserve(directory.path(), 3).await?;
     let guards = Arc::new(UploadWorkerGuards::new(
         admission_permit,
         instance_operation,
@@ -295,9 +283,16 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
     );
     let caller = tokio::spawn(worker);
 
-    started_receiver.await.unwrap();
+    started_receiver.await?;
     caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(
+        caller
+            .await
+            .expect_err(
+                "cancelled upload waiter keeps guards until worker commits should return an error"
+            )
+            .is_cancelled()
+    );
     assert!(admission.clone().try_acquire_owned().is_err());
     assert!(
         tokio::time::timeout(Duration::from_millis(20), locks.lock("inst"))
@@ -306,13 +301,15 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
     );
     assert_eq!(disk_capacity.reserved_bytes(), 3);
 
-    release_sender.send(()).unwrap();
+    release_sender
+        .send(())
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let ready = repository
                 .get("inst", "upl_worker")
                 .await
-                .unwrap()
+                .expect("get should succeed")
                 .is_some_and(|upload| upload.state == ImportUploadState::Ready);
             if ready && final_path.exists() {
                 break;
@@ -320,9 +317,8 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
-    assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"abc");
+    .await?;
+    assert_eq!(tokio::fs::read(&final_path).await?, b"abc");
     assert!(!partial_path.exists());
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -333,24 +329,23 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), locks.lock("inst"))
-        .await
-        .unwrap();
+    .await?;
+    tokio::time::timeout(Duration::from_secs(1), locks.lock("inst")).await?;
     drop(directory);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn panicking_upload_worker_durably_cleans_files_and_row() {
+async fn panicking_upload_worker_durably_cleans_files_and_row() -> anyhow::Result<()> {
     let (repository, upload, directory, partial_path, final_path) = upload_worker_fixture().await;
-    std::fs::write(&final_path, b"orphan").unwrap();
+    std::fs::write(&final_path, b"orphan")?;
     let admission = Arc::new(Semaphore::new(1));
     let locks = crate::server::locks::InstanceLocks::default();
     let disk_capacity = DiskCapacityService::default();
-    let disk_reservation = disk_capacity.reserve(directory.path(), 3).await.unwrap();
+    let disk_reservation = disk_capacity.reserve(directory.path(), 3).await?;
     let guards = Arc::new(UploadWorkerGuards::new(
-        admission.clone().try_acquire_owned().unwrap(),
+        admission.clone().try_acquire_owned()?,
         locks.lock("inst").await,
         disk_reservation,
     ));
@@ -377,25 +372,18 @@ async fn panicking_upload_worker_durably_cleans_files_and_row() {
             total_timeout: Duration::from_secs(2),
         },
     )
-    .await
-    .unwrap()
-    .unwrap_err();
+    .await?
+    .expect_err("from secs should return an error");
 
     assert!(matches!(error, ApiError::Runtime(_)));
-    assert!(
-        repository
-            .get("inst", "upl_worker")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(repository.get("inst", "upl_worker").await?.is_none());
     assert!(!partial_path.exists());
     assert!(!final_path.exists());
     assert!(admission.try_acquire_owned().is_ok());
     assert_eq!(disk_capacity.reserved_bytes(), 0);
-    tokio::time::timeout(Duration::from_secs(1), locks.lock("inst"))
-        .await
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), locks.lock("inst")).await?;
+
+    Ok(())
 }
 
 async fn upload_worker_fixture() -> (
@@ -411,8 +399,8 @@ async fn upload_worker_fixture() -> (
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
-        .unwrap();
-    migrations::run(&pool).await.unwrap();
+        .expect("connect should succeed");
+    migrations::run(&pool).await.expect("run should succeed");
     test_support::seed_dedicated_instance(&pool, "inst", CREATED).await;
     let repository = ImportUploadRepository::new(pool);
     let upload = repository
@@ -428,15 +416,17 @@ async fn upload_worker_fixture() -> (
             expires_at: EXPIRES.to_string(),
         })
         .await
-        .unwrap();
-    let directory = tempfile::tempdir().unwrap();
+        .expect("to string should succeed");
+    let directory = tempfile::tempdir().expect("tempdir should succeed");
     let partial_path = directory.path().join(".upl_worker.upload.partial");
     let final_path = directory.path().join("upl_worker.upload");
     (repository, upload, directory, partial_path, final_path)
 }
 
 #[tokio::test]
-async fn retryable_inspection_retains_detected_wrapper_for_hardening() {
+async fn retryable_inspection_retains_detected_wrapper_for_hardening() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     const CREATED: &str = "2026-08-10T10:00:00Z";
     const EXPIRES: &str = "2026-08-10T11:00:00Z";
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -444,9 +434,8 @@ async fn retryable_inspection_retains_detected_wrapper_for_hardening() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    migrations::run(&pool).await.unwrap();
+        .await?;
+    migrations::run(&pool).await?;
     test_support::seed_dedicated_instance(&pool, "inst", CREATED).await;
     let repository = ImportUploadRepository::new(pool);
     repository
@@ -461,20 +450,16 @@ async fn retryable_inspection_retains_detected_wrapper_for_hardening() {
             created_at: CREATED.to_string(),
             expires_at: EXPIRES.to_string(),
         })
-        .await
-        .unwrap();
+        .await?;
     repository
         .mark_uploaded("inst", "upl", 42, DIGEST, "2026-08-10T10:01:00Z")
-        .await
-        .unwrap();
+        .await?;
     repository
         .mark_ready("inst", "upl", None, "2026-08-10T10:02:00Z")
-        .await
-        .unwrap();
+        .await?;
     repository
         .mark_processing("inst", "upl", "2026-08-10T10:03:00Z")
-        .await
-        .unwrap();
+        .await?;
 
     let confirmed = confirmed_storage_archive_format(Protocol::Postgres, DumpArchiveFormat::Tar);
     assert!(
@@ -487,10 +472,12 @@ async fn retryable_inspection_retains_detected_wrapper_for_hardening() {
                 Some("bounded catalog inspection"),
                 "2026-08-10T10:04:00Z",
             )
-            .await
-            .unwrap()
+            .await?
     );
-    let upload = repository.get("inst", "upl").await.unwrap().unwrap();
+    let upload = repository
+        .get("inst", "upl")
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(upload.state, ImportUploadState::Ready);
     assert_eq!(upload.archive_format, Some(ImportUploadArchiveFormat::Tar));
     assert_eq!(
@@ -506,10 +493,12 @@ async fn retryable_inspection_retains_detected_wrapper_for_hardening() {
         confirmed_storage_archive_format(Protocol::Redis, DumpArchiveFormat::TarGzip),
         None
     );
+
+    Ok(())
 }
 
 #[test]
-fn upload_summaries_never_decode_or_serialize_the_catalog() {
+fn upload_summaries_never_decode_or_serialize_the_catalog() -> anyhow::Result<()> {
     let upload = crate::storage::import_uploads::ImportUpload {
         upload_id: "upl_test".into(),
         instance_id: "tenant".into(),
@@ -528,22 +517,27 @@ fn upload_summaries_never_decode_or_serialize_the_catalog() {
         expires_at: "later".into(),
     };
     assert!(upload_catalog(&upload).is_err());
-    let summary = serde_json::to_value(public_upload(upload.clone())).unwrap();
+    let summary = serde_json::to_value(public_upload(upload.clone()))?;
     assert_eq!(summary["catalog_available"], true);
     assert!(summary.get("catalog").is_none());
     assert!(summary.get("stored_filename").is_none());
-    assert!(serde_json::to_vec(&summary).unwrap().len() < 1024);
+    assert!(serde_json::to_vec(&summary)?.len() < 1024);
     let mut missing = upload;
     missing.catalog_json = None;
     assert_eq!(
-        upload_catalog(&missing).unwrap_err().status(),
+        upload_catalog(&missing)
+            .expect_err("upload catalog should return an error")
+            .status(),
         http::StatusCode::CONFLICT
     );
     assert!(!public_upload(missing).catalog_available);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn catalog_routes_are_scoped_and_return_the_catalog_without_an_upload_wrapper() {
+async fn catalog_routes_are_scoped_and_return_the_catalog_without_an_upload_wrapper()
+-> anyhow::Result<()> {
     use crate::{
         auth::api_token::ApiToken,
         routes::http::router::build_router,
@@ -556,18 +550,15 @@ async fn catalog_routes_are_scoped_and_return_the_catalog_without_an_upload_wrap
     };
     use tower::ServiceExt;
 
-    let directory = tempfile::tempdir().unwrap();
-    let db = crate::storage::sqlite::connect(directory.path())
-        .await
-        .unwrap();
+    let directory = tempfile::tempdir()?;
+    let db = crate::storage::sqlite::connect(directory.path()).await?;
     let instances = InstanceStore::default();
     for id in ["owner", "other"] {
         let mut metadata = crate::server::test_support::metadata(id, Protocol::Mysql);
         metadata.database.username = format!("user_{id}");
         InstanceRepository::new(db.clone())
             .upsert(&metadata)
-            .await
-            .unwrap();
+            .await?;
         instances.upsert(metadata).await;
     }
     let manager = InstanceManager::new(instances.clone(), InstanceRepository::new(db.clone()));
@@ -610,8 +601,7 @@ async fn catalog_routes_are_scoped_and_return_the_catalog_without_an_upload_wrap
             updated_at: "2026-09-01T00:00:00Z".into(),
             expires_at: "2099-09-01T00:00:00Z".into(),
         })
-        .await
-        .unwrap();
+        .await?;
     let app = build_router(state);
     for method in ["GET", "POST"] {
         for (instance, token, expected) in [
@@ -628,13 +618,12 @@ async fn catalog_routes_are_scoped_and_return_the_catalog_without_an_upload_wrap
                             "/api/instances/{instance}/import/uploads/{id}/catalog"
                         ))
                         .header("authorization", format!("Bearer {token}"))
-                        .body(Body::empty())
-                        .unwrap(),
+                        .body(Body::empty())?,
                 )
                 .await
-                .unwrap();
+                .expect("expected a value from oneshot");
             let status = response.status();
-            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let body = to_bytes(response.into_body(), 4096).await?;
             assert_eq!(
                 status,
                 expected,
@@ -642,11 +631,10 @@ async fn catalog_routes_are_scoped_and_return_the_catalog_without_an_upload_wrap
                 String::from_utf8_lossy(&body)
             );
             if expected == StatusCode::OK {
-                assert_eq!(
-                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-                    catalog
-                );
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&body)?, catalog);
             }
         }
     }
+
+    Ok(())
 }

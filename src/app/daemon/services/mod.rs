@@ -226,6 +226,8 @@ async fn drain_daemon_task(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use std::sync::{
         Arc,
@@ -264,16 +266,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_closes_admission_and_drains_owned_mutations() {
+    async fn shutdown_closes_admission_and_drains_owned_mutations() -> anyhow::Result<()> {
         let (state, _directory) =
             crate::subsystems::test_support::database(Default::default()).await;
         let mutation = state
             .daemon_shutdown
             .try_admit_background_mutation()
-            .unwrap();
+            .context("expected a value from try_admit_background_mutation")?;
         let mut shutdown = state.daemon_shutdown.subscribe();
         let lifecycle = tokio::spawn(async move {
-            shutdown.wait_for(|stopped| *stopped).await.unwrap();
+            shutdown
+                .wait_for(|stopped| *stopped)
+                .await
+                .expect("wait for should succeed");
             drop(mutation);
         });
         let maintenance_released = Arc::new(AtomicBool::new(false));
@@ -300,7 +305,7 @@ mod tests {
             ],
         };
 
-        services.shutdown(&state, true).await.unwrap();
+        services.shutdown(&state, true).await?;
 
         assert!(maintenance_released.load(Ordering::SeqCst));
         assert!(state.daemon_shutdown.is_triggered());
@@ -320,5 +325,7 @@ mod tests {
             ),
             Err(crate::subsystems::instances::progress::BeginCreationError::ShuttingDown),
         ));
+
+        Ok(())
     }
 }

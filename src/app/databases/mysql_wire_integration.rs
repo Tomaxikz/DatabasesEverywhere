@@ -46,8 +46,10 @@ pub(super) async fn start_gateway(
     tokio::task::JoinHandle<Result<(), ListenerError>>,
 ) {
     assert!(matches!(protocol, Protocol::Mariadb | Protocol::Mysql));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind should succeed");
+    let address = listener.local_addr().expect("local addr should succeed");
     let supervisor = GatewaySupervisor::new();
     assert!(supervisor.begin(1));
     supervisor.mark_ready();
@@ -117,7 +119,11 @@ pub(super) fn test_tls_acceptor(directory: &std::path::Path) -> tokio_rustls::Tl
         "test TLS certificate generation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    crate::gateway::tls::acceptor(certificate.to_str().unwrap(), key.to_str().unwrap()).unwrap()
+    crate::gateway::tls::acceptor(
+        certificate.to_str().expect("expected a value from to_str"),
+        key.to_str().expect("expected a value from to_str"),
+    )
+    .expect("to str should succeed")
 }
 
 pub(super) fn run_jdbc_smoke(

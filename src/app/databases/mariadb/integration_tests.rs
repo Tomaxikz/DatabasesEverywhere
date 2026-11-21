@@ -30,23 +30,22 @@ const ROOT_PASSWORD: &str = "integration-root-password";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker, supported MariaDB images, Maven, Java, and OpenSSL"]
-async fn mariadb_supported_version_routes_real_cli_jdbc_tls_and_hikari() {
+async fn mariadb_supported_version_routes_real_cli_jdbc_tls_and_hikari() -> anyhow::Result<()> {
     let image =
         std::env::var("DBE_MARIADB_TEST_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
     let name = format!("dbev-mariadb-test-{}", uuid::Uuid::new_v4().simple());
-    let socket_root = tempfile::tempdir().unwrap();
+    let socket_root = tempfile::tempdir()?;
     let container = start_container(&name, socket_root.path(), &image);
     wait_until_ready(&name);
 
     let verifier = native_password_sha1_stage2_hex(TENANT_PASSWORD);
-    let provision_sql = shared_tenant_user_sql(DATABASE, TENANT, &verifier).unwrap();
+    let provision_sql = shared_tenant_user_sql(DATABASE, TENANT, &verifier)?;
     assert_success(
         &exec_with_input(&name, ROOT_PASSWORD, provision_sql.as_bytes()),
         "MariaDB tenant provisioning",
     );
     let neighbor_verifier = native_password_sha1_stage2_hex(NEIGHBOR_PASSWORD);
-    let neighbor_sql =
-        shared_tenant_user_sql(NEIGHBOR_DATABASE, NEIGHBOR, &neighbor_verifier).unwrap();
+    let neighbor_sql = shared_tenant_user_sql(NEIGHBOR_DATABASE, NEIGHBOR, &neighbor_verifier)?;
     assert_success(
         &exec_with_input(&name, ROOT_PASSWORD, neighbor_sql.as_bytes()),
         "MariaDB neighbor tenant provisioning",
@@ -86,7 +85,7 @@ async fn mariadb_supported_version_routes_real_cli_jdbc_tls_and_hikari() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (address, gateway) =
         start_gateway(Protocol::Mariadb, store.clone(), None, shutdown_rx.clone()).await;
-    let tls_directory = tempfile::tempdir().unwrap();
+    let tls_directory = tempfile::tempdir()?;
     let tls = test_tls_acceptor(tls_directory.path());
     let (tls_address, tls_gateway) =
         start_gateway(Protocol::Mariadb, store, Some(tls), shutdown_rx).await;
@@ -112,10 +111,12 @@ async fn mariadb_supported_version_routes_real_cli_jdbc_tls_and_hikari() {
         "MariaDB gateway accepted a wrong password"
     );
 
-    shutdown_tx.send(true).unwrap();
-    gateway.await.unwrap().unwrap();
-    tls_gateway.await.unwrap().unwrap();
+    shutdown_tx.send(true)?;
+    gateway.await??;
+    tls_gateway.await??;
     drop(container);
+
+    Ok(())
 }
 
 fn assert_mariadb_engine_telemetry(name: &str) {

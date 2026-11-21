@@ -33,10 +33,10 @@ const ROOT_PASSWORD: &str = "integration-root-password";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker, supported MySQL/MariaDB images, Maven, Java, and OpenSSL"]
-async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
+async fn mysql_supported_version_provisions_routes_and_round_trips_dump() -> anyhow::Result<()> {
     let image = std::env::var("DBE_MYSQL_TEST_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
     let name = format!("dbev-mysql-test-{}", uuid::Uuid::new_v4().simple());
-    let socket_root = tempfile::tempdir().unwrap();
+    let socket_root = tempfile::tempdir()?;
     let container = start_container(&name, socket_root.path(), &image);
     wait_until_ready(&name);
     let version = query_mysql(&name, ROOT_PASSWORD, "root", "mysql", "SELECT VERSION()");
@@ -213,7 +213,7 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (address, gateway) =
         start_gateway(Protocol::Mysql, store.clone(), None, shutdown_rx.clone()).await;
-    let tls_directory = tempfile::tempdir().unwrap();
+    let tls_directory = tempfile::tempdir()?;
     let tls = test_tls_acceptor(tls_directory.path());
     let (tls_address, tls_gateway) =
         start_gateway(Protocol::Mysql, store, Some(tls), shutdown_rx).await;
@@ -247,11 +247,13 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
         "gateway accepted a wrong password"
     );
 
-    shutdown_tx.send(true).unwrap();
-    gateway.await.unwrap().unwrap();
-    tls_gateway.await.unwrap().unwrap();
+    shutdown_tx.send(true)?;
+    gateway.await??;
+    tls_gateway.await??;
 
     drop(container);
+
+    Ok(())
 }
 
 fn assert_mysql_engine_telemetry(name: &str) {

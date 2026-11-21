@@ -22,11 +22,13 @@ pub(crate) fn sha256_reader(mut reader: impl Read) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn hashes_streams_like_the_one_shot_digest() {
+    fn hashes_streams_like_the_one_shot_digest() -> anyhow::Result<()> {
         let data = vec![7_u8; 200_000];
         assert_eq!(
-            super::sha256_reader(&data[..]).unwrap(),
+            super::sha256_reader(&data[..])?,
             hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&data))
         );
+
+        Ok(())
     }
 }

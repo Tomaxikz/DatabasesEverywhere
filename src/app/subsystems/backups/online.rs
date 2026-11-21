@@ -753,26 +753,26 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn staging_inside_the_source_volume_is_rejected() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn staging_inside_the_source_volume_is_rejected() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let data = temp.path().join("volumes/inst_one");
         let inside = data.join(".staging/inst_one");
         let outside = temp.path().join("backups/.staging/inst_one");
         for directory in [&inside, &outside] {
-            tokio::fs::create_dir_all(directory).await.unwrap();
+            tokio::fs::create_dir_all(directory).await?;
         }
         assert!(
             ensure_outside_source(&data, &inside.join(".job.capture"))
                 .await
                 .is_err()
         );
-        ensure_outside_source(&data, &outside.join(".job.capture"))
-            .await
-            .unwrap();
+        ensure_outside_source(&data, &outside.join(".job.capture")).await?;
+
+        Ok(())
     }
 
     #[test]
-    fn strategy_capture_paths_must_stay_inside_staging() {
+    fn strategy_capture_paths_must_stay_inside_staging() -> anyhow::Result<()> {
         let capture = |data_root: &str, restore_target: &str| CaptureResult {
             data_root: PathBuf::from(data_root),
             restore_target: PathBuf::from(restore_target),
@@ -784,24 +784,28 @@ mod tests {
             native_manifest: None,
         };
         let root = Path::new("/staging");
-        let (data, target) = capture_paths(root, &capture("base", "pgdata")).unwrap();
+        let (data, target) = capture_paths(root, &capture("base", "pgdata"))?;
         assert_eq!(data, Path::new("/staging/base"));
         assert_eq!(target, "pgdata");
         for (data_root, target) in [("../x", "pgdata"), ("base", "/abs"), ("base", "a/../b")] {
             assert!(capture_paths(root, &capture(data_root, target)).is_err());
         }
+
+        Ok(())
     }
 
     #[test]
-    fn captures_restore_cannot_extract_are_not_published() {
-        check_restorable(10, 1024, 1024).unwrap();
+    fn captures_restore_cannot_extract_are_not_published() -> anyhow::Result<()> {
+        check_restorable(10, 1024, 1024)?;
         assert!(check_restorable(10, 1025, 1024).is_err());
         assert!(check_restorable(MAX_DATA_ARCHIVE_ENTRIES + 1, 1, u64::MAX).is_err());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn archive_expansion_uses_restore_accounting() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn archive_expansion_uses_restore_accounting() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let child = |name: &str| temp.path().join(name).join("inst_one");
         let paths = InstancePaths {
             instance_id: "inst_one".to_string(),
@@ -816,16 +820,13 @@ mod tests {
             socket_bridge_binary: temp.path().join("bridge"),
         };
         let staged = temp.path().join("staging/pgdata");
-        std::fs::create_dir_all(staged.join("pg_wal")).unwrap();
-        std::fs::write(staged.join("PG_VERSION"), b"18\n").unwrap();
-        std::fs::write(staged.join("pg_wal/segment"), vec![0_u8; 4096]).unwrap();
+        std::fs::create_dir_all(staged.join("pg_wal"))?;
+        std::fs::write(staged.join("PG_VERSION"), b"18\n")?;
+        std::fs::write(staged.join("pg_wal/segment"), vec![0_u8; 4096])?;
         let archive = temp.path().join("capture.tar.gz");
-        package_capture(&paths, &staged, "18/docker", &archive, 1 << 30)
-            .await
-            .unwrap();
-        let (check, expanded) = validate_archive_structure(&paths, "18/docker", &archive, 1 << 30)
-            .await
-            .unwrap();
+        package_capture(&paths, &staged, "18/docker", &archive, 1 << 30).await?;
+        let (check, expanded) =
+            validate_archive_structure(&paths, "18/docker", &archive, 1 << 30).await?;
         assert!(check.passed);
         assert!(expanded >= 4096 + 3 + 4 * DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES);
         assert!(
@@ -833,5 +834,7 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        Ok(())
     }
 }

@@ -232,7 +232,7 @@ mod tests {
     };
 
     #[test]
-    fn persisted_target_method_survives_a_node_mode_change() {
+    fn persisted_target_method_survives_a_node_mode_change() -> anyhow::Result<()> {
         let limiter = DiskLimiter::new(DiskConfig {
             mode: DiskLimitMode::SoftScanner,
             ..DiskConfig::default()
@@ -243,10 +243,11 @@ mod tests {
             Protocol::Postgres,
             std::path::Path::new("unused-when-method-is-known"),
             Some("fuse_quota"),
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(selected.mode(), DiskLimitMode::FuseQuota);
+
+        Ok(())
     }
 
     #[test]
@@ -271,7 +272,7 @@ mod tests {
             std::path::Path::new("/var/lib/dbev/volumes/instances/target"),
             None,
         )
-        .unwrap_err();
+        .expect_err("provisional cleanup limiter should return an error");
 
         assert!(matches!(
             error,

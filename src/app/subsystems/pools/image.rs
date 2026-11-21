@@ -396,9 +396,12 @@ fn numeric_version_components(protocol: Protocol, version: &str) -> Option<Vec<u
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     #[tokio::test]
-    async fn console_policy_boot_repair_never_activates_stopped_or_unhealthy_pools() {
+    async fn console_policy_boot_repair_never_activates_stopped_or_unhealthy_pools()
+    -> anyhow::Result<()> {
         let (state, _directory) =
             crate::subsystems::test_support::database(crate::config::Config::default()).await;
         for (status, desired) in [
@@ -418,15 +421,21 @@ mod tests {
             );
             pool.status = status;
             pool.desired_state = desired;
-            state.placements.save(&pool).await.unwrap();
+            state.placements.save(&pool).await?;
             // The deliberately offline engine would fail if repair inspected
             // or started a container before checking durable power intent.
-            assert!(!refresh_logging(&state, "pool").await.unwrap());
-            let stored = state.placements.get("pool").await.unwrap().unwrap();
+            assert!(!refresh_logging(&state, "pool").await?);
+            let stored = state
+                .placements
+                .get("pool")
+                .await?
+                .context("get should provide a value")?;
             assert_eq!(stored.status, status);
             assert_eq!(stored.desired_state, desired);
             assert!(stored.pending_image.is_none());
         }
+
+        Ok(())
     }
     #[test]
     fn only_forward_same_release_line_images_are_accepted() {

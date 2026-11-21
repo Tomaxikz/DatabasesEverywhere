@@ -50,7 +50,9 @@ async fn route_store(routes: usize) -> InstanceStore {
 }
 
 fn route_lookup(c: &mut Criterion) {
-    let runtime = Builder::new_current_thread().build().unwrap();
+    let runtime = Builder::new_current_thread()
+        .build()
+        .expect("build should succeed");
     let mut group = c.benchmark_group("postgres_route_without_database");
     for count in [100, 1_000, 5_000] {
         let store = runtime.block_on(route_store(count));

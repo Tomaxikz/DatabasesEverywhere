@@ -4,13 +4,13 @@ use crate::config::Config;
 use crate::config::{BackupStorageDriver, path_policy::HostPathPolicyError};
 
 #[test]
-fn validates_global_sql_buffer_capacity() {
+fn validates_global_sql_buffer_capacity() -> anyhow::Result<()> {
     let mut config = valid_config();
     for mib in [1, 1024, 2048] {
         config.daemon.sql_buffer_global_mib = mib;
-        validate_config(&config).unwrap();
+        validate_config(&config)?;
         assert_eq!(
-            config.daemon.sql_buffer_global_bytes().unwrap() as u64,
+            config.daemon.sql_buffer_global_bytes()? as u64,
             mib * 1024 * 1024
         );
     }
@@ -25,18 +25,22 @@ fn validates_global_sql_buffer_capacity() {
             })
         ));
     }
+
+    Ok(())
 }
 
 #[test]
-fn legacy_recovery_list_is_accepted_but_no_longer_serialized() {
+fn legacy_recovery_list_is_accepted_but_no_longer_serialized() -> anyhow::Result<()> {
     let config: Config =
-        yaml_serde::from_str("daemon:\n  recover_shared_pools: ['*', 'pool_old']\n").unwrap();
+        yaml_serde::from_str("daemon:\n  recover_shared_pools: ['*', 'pool_old']\n")?;
     assert_eq!(config.daemon.recover_shared_pools.len(), 2);
     assert!(
-        serde_json::to_value(config).unwrap()["daemon"]
+        serde_json::to_value(config)?["daemon"]
             .get("recover_shared_pools")
             .is_none()
     );
+
+    Ok(())
 }
 
 #[test]
@@ -60,7 +64,7 @@ fn rejects_relative_paths() {
     let mut config = valid_config();
     config.paths.data = "relative".to_string();
 
-    let error = validate_config(&config).unwrap_err();
+    let error = validate_config(&config).expect_err("validate config should return an error");
 
     assert!(matches!(
         error,
@@ -73,7 +77,7 @@ fn rejects_invalid_pids_limits() {
     let mut config = valid_config();
     config.security.pids_limit = 0;
 
-    let error = validate_config(&config).unwrap_err();
+    let error = validate_config(&config).expect_err("validate config should return an error");
 
     assert!(matches!(
         error,
@@ -85,7 +89,7 @@ fn rejects_invalid_pids_limits() {
     let mut config = valid_config();
     config.security.pids_limits.clickhouse = Some(-1);
 
-    let error = validate_config(&config).unwrap_err();
+    let error = validate_config(&config).expect_err("validate config should return an error");
 
     assert!(matches!(
         error,
@@ -96,10 +100,10 @@ fn rejects_invalid_pids_limits() {
 }
 
 #[test]
-fn remote_import_security_defaults_are_valid() {
+fn remote_import_security_defaults_are_valid() -> anyhow::Result<()> {
     let config = valid_config();
 
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
 
     let remote = &config.security.remote_import;
     assert!(remote.enabled);
@@ -109,6 +113,8 @@ fn remote_import_security_defaults_are_valid() {
     assert_eq!(remote.connect_timeout_seconds, 15);
     assert_eq!(remote.operation_timeout_seconds, 900);
     assert_eq!(remote.max_staged_bytes, 8 * 1024 * 1024 * 1024);
+
+    Ok(())
 }
 
 #[test]
@@ -117,7 +123,7 @@ fn rejects_out_of_range_remote_import_limits() {
         let mut config = valid_config();
         config.security.remote_import.max_concurrent_jobs = value;
         assert!(matches!(
-            validate_config(&config).unwrap_err(),
+            validate_config(&config).expect_err("validate config should return an error"),
             ConfigValidationError::InvalidRemoteImportLimit {
                 field: "max_concurrent_jobs",
                 ..
@@ -129,7 +135,7 @@ fn rejects_out_of_range_remote_import_limits() {
         let mut config = valid_config();
         config.security.remote_import.connect_timeout_seconds = value;
         assert!(matches!(
-            validate_config(&config).unwrap_err(),
+            validate_config(&config).expect_err("validate config should return an error"),
             ConfigValidationError::InvalidRemoteImportLimit {
                 field: "connect_timeout_seconds",
                 ..
@@ -141,7 +147,7 @@ fn rejects_out_of_range_remote_import_limits() {
         let mut config = valid_config();
         config.security.remote_import.operation_timeout_seconds = value;
         assert!(matches!(
-            validate_config(&config).unwrap_err(),
+            validate_config(&config).expect_err("validate config should return an error"),
             ConfigValidationError::InvalidRemoteImportLimit {
                 field: "operation_timeout_seconds",
                 ..
@@ -153,7 +159,7 @@ fn rejects_out_of_range_remote_import_limits() {
         let mut config = valid_config();
         config.security.remote_import.max_staged_bytes = value;
         assert!(matches!(
-            validate_config(&config).unwrap_err(),
+            validate_config(&config).expect_err("validate config should return an error"),
             ConfigValidationError::InvalidRemoteImportLimit {
                 field: "max_staged_bytes",
                 ..
@@ -169,20 +175,20 @@ fn remote_import_operation_timeout_must_cover_connect_timeout() {
     config.security.remote_import.operation_timeout_seconds = 29;
 
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::InvalidRemoteImportTimeoutOrder
     ));
 }
 
 #[test]
-fn validates_remote_import_private_host_allowlist_syntax() {
+fn validates_remote_import_private_host_allowlist_syntax() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.security.remote_import.allowed_private_hosts = vec![
         "db.internal.example".to_string(),
         "10.20.30.40".to_string(),
         "[fd00::1234]".to_string(),
     ];
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
 
     for invalid in [
         "",
@@ -198,23 +204,26 @@ fn validates_remote_import_private_host_allowlist_syntax() {
         let mut config = valid_config();
         config.security.remote_import.allowed_private_hosts = vec![invalid.to_string()];
         assert!(matches!(
-            validate_config(&config).unwrap_err(),
+            validate_config(&config).expect_err("validate config should return an error"),
             ConfigValidationError::InvalidRemoteImportHost { .. }
         ));
     }
+
+    Ok(())
 }
 
 #[test]
-fn rejects_zero_or_unrepresentable_allocation_limits_but_accepts_zero_reserves() {
+fn rejects_zero_or_unrepresentable_allocation_limits_but_accepts_zero_reserves()
+-> anyhow::Result<()> {
     let mut config = valid_config();
     config.allocation.reserved_memory_mib = 0;
     config.allocation.reserved_disk_mib = 0;
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
 
     let mut config = valid_config();
     config.allocation.max_memory_mib = Some(0);
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::InvalidAllocationLimit {
             field: "max_memory_mib"
         }
@@ -223,11 +232,13 @@ fn rejects_zero_or_unrepresentable_allocation_limits_but_accepts_zero_reserves()
     let mut config = valid_config();
     config.allocation.reserved_disk_mib = u64::MAX;
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::InvalidAllocationLimit {
             field: "reserved_disk_mib"
         }
     ));
+
+    Ok(())
 }
 
 #[test]
@@ -236,7 +247,7 @@ fn rejects_api_self_upgrade() {
     config.security.self_upgrade_enabled = true;
 
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::UnsupportedSelfUpgrade
     ));
 }
@@ -246,21 +257,21 @@ fn rejects_weak_or_placeholder_secrets() {
     let mut config = valid_config();
     config.token = "short-token".to_string();
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::WeakApiToken
     ));
 
     let mut config = valid_config();
     config.token = "REPLACE_WITH_32_BYTE_RANDOM_API_TOKEN".to_string();
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::PlaceholderApiToken
     ));
 
     let mut config = valid_config();
     config.jwt_signing_key = "REPLACE_WITH_32_BYTE_RANDOM_JWT_SIGNING_KEY".to_string();
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::PlaceholderJwtSigningKey
     ));
 }
@@ -271,13 +282,13 @@ fn rejects_reusing_api_token_as_jwt_signing_key() {
     config.jwt_signing_key = config.token.clone();
 
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::ReusedJwtSigningKey
     ));
 }
 
 #[test]
-fn accepts_authenticated_database_gateways_on_public_cleartext_binds() {
+fn accepts_authenticated_database_gateways_on_public_cleartext_binds() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.postgres.bind = "0.0.0.0:5432".to_string();
     config.mariadb.bind = "0.0.0.0:3306".to_string();
@@ -288,43 +299,49 @@ fn accepts_authenticated_database_gateways_on_public_cleartext_binds() {
     config.clickhouse.bind = "0.0.0.0:9000".to_string();
     config.clickhouse.http_bind = "0.0.0.0:8123".to_string();
     config.qdrant.bind = "0.0.0.0:6334".to_string();
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
+
+    Ok(())
 }
 
 #[test]
-fn accepts_public_api_with_plain_http_or_native_tls() {
+fn accepts_public_api_with_plain_http_or_native_tls() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.api.host = "0.0.0.0".to_string();
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir()?;
     let certificate = directory.path().join("certificate.pem");
     let private_key = directory.path().join("private-key.pem");
-    std::fs::write(&certificate, b"test certificate").unwrap();
-    std::fs::write(&private_key, b"test key").unwrap();
+    std::fs::write(&certificate, b"test certificate")?;
+    std::fs::write(&private_key, b"test key")?;
     config.api.ssl.enabled = true;
     config.api.ssl.cert = certificate.display().to_string();
     config.api.ssl.key = private_key.display().to_string();
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
+
+    Ok(())
 }
 
 #[test]
-fn accepts_supported_hostname_and_loopback_api_binds() {
+fn accepts_supported_hostname_and_loopback_api_binds() -> anyhow::Result<()> {
     for host in ["localhost", "dbe.internal", "127.0.0.1", "::1"] {
         let mut config = valid_config();
         config.api.host = host.to_string();
 
-        validate_config(&config).unwrap();
+        validate_config(&config)?;
     }
+
+    Ok(())
 }
 
 #[test]
-fn accepts_exposed_listeners_when_tls_is_configured() {
-    let directory = tempfile::tempdir().unwrap();
+fn accepts_exposed_listeners_when_tls_is_configured() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let certificate = directory.path().join("certificate.pem");
     let private_key = directory.path().join("private-key.pem");
-    std::fs::write(&certificate, b"test certificate").unwrap();
-    std::fs::write(&private_key, b"test key").unwrap();
+    std::fs::write(&certificate, b"test certificate")?;
+    std::fs::write(&private_key, b"test key")?;
 
     let mut config = valid_config();
     config.api.ssl.enabled = true;
@@ -335,18 +352,20 @@ fn accepts_exposed_listeners_when_tls_is_configured() {
     config.tls.cert = certificate.display().to_string();
     config.tls.key = private_key.display().to_string();
 
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
+
+    Ok(())
 }
 
 #[test]
-fn container_engine_socket_path_must_be_absolute() {
+fn container_engine_socket_path_must_be_absolute() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.daemon.socket_path = "/run/podman/podman.sock".to_string();
 
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
     config.daemon.socket_path = "podman.sock".to_string();
 
-    let error = validate_config(&config).unwrap_err();
+    let error = validate_config(&config).expect_err("validate config should return an error");
 
     assert!(matches!(
         error,
@@ -355,10 +374,12 @@ fn container_engine_socket_path_must_be_absolute() {
             ..
         }
     ));
+
+    Ok(())
 }
 
 #[test]
-fn accepts_s3_backup_storage_with_configured_credentials() {
+fn accepts_s3_backup_storage_with_configured_credentials() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.backups.storage.driver = BackupStorageDriver::S3;
     config.backups.storage.s3.bucket = "node-backups".to_string();
@@ -367,11 +388,13 @@ fn accepts_s3_backup_storage_with_configured_credentials() {
     config.backups.storage.s3.secret_access_key =
         crate::config::SensitiveString("test-secret-key".to_string());
 
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
+
+    Ok(())
 }
 
 #[test]
-fn s3_plaintext_endpoint_requires_explicit_opt_in() {
+fn s3_plaintext_endpoint_requires_explicit_opt_in() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.backups.storage.driver = BackupStorageDriver::S3;
     config.backups.storage.s3.bucket = "node-backups".to_string();
@@ -381,14 +404,16 @@ fn s3_plaintext_endpoint_requires_explicit_opt_in() {
         crate::config::SensitiveString("test-secret-key".to_string());
 
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::InvalidBackupConfig {
             field: "storage.s3.endpoint",
             ..
         }
     ));
     config.backups.storage.s3.allow_http = true;
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
+
+    Ok(())
 }
 
 #[test]
@@ -406,16 +431,16 @@ fn identifies_mongodb_8_images_and_incompatible_kernels() {
 }
 
 #[test]
-fn accepts_normal_version_tags_and_rejects_unversioned_runtime_images() {
+fn accepts_normal_version_tags_and_rejects_unversioned_runtime_images() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.images.clickhouse = "clickhouse/clickhouse-server:26.4.4.38".to_string();
     config.images.postgres = "ghcr.io/example/postgres:18.4".to_string();
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
 
     let mut config = valid_config();
     config.images.qdrant = "qdrant/qdrant".to_string();
 
-    let error = validate_config(&config).unwrap_err();
+    let error = validate_config(&config).expect_err("validate config should return an error");
 
     assert!(matches!(
         error,
@@ -424,18 +449,20 @@ fn accepts_normal_version_tags_and_rejects_unversioned_runtime_images() {
             ..
         }
     ));
+
+    Ok(())
 }
 
 #[test]
-fn accepts_normal_allowed_tags_and_rejects_latest() {
+fn accepts_normal_allowed_tags_and_rejects_latest() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.images.allowed.postgres = vec!["postgres:18.4".to_string()];
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
 
     let mut config = valid_config();
     config.images.allowed.postgres = vec!["postgres:latest".to_string()];
 
-    let error = validate_config(&config).unwrap_err();
+    let error = validate_config(&config).expect_err("validate config should return an error");
 
     assert!(matches!(
         error,
@@ -444,6 +471,8 @@ fn accepts_normal_allowed_tags_and_rejects_latest() {
             ..
         }
     ));
+
+    Ok(())
 }
 
 #[test]
@@ -451,13 +480,13 @@ fn rejects_zero_project_id_base() {
     let mut config = valid_config();
     config.disk.project_id_base = 0;
 
-    let error = validate_config(&config).unwrap_err();
+    let error = validate_config(&config).expect_err("validate config should return an error");
 
     assert!(matches!(error, ConfigValidationError::InvalidProjectIdBase));
 }
 
 #[test]
-fn validates_hybrid_soft_scanner_bounds() {
+fn validates_hybrid_soft_scanner_bounds() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.disk.soft_scanner.scan_interval_seconds = 30;
     config.disk.soft_scanner.full_scan_interval_seconds = 30;
@@ -479,24 +508,26 @@ fn validates_hybrid_soft_scanner_bounds() {
     ));
 
     config.disk.soft_scanner.max_dirty_paths_per_instance = 512;
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
 
     // Older configurations could set a longer base interval before the
     // hybrid full-scan field existed. Runtime normalization uses the
     // greater interval instead of rejecting that valid configuration.
     config.disk.soft_scanner.scan_interval_seconds = 3_600;
     config.disk.soft_scanner.full_scan_interval_seconds = 90;
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
+
+    Ok(())
 }
 
 #[test]
-fn external_fuse_helper_requires_absolute_path_and_sha256() {
+fn external_fuse_helper_requires_absolute_path_and_sha256() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.disk.fuse_quota_binary = "bin/fusequota".to_string();
     config.disk.fuse_quota_binary_sha256 = "a".repeat(64);
 
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::RelativePath {
             field: "disk.fuse_quota_binary",
             ..
@@ -506,12 +537,14 @@ fn external_fuse_helper_requires_absolute_path_and_sha256() {
     config.disk.fuse_quota_binary = "/usr/local/libexec/fusequota".to_string();
     config.disk.fuse_quota_binary_sha256 = "A".repeat(64);
     assert!(matches!(
-        validate_config(&config).unwrap_err(),
+        validate_config(&config).expect_err("validate config should return an error"),
         ConfigValidationError::InvalidFuseQuotaBinarySha256
     ));
 
     config.disk.fuse_quota_binary_sha256 = "a".repeat(64);
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
+
+    Ok(())
 }
 
 #[test]
@@ -540,52 +573,55 @@ fn rejects_invalid_remote() {
     let mut config = valid_config();
     config.remote = "panel.example.com".to_string();
 
-    let error = validate_config(&config).unwrap_err();
+    let error = validate_config(&config).expect_err("validate config should return an error");
 
     assert!(matches!(error, ConfigValidationError::InvalidRemoteUrl));
 }
 
 #[test]
-fn standalone_nodes_need_no_remote_and_add_no_panel_origin() {
+fn standalone_nodes_need_no_remote_and_add_no_panel_origin() -> anyhow::Result<()> {
     for remote in ["", "  "] {
         let mut config = valid_config();
         config.remote = remote.to_string();
         config.api.trusted_origins = vec!["https://admin.example.com".to_string()];
 
-        validate_config(&config).unwrap();
+        validate_config(&config)?;
         assert_eq!(
             config.cors_allowed_origins(),
             ["https://admin.example.com:443"]
         );
     }
 
-    let config: Config = yaml_serde::from_str("uuid: node\n").unwrap();
+    let config: Config = yaml_serde::from_str("uuid: node\n")?;
     assert!(config.remote.is_empty());
     assert!(config.cors_allowed_origins().is_empty());
+
+    Ok(())
 }
 
 #[test]
-fn network_api_defaults_on_with_a_root_socket() {
-    let config: Config = yaml_serde::from_str("api:\n  port: 8090\n").unwrap();
+fn network_api_defaults_on_with_a_root_socket() -> anyhow::Result<()> {
+    let config: Config = yaml_serde::from_str("api:\n  port: 8090\n")?;
     assert!(config.api.enabled);
     assert_eq!(config.api_socket_path(), "/run/dbev/api.sock");
 
     let config: Config = yaml_serde::from_str(
         "api:\n  enabled: false\n  socket_path: /run/databases-everywhere/api.sock\n",
-    )
-    .unwrap();
+    )?;
     assert!(!config.api.enabled);
-    let yaml = yaml_serde::to_string(&config).unwrap();
-    let restored: Config = yaml_serde::from_str(&yaml).unwrap();
+    let yaml = yaml_serde::to_string(&config)?;
+    let restored: Config = yaml_serde::from_str(&yaml)?;
     assert!(!restored.api.enabled);
     assert_eq!(
         restored.api.socket_path,
         "/run/databases-everywhere/api.sock"
     );
+
+    Ok(())
 }
 
 #[test]
-fn disabled_network_api_skips_tcp_only_settings() {
+fn disabled_network_api_skips_tcp_only_settings() -> anyhow::Result<()> {
     let mut config = valid_config();
     config.api.host = "https://dbe.example.com".to_string();
     config.api.ssl.enabled = true;
@@ -595,17 +631,19 @@ fn disabled_network_api_skips_tcp_only_settings() {
     ));
 
     config.api.enabled = false;
-    validate_config(&config).unwrap();
+    validate_config(&config)?;
 
     config.api.trusted_origins = vec!["https://admin.example.com/path".to_string()];
     assert!(matches!(
         validate_config(&config),
         Err(ConfigValidationError::InvalidApiOrigin { .. })
     ));
+
+    Ok(())
 }
 
 #[test]
-fn api_socket_path_follows_runtime_path_rules() {
+fn api_socket_path_follows_runtime_path_rules() -> anyhow::Result<()> {
     let mut config = valid_config();
     for path in [
         "",
@@ -613,7 +651,7 @@ fn api_socket_path_follows_runtime_path_rules() {
         "/run/databases-everywhere/admin/api.sock",
     ] {
         config.api.socket_path = path.to_string();
-        validate_config(&config).unwrap();
+        validate_config(&config)?;
     }
 
     for (path, expected) in [
@@ -628,7 +666,7 @@ fn api_socket_path_follows_runtime_path_rules() {
         ("/home/operator/api.sock", "protected"),
     ] {
         config.api.socket_path = path.to_string();
-        let error = validate_config(&config).unwrap_err();
+        let error = validate_config(&config).expect_err("validate config should return an error");
         let kind = match error {
             ConfigValidationError::UnsafeRuntimePath(HostPathPolicyError::Relative {
                 field: "api.socket_path",
@@ -655,14 +693,16 @@ fn api_socket_path_follows_runtime_path_rules() {
         validate_config(&config),
         Err(ConfigValidationError::ApiSocketPathTooLong { maximum: 107, .. })
     ));
+
+    Ok(())
 }
 
 #[test]
-fn api_socket_directory_must_not_traverse_symlinks() {
-    let temporary = tempfile::tempdir().unwrap();
+fn api_socket_directory_must_not_traverse_symlinks() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let real = temporary.path().join("real");
-    std::fs::create_dir(&real).unwrap();
-    std::os::unix::fs::symlink(&real, temporary.path().join("linked")).unwrap();
+    std::fs::create_dir(&real)?;
+    std::os::unix::fs::symlink(&real, temporary.path().join("linked"))?;
     let mut config = valid_config();
     config.api.socket_path = temporary
         .path()
@@ -676,6 +716,8 @@ fn api_socket_directory_must_not_traverse_symlinks() {
             HostPathPolicyError::Symlink { .. }
         ))
     ));
+
+    Ok(())
 }
 
 #[test]

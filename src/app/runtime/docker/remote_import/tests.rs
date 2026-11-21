@@ -18,7 +18,9 @@ use crate::{
 };
 
 #[test]
-fn helper_body_has_only_the_work_mount_and_strict_sandboxing() {
+fn helper_body_has_only_the_work_mount_and_strict_sandboxing() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let spec = RemoteImportHelperSpec {
         image: "postgres:18.4".to_string(),
         work_dir: PathBuf::from("/var/lib/dbev/tmp/import-job"),
@@ -44,9 +46,15 @@ fn helper_body_has_only_the_work_mount_and_strict_sandboxing() {
         rootless_podman: false,
         node_id: "node-test",
     });
-    let labels = body.labels.as_ref().unwrap();
-    let host = body.host_config.as_ref().unwrap();
-    let mounts = host.mounts.as_ref().unwrap();
+    let labels = body.labels.as_ref().context(
+        "helper body has only the work mount and strict sandboxing should provide a value",
+    )?;
+    let host = body.host_config.as_ref().context(
+        "helper body has only the work mount and strict sandboxing should provide a value",
+    )?;
+    let mounts = host.mounts.as_ref().context(
+        "helper body has only the work mount and strict sandboxing should provide a value",
+    )?;
 
     assert_eq!(body.image.as_deref(), Some("postgres:18.4"));
     assert_eq!(body.user.as_deref(), Some("0:0"));
@@ -113,10 +121,14 @@ fn helper_body_has_only_the_work_mount_and_strict_sandboxing() {
     );
     assert_eq!(mounts[0].target.as_deref(), Some(HELPER_WORK_DIR));
     assert_eq!(mounts[0].read_only, Some(false));
+
+    Ok(())
 }
 
 #[test]
-fn rootless_podman_helper_overrides_incompatible_user_namespaces() {
+fn rootless_podman_helper_overrides_incompatible_user_namespaces() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let spec = RemoteImportHelperSpec {
         image: "postgres:18.4".to_string(),
         work_dir: PathBuf::from("/var/lib/dbev/tmp/import-job"),
@@ -148,13 +160,17 @@ fn rootless_podman_helper_overrides_incompatible_user_namespaces() {
     });
 
     assert_eq!(
-        body.host_config.unwrap().userns_mode.as_deref(),
+        body.host_config.context("rootless podman helper overrides incompatible user namespaces should provide a value")?.userns_mode.as_deref(),
         Some("host")
     );
+
+    Ok(())
 }
 
 #[test]
-fn shared_restore_body_has_only_read_only_input_and_work_mounts() {
+fn shared_restore_body_has_only_read_only_input_and_work_mounts() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let secret = SecretString::from("tenant-password".to_string());
     let spec = RemoteImportHelperSpec {
         image: "sha256:pinned-image".to_string(),
@@ -175,7 +191,7 @@ fn shared_restore_body_has_only_read_only_input_and_work_mounts() {
         environment: vec![DockerEnv::new("DBE_IMPORT_PASSWORD", secret)],
         read_only_work_dir: true,
     };
-    let (environment, _) = validate_helper_environment(&spec).unwrap();
+    let (environment, _) = validate_helper_environment(&spec)?;
     let body = import_helper_body(ImportHelperCreateOptions {
         spec: &spec,
         work_dir: &spec.work_dir,
@@ -188,8 +204,12 @@ fn shared_restore_body_has_only_read_only_input_and_work_mounts() {
         rootless_podman: false,
         node_id: "node-test",
     });
-    let host = body.host_config.unwrap();
-    let mounts = host.mounts.unwrap();
+    let host = body.host_config.context(
+        "shared restore body has only read only input and work mounts should provide a value",
+    )?;
+    let mounts = host.mounts.context(
+        "shared restore body has only read only input and work mounts should provide a value",
+    )?;
 
     assert_eq!(
         host.network_mode.as_deref(),
@@ -211,10 +231,12 @@ fn shared_restore_body_has_only_read_only_input_and_work_mounts() {
     assert!(body.env.as_ref().is_some_and(|environment| {
         environment.contains(&"DBE_IMPORT_PASSWORD=tenant-password".to_string())
     }));
+
+    Ok(())
 }
 
 #[test]
-fn helper_output_and_validation_never_expose_environment_secrets() {
+fn helper_output_and_validation_never_expose_environment_secrets() -> anyhow::Result<()> {
     let secret = SecretString::from("correct-horse-battery-staple".to_string());
     let mut spec = RemoteImportHelperSpec {
         image: "postgres:18.4".to_string(),
@@ -228,21 +250,25 @@ fn helper_output_and_validation_never_expose_environment_secrets() {
         environment: vec![DockerEnv::new("PGPASSWORD", secret)],
         read_only_work_dir: false,
     };
-    let (_, secrets) = validate_helper_environment(&spec).unwrap();
+    let (_, secrets) = validate_helper_environment(&spec)?;
     let redacted = redact_helper_output("password=correct-horse-battery-staple", &secrets);
     assert!(!redacted.contains("correct-horse-battery-staple"));
     assert!(redacted.contains("[redacted]"));
 
     spec.script = "echo correct-horse-battery-staple".to_string();
-    let error = validate_helper_environment(&spec).unwrap_err().to_string();
+    let error = validate_helper_environment(&spec)
+        .expect_err("validate helper environment should return an error")
+        .to_string();
     assert!(!error.contains("correct-horse-battery-staple"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn helper_input_rejects_digest_changes_before_container_creation() {
-    let directory = tempfile::tempdir().unwrap();
+async fn helper_input_rejects_digest_changes_before_container_creation() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let input = directory.path().join("dump.sql");
-    std::fs::write(&input, b"unsafe").unwrap();
+    std::fs::write(&input, b"unsafe")?;
     let expected: [u8; 32] = Sha256::digest(b"safe!!").into();
     let error = validate_helper_input(Some(&ImportHelperInput {
         path: input,
@@ -250,8 +276,10 @@ async fn helper_input_rejects_digest_changes_before_container_creation() {
         sha256: expected,
     }))
     .await
-    .unwrap_err();
+    .expect_err("validate helper input should return an error");
     assert!(!error.to_string().contains("unsafe"));
+
+    Ok(())
 }
 
 #[test]

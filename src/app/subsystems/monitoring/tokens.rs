@@ -247,6 +247,8 @@ fn known_scope(scope: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     fn request(instances: Vec<&str>, all_instances: bool) -> IssueWsTokenRequest {
@@ -262,21 +264,23 @@ mod tests {
     }
 
     #[test]
-    fn instance_scope_must_be_explicit_unambiguous_and_unique() {
+    fn instance_scope_must_be_explicit_unambiguous_and_unique() -> anyhow::Result<()> {
         assert!(matches!(
             validate_request(&request(Vec::new(), false)),
             Err(ApiError::BadRequest(_))
         ));
-        validate_request(&request(Vec::new(), true)).unwrap();
+        validate_request(&request(Vec::new(), true))?;
         assert!(validate_request(&request(vec!["inst_one"], true)).is_err());
         assert!(matches!(
             validate_request(&request(vec!["inst_one", "inst_one"], false)),
             Err(ApiError::BadRequest(_))
         ));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tokens_bind_running_creations_and_reject_unknown_instances() {
+    async fn tokens_bind_running_creations_and_reject_unknown_instances() -> anyhow::Result<()> {
         let (state, _dir) =
             crate::subsystems::test_support::database(crate::config::Config::default()).await;
         assert!(matches!(
@@ -291,18 +295,18 @@ mod tests {
                 "postgres:18.4",
                 true,
             )
-            .unwrap();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let generation = state
             .install_progress
             .get("creating_one")
-            .unwrap()
+            .context("missing creating_one entry")?
             .creation_generation()
-            .unwrap();
+            .context("expected a value from creation_generation")?;
         assert_eq!(
-            instance_generation_digest(&state, &["creating_one".to_string()])
-                .await
-                .unwrap(),
+            instance_generation_digest(&state, &["creating_one".to_string()]).await?,
             jwt::instance_generation_digest(&[("creating_one".to_string(), generation)])
         );
+
+        Ok(())
     }
 }

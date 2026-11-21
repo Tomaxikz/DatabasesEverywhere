@@ -452,7 +452,7 @@ mod tests {
 
     fn write_file(directory: &TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = directory.path().join(name);
-        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(&path, bytes).expect("write should succeed");
         path
     }
 
@@ -465,7 +465,7 @@ mod tests {
                 "server_version": "8.0.0",
                 "tool_version": "100.12.2",
             })
-            .unwrap(),
+            .expect("to vec should succeed"),
         );
         bytes.extend(
             bson::Document::to_vec(&bson::doc! {
@@ -475,17 +475,17 @@ mod tests {
                 "size": 0_i32,
                 "type": "collection",
             })
-            .unwrap(),
+            .expect("to vec should succeed"),
         );
         bytes.extend(u32::MAX.to_le_bytes());
         let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
-        gzip.write_all(&bytes).unwrap();
-        gzip.finish().unwrap()
+        gzip.write_all(&bytes).expect("write all should succeed");
+        gzip.finish().expect("finish should succeed")
     }
 
     #[tokio::test]
-    async fn approval_is_explicitly_tenant_only_and_staged() {
-        let directory = TempDir::new().unwrap();
+    async fn approval_is_explicitly_tenant_only_and_staged() -> anyhow::Result<()> {
+        let directory = TempDir::new()?;
         let path = write_file(
             &directory,
             "tenant.mysql.sql",
@@ -502,30 +502,29 @@ mod tests {
                 postgres_wrapper_lines: None,
             },
         )
-        .await
-        .unwrap();
+        .await?;
         assert!(approval.requires_isolated_staging);
         assert!(approval.restore_as_tenant);
         assert_eq!(approval.namespaces_checked, ["tenant_db"]);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn archive_links_and_physical_restore_fail_closed() {
-        let directory = TempDir::new().unwrap();
+    async fn archive_links_and_physical_restore_fail_closed() -> anyhow::Result<()> {
+        let directory = TempDir::new()?;
         let path = directory.path().join("linked.tar");
         {
-            let output = std::fs::File::create(&path).unwrap();
+            let output = std::fs::File::create(&path)?;
             let mut archive = tar::Builder::new(output);
             let mut header = tar::Header::new_gnu();
             header.set_entry_type(tar::EntryType::Symlink);
             header.set_size(0);
             header.set_mode(0o777);
-            header.set_link_name("../../etc/passwd").unwrap();
+            header.set_link_name("../../etc/passwd")?;
             header.set_cksum();
-            archive
-                .append_data(&mut header, "dump.sql", std::io::empty())
-                .unwrap();
-            archive.finish().unwrap();
+            archive.append_data(&mut header, "dump.sql", std::io::empty())?;
+            archive.finish()?;
         }
         let error = validate_shared_import(
             &path,
@@ -539,7 +538,7 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .expect_err("validate shared import should return an error");
         assert_eq!(error.reason, SharedImportRejection::UnsafeArchive);
 
         let physical = validate_shared_import(
@@ -554,21 +553,23 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .expect_err("validate shared import should return an error");
         assert_eq!(physical.reason, SharedImportRejection::PhysicalRestore);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn validates_every_compressed_stream_member() {
-        let directory = TempDir::new().unwrap();
+    async fn validates_every_compressed_stream_member() -> anyhow::Result<()> {
+        let directory = TempDir::new()?;
         let mut wrapped = Vec::new();
         for sql in [
             b"USE tenant_db;".as_slice(),
             b"DROP USER tenant_admin;".as_slice(),
         ] {
             let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
-            gzip.write_all(sql).unwrap();
-            wrapped.extend(gzip.finish().unwrap());
+            gzip.write_all(sql)?;
+            wrapped.extend(gzip.finish()?);
         }
         let path = write_file(&directory, "members.mysql.sql.gz", &wrapped);
         let error = validate_shared_import(
@@ -583,13 +584,15 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .expect_err("validate shared import should return an error");
         assert_eq!(error.reason, SharedImportRejection::PrivilegedStatement);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn mongodb_requires_exact_safe_namespace_and_metadata() {
-        let directory = TempDir::new().unwrap();
+    async fn mongodb_requires_exact_safe_namespace_and_metadata() -> anyhow::Result<()> {
+        let directory = TempDir::new()?;
         for (name, database, collection, metadata, expected) in [
             ("safe", "tenant_db", "items", "{}", None),
             (
@@ -632,15 +635,18 @@ mod tests {
             )
             .await;
             match expected {
-                Some(reason) => assert_eq!(result.unwrap_err().reason, reason),
+                Some(reason) => assert_eq!(result.expect_err("mongodb requires exact safe namespace and metadata should return an error").reason, reason),
                 None => assert!(result.is_ok(), "{result:?}"),
             }
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn postgres_admission_checks_the_same_wrapper_filtered_stream_as_execution() {
-        let directory = TempDir::new().unwrap();
+    async fn postgres_admission_checks_the_same_wrapper_filtered_stream_as_execution()
+    -> anyhow::Result<()> {
+        let directory = TempDir::new()?;
         let path = write_file(
             &directory,
             "tenant.postgres.sql",
@@ -654,7 +660,7 @@ mod tests {
             archive_format: Some("plain"),
             postgres_wrapper_lines: Some((2, 4)),
         };
-        let approval = validate_shared_import(&path, request).await.unwrap();
+        let approval = validate_shared_import(&path, request).await?;
         assert_eq!(approval.statements_checked, 1);
 
         let error = validate_shared_import(
@@ -665,7 +671,9 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .expect_err("validate shared import should return an error");
         assert_eq!(error.reason, SharedImportRejection::PrivilegedStatement);
+
+        Ok(())
     }
 }

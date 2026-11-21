@@ -56,39 +56,49 @@ impl QueryBudget {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn reservations_are_shared_and_released() {
+    fn reservations_are_shared_and_released() -> anyhow::Result<()> {
         let budget = QueryBudget {
             tenant: Arc::new(Semaphore::new(8)),
             global: Arc::new(Semaphore::new(16)),
         };
         let other_connection = budget.clone();
-        let reserved = budget.reserve(6).unwrap();
+        let reserved = budget.reserve(6)?;
         assert!(other_connection.reserve(3).is_err());
         drop(reserved);
         assert!(other_connection.reserve(8).is_ok());
         assert_eq!(budget.tenant.available_permits(), 8);
         assert_eq!(budget.global.available_permits(), 16);
+
+        Ok(())
     }
 
     #[test]
-    fn global_rejection_releases_tenant_reservation() {
+    fn global_rejection_releases_tenant_reservation() -> anyhow::Result<()> {
         let budget = QueryBudget {
             tenant: Arc::new(Semaphore::new(8)),
             global: Arc::new(Semaphore::new(4)),
         };
         assert_eq!(
-            budget.reserve(6).err().unwrap().kind(),
+            budget
+                .reserve(6)
+                .err()
+                .context("err should provide a value")?
+                .kind(),
             io::ErrorKind::WouldBlock
         );
         assert_eq!(budget.tenant.available_permits(), 8);
         assert_eq!(budget.global.available_permits(), 4);
+
+        Ok(())
     }
 
     #[test]
-    fn tenants_share_the_configured_global_capacity() {
+    fn tenants_share_the_configured_global_capacity() -> anyhow::Result<()> {
         let settings = crate::config::Config {
             daemon: crate::config::DaemonConfig {
                 sql_buffer_global_mib: 1,
@@ -96,21 +106,27 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = RuntimeConfig::new(settings).unwrap();
+        let config = RuntimeConfig::new(settings)?;
         let first = QueryBudget::new(&config);
         let second = QueryBudget::new(&config);
-        let reservation = first.reserve(1024 * 1024).unwrap();
+        let reservation = first.reserve(1024 * 1024)?;
         assert_eq!(
-            second.reserve(1).err().unwrap().kind(),
+            second
+                .reserve(1)
+                .err()
+                .context("err should provide a value")?
+                .kind(),
             io::ErrorKind::WouldBlock
         );
         assert_eq!(second.tenant.available_permits(), TENANT_BYTES);
         drop(reservation);
         assert!(second.reserve(1024 * 1024).is_ok());
+
+        Ok(())
     }
 
     #[test]
-    fn independent_runtime_configs_do_not_share_capacity() {
+    fn independent_runtime_configs_do_not_share_capacity() -> anyhow::Result<()> {
         let settings = crate::config::Config {
             daemon: crate::config::DaemonConfig {
                 sql_buffer_global_mib: 1,
@@ -118,9 +134,11 @@ mod tests {
             },
             ..Default::default()
         };
-        let first = QueryBudget::new(&RuntimeConfig::new(settings.clone()).unwrap());
-        let second = QueryBudget::new(&RuntimeConfig::new(settings).unwrap());
-        let _first = first.reserve(1024 * 1024).unwrap();
+        let first = QueryBudget::new(&RuntimeConfig::new(settings.clone())?);
+        let second = QueryBudget::new(&RuntimeConfig::new(settings)?);
+        let _first = first.reserve(1024 * 1024)?;
         assert!(second.reserve(1024 * 1024).is_ok());
+
+        Ok(())
     }
 }

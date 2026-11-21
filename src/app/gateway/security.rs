@@ -235,10 +235,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quota_does_not_double_across_a_minute_boundary() {
+    fn quota_does_not_double_across_a_minute_boundary() -> anyhow::Result<()> {
         let clock = governor::clock::FakeRelativeClock::default();
         let limiter = GatewayConnectionLimiter::with_clock(60, 1000, clock.clone());
-        let ip = "192.0.2.30".parse().unwrap();
+        let ip = "192.0.2.30".parse()?;
         let allowed_until_rejected = || {
             let mut allowed = 0;
             while limiter.try_acquire(ip).is_ok() {
@@ -249,7 +249,11 @@ mod tests {
 
         // A fixed window opened at t=0 would admit 60 at t=59s and another 60
         // at t=61s. GCRA only refills one connection per second.
-        drop(limiter.try_acquire(ip).unwrap());
+        drop(
+            limiter
+                .try_acquire(ip)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+        );
         clock.advance(Duration::from_secs(59));
         assert_eq!(allowed_until_rejected(), 60);
         clock.advance(Duration::from_secs(2));
@@ -261,32 +265,50 @@ mod tests {
                 should_log: false,
             })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn idle_peers_are_evicted_but_active_peers_are_kept() {
+    fn idle_peers_are_evicted_but_active_peers_are_kept() -> anyhow::Result<()> {
         let clock = governor::clock::FakeRelativeClock::default();
         let limiter = GatewayConnectionLimiter::with_clock(2, 2, clock.clone());
-        let idle = "192.0.2.40".parse().unwrap();
-        let busy = "192.0.2.41".parse().unwrap();
-        drop(limiter.try_acquire(idle).unwrap());
-        let _permit = limiter.try_acquire(busy).unwrap();
+        let idle = "192.0.2.40".parse()?;
+        let busy = "192.0.2.41".parse()?;
+        drop(
+            limiter
+                .try_acquire(idle)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+        );
+        let _permit = limiter
+            .try_acquire(busy)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
 
         clock.advance(DB_CONNECTION_WINDOW);
-        drop(limiter.try_acquire("192.0.2.42".parse().unwrap()).unwrap());
+        drop(
+            limiter
+                .try_acquire("192.0.2.42".parse()?)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+        );
         let state = limiter.inner.lock();
         assert!(!state.peers.contains_key(&GatewayPeer::from_ip(idle)));
         assert!(state.peers.contains_key(&GatewayPeer::from_ip(busy)));
         assert_eq!(state.limiter.len(), 1);
+
+        Ok(())
     }
 
     #[test]
-    fn active_peer_limit_is_configurable_and_releases_capacity() {
+    fn active_peer_limit_is_configurable_and_releases_capacity() -> anyhow::Result<()> {
         let limiter = GatewayConnectionLimiter::with_active_limit(1000, 80);
-        let ip = "192.0.2.20".parse().unwrap();
+        let ip = "192.0.2.20".parse()?;
         let mut permits = Vec::new();
         for _ in 0..80 {
-            permits.push(limiter.try_acquire(ip).unwrap());
+            permits.push(
+                limiter
+                    .try_acquire(ip)
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+            );
         }
         assert!(matches!(
             limiter.try_acquire(ip),
@@ -297,14 +319,20 @@ mod tests {
         ));
         permits.pop();
         assert!(limiter.try_acquire(ip).is_ok());
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_excess_active_connections_and_releases_permit() {
+    fn rejects_excess_active_connections_and_releases_permit() -> anyhow::Result<()> {
         let limiter = GatewayConnectionLimiter::new(2);
-        let ip = "203.0.113.10".parse().unwrap();
-        let first = limiter.try_acquire(ip).unwrap();
-        let second = limiter.try_acquire(ip).unwrap();
+        let ip = "203.0.113.10".parse()?;
+        let first = limiter
+            .try_acquire(ip)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let second = limiter
+            .try_acquire(ip)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
 
         assert!(matches!(
             limiter.try_acquire(ip),
@@ -317,25 +345,33 @@ mod tests {
         drop(first);
         assert!(limiter.try_acquire(ip).is_err(), "rate limit still applies");
         drop(second);
+
+        Ok(())
     }
 
     #[test]
-    fn tracks_active_connections_independently_per_ip() {
+    fn tracks_active_connections_independently_per_ip() -> anyhow::Result<()> {
         let limiter = GatewayConnectionLimiter::new(1);
-        let first_ip = "203.0.113.10".parse().unwrap();
-        let second_ip = "203.0.113.11".parse().unwrap();
+        let first_ip = "203.0.113.10".parse()?;
+        let second_ip = "203.0.113.11".parse()?;
 
-        let _first = limiter.try_acquire(first_ip).unwrap();
+        let _first = limiter
+            .try_acquire(first_ip)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         assert!(limiter.try_acquire(second_ip).is_ok());
+
+        Ok(())
     }
 
     #[test]
-    fn cloned_limiters_share_per_ip_accounting_across_listeners() {
+    fn cloned_limiters_share_per_ip_accounting_across_listeners() -> anyhow::Result<()> {
         let first_listener = GatewayConnectionLimiter::new(1);
         let second_listener = first_listener.clone();
-        let ip = "203.0.113.10".parse().unwrap();
+        let ip = "203.0.113.10".parse()?;
 
-        let _permit = first_listener.try_acquire(ip).unwrap();
+        let _permit = first_listener
+            .try_acquire(ip)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
 
         assert!(matches!(
             second_listener.try_acquire(ip),
@@ -344,16 +380,22 @@ mod tests {
                 ..
             })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn groups_ipv6_addresses_by_64_bit_prefix() {
+    fn groups_ipv6_addresses_by_64_bit_prefix() -> anyhow::Result<()> {
         let limiter = GatewayConnectionLimiter::new(2);
-        let first = "2001:db8:1234:5678::1".parse().unwrap();
-        let second = "2001:db8:1234:5678::2".parse().unwrap();
+        let first = "2001:db8:1234:5678::1".parse()?;
+        let second = "2001:db8:1234:5678::2".parse()?;
 
-        let _first = limiter.try_acquire(first).unwrap();
-        let _second = limiter.try_acquire(second).unwrap();
+        let _first = limiter
+            .try_acquire(first)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let _second = limiter
+            .try_acquire(second)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         assert!(matches!(
             limiter.try_acquire(first),
             Err(GatewayConnectionRejection {
@@ -361,30 +403,42 @@ mod tests {
                 ..
             })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn ipv4_mapped_ipv6_uses_distinct_native_ipv4_identities() {
-        let native = GatewayPeer::from_ip("203.0.113.10".parse().unwrap());
-        let mapped = GatewayPeer::from_ip("::ffff:203.0.113.10".parse().unwrap());
+    fn ipv4_mapped_ipv6_uses_distinct_native_ipv4_identities() -> anyhow::Result<()> {
+        let native = GatewayPeer::from_ip("203.0.113.10".parse()?);
+        let mapped = GatewayPeer::from_ip("::ffff:203.0.113.10".parse()?);
         assert_eq!(native, mapped);
 
-        let first = GatewayPeer::from_ip("::ffff:203.0.113.10".parse().unwrap());
-        let second = GatewayPeer::from_ip("::ffff:203.0.113.11".parse().unwrap());
+        let first = GatewayPeer::from_ip("::ffff:203.0.113.10".parse()?);
+        let second = GatewayPeer::from_ip("::ffff:203.0.113.11".parse()?);
 
         assert_ne!(first, second);
+
+        Ok(())
     }
 
     #[test]
-    fn repeated_rejections_are_logged_once_until_recovery() {
+    fn repeated_rejections_are_logged_once_until_recovery() -> anyhow::Result<()> {
         let limiter = GatewayConnectionLimiter::new(1);
-        let ip = "203.0.113.10".parse().unwrap();
-        let permit = limiter.try_acquire(ip).unwrap();
-        let first = limiter.try_acquire(ip).unwrap_err();
-        let repeated = limiter.try_acquire(ip).unwrap_err();
+        let ip = "203.0.113.10".parse()?;
+        let permit = limiter
+            .try_acquire(ip)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let first = limiter
+            .try_acquire(ip)
+            .expect_err("try acquire should return an error");
+        let repeated = limiter
+            .try_acquire(ip)
+            .expect_err("try acquire should return an error");
 
         assert!(first.should_log);
         assert!(!repeated.should_log);
         drop(permit);
+
+        Ok(())
     }
 }

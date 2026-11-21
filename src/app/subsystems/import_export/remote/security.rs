@@ -359,27 +359,28 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_request_defaults_to_tls() {
+    fn endpoint_request_defaults_to_tls() -> anyhow::Result<()> {
         let request: RemoteEndpointRequest =
-            serde_json::from_value(serde_json::json!({"host": "db.example.com"})).unwrap();
+            serde_json::from_value(serde_json::json!({"host": "db.example.com"}))?;
 
         assert_eq!(request.port, None);
         assert!(request.tls);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resolves_and_pins_public_addresses() {
+    async fn resolves_and_pins_public_addresses() -> anyhow::Result<()> {
         let resolved = resolve_with_addresses(
             "DB.Example.COM.",
             &[
-                "2001:4860:4860::8888".parse().unwrap(),
-                "8.8.8.8".parse().unwrap(),
-                "8.8.8.8".parse().unwrap(),
+                "2001:4860:4860::8888".parse()?,
+                "8.8.8.8".parse()?,
+                "8.8.8.8".parse()?,
             ],
             &secure_config(),
         )
-        .await
-        .unwrap();
+        .await?;
 
         assert_eq!(resolved.host, "db.example.com");
         assert_eq!(resolved.port, 5432);
@@ -391,10 +392,12 @@ mod tests {
                 "db.example.com:[2001:4860:4860::8888]",
             ]
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn literal_ip_does_not_call_dns_or_create_extra_hosts() {
+    async fn literal_ip_does_not_call_dns_or_create_extra_hosts() -> anyhow::Result<()> {
         let resolved = resolve_endpoint_with(
             RemoteEndpointRequest {
                 host: "8.8.8.8".to_string(),
@@ -405,28 +408,30 @@ mod tests {
             &secure_config(),
             |_, _| async { panic!("literal IP must bypass DNS") },
         )
-        .await
-        .unwrap();
+        .await?;
 
-        assert_eq!(resolved.addresses, vec!["8.8.8.8:15432".parse().unwrap()]);
+        assert_eq!(resolved.addresses, vec!["8.8.8.8:15432".parse()?]);
         assert!(resolved.helper_extra_hosts().is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn remote_import_must_be_enabled() {
+    async fn remote_import_must_be_enabled() -> anyhow::Result<()> {
         let mut security = secure_config();
         security.enabled = false;
 
-        let error =
-            resolve_with_addresses("db.example.com", &["8.8.8.8".parse().unwrap()], &security)
-                .await
-                .unwrap_err();
+        let error = resolve_with_addresses("db.example.com", &["8.8.8.8".parse()?], &security)
+            .await
+            .expect_err("parse should return an error");
 
         assert!(error.to_string().contains("disabled"));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn plaintext_requires_explicit_node_policy() {
+    async fn plaintext_requires_explicit_node_policy() -> anyhow::Result<()> {
         let request = RemoteEndpointRequest {
             host: "8.8.8.8".to_string(),
             port: None,
@@ -436,7 +441,7 @@ mod tests {
             panic!("policy rejection must happen before DNS")
         })
         .await
-        .unwrap_err();
+        .expect_err("secure config should return an error");
         assert!(error.to_string().contains("require TLS"));
 
         let mut security = secure_config();
@@ -444,9 +449,10 @@ mod tests {
         let resolved = resolve_endpoint_with(request, 5432, &security, |_, _| async {
             panic!("literal IP must bypass DNS")
         })
-        .await
-        .unwrap();
+        .await?;
         assert!(!resolved.tls);
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -466,7 +472,7 @@ mod tests {
                     panic!("invalid host must be rejected before DNS")
                 })
                 .await
-                .unwrap_err();
+                .expect_err("secure config should return an error");
             assert!(error.to_string().contains("valid host name"), "{host}");
         }
 
@@ -479,7 +485,7 @@ mod tests {
             panic!("invalid port must be rejected before DNS")
         })
         .await
-        .unwrap_err();
+        .expect_err("secure config should return an error");
         assert!(error.to_string().contains("port"));
     }
 
@@ -487,7 +493,7 @@ mod tests {
     async fn rejects_empty_failed_and_timed_out_resolution() {
         let empty = resolve_with_addresses("db.example.com", &[], &secure_config())
             .await
-            .unwrap_err();
+            .expect_err("secure config should return an error");
         assert!(empty.to_string().contains("did not resolve to an address"));
 
         let failure = resolve_endpoint_with(
@@ -497,7 +503,7 @@ mod tests {
             |_, _| async { Err(io::Error::other("resolver detail")) },
         )
         .await
-        .unwrap_err();
+        .expect_err("other should return an error");
         assert!(failure.to_string().contains("could not be resolved"));
         assert!(!failure.to_string().contains("resolver detail"));
 
@@ -508,7 +514,7 @@ mod tests {
                 pending::<io::Result<Vec<SocketAddr>>>().await
             })
             .await
-            .unwrap_err();
+            .expect_err("pending should return an error");
         assert!(timeout.to_string().contains("configured timeout"));
     }
 
@@ -520,13 +526,13 @@ mod tests {
 
         let error = resolve_with_addresses("many.example", &addresses, &secure_config())
             .await
-            .unwrap_err();
+            .expect_err("secure config should return an error");
 
         assert!(error.to_string().contains("more than 64 addresses"));
     }
 
     #[tokio::test]
-    async fn rejects_private_addresses_without_exact_allowlist_match() {
+    async fn rejects_private_addresses_without_exact_allowlist_match() -> anyhow::Result<()> {
         for address in [
             "10.0.0.1",
             "172.16.10.2",
@@ -536,33 +542,36 @@ mod tests {
         ] {
             let error = resolve_with_addresses(
                 "db.internal.example",
-                &[address.parse().unwrap()],
+                &[address.parse()?],
                 &secure_config(),
             )
             .await
-            .unwrap_err();
+            .expect_err("secure config should return an error");
             assert!(error.to_string().contains("private address"), "{address}");
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn exact_allowlist_match_accepts_private_addresses() {
+    async fn exact_allowlist_match_accepts_private_addresses() -> anyhow::Result<()> {
         let mut security = secure_config();
         security.allowed_private_hosts = vec!["DB.Internal.Example.".to_string()];
 
         let resolved = resolve_with_addresses(
             "db.internal.example",
-            &["10.0.0.1".parse().unwrap(), "fd00::1234".parse().unwrap()],
+            &["10.0.0.1".parse()?, "fd00::1234".parse()?],
             &security,
         )
-        .await
-        .unwrap();
+        .await?;
 
         assert_eq!(resolved.addresses.len(), 2);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn allowlist_never_overrides_always_forbidden_ranges() {
+    async fn allowlist_never_overrides_always_forbidden_ranges() -> anyhow::Result<()> {
         let mut security = secure_config();
         security.allowed_private_hosts = vec!["blocked.internal".to_string()];
         for address in [
@@ -592,19 +601,20 @@ mod tests {
             "3fff::1",
             "ff02::1",
         ] {
-            let error =
-                resolve_with_addresses("blocked.internal", &[address.parse().unwrap()], &security)
-                    .await
-                    .unwrap_err();
+            let error = resolve_with_addresses("blocked.internal", &[address.parse()?], &security)
+                .await
+                .expect_err("parse should return an error");
             assert!(
                 error.to_string().contains("reserved address"),
                 "{address}: {error}"
             );
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn ipv4_mapped_ipv6_is_always_rejected() {
+    async fn ipv4_mapped_ipv6_is_always_rejected() -> anyhow::Result<()> {
         let mut security = secure_config();
         security.allowed_private_hosts = vec!["blocked.internal".to_string()];
 
@@ -612,26 +622,31 @@ mod tests {
             ("blocked.internal", "::ffff:127.0.0.1", security.clone()),
             ("public.example", "::ffff:8.8.8.8", secure_config()),
         ] {
-            let error = resolve_with_addresses(host, &[address.parse().unwrap()], &policy)
+            let error = resolve_with_addresses(host, &[address.parse()?], &policy)
                 .await
-                .unwrap_err();
+                .expect_err("parse should return an error");
             assert!(error.to_string().contains("reserved address"), "{address}");
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_mixed_public_and_private_dns_answers_even_when_allowlisted() {
+    async fn rejects_mixed_public_and_private_dns_answers_even_when_allowlisted()
+    -> anyhow::Result<()> {
         let mut security = secure_config();
         security.allowed_private_hosts = vec!["mixed.example".to_string()];
 
         let error = resolve_with_addresses(
             "mixed.example",
-            &["8.8.8.8".parse().unwrap(), "10.0.0.1".parse().unwrap()],
+            &["8.8.8.8".parse()?, "10.0.0.1".parse()?],
             &security,
         )
         .await
-        .unwrap_err();
+        .expect_err("parse should return an error");
 
         assert!(error.to_string().contains("mix of public and private"));
+
+        Ok(())
     }
 }

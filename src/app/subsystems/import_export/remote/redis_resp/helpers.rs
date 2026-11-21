@@ -40,16 +40,12 @@ pub(super) fn tls_server_name(host: &str) -> Result<ServerName<'static>, ()> {
 }
 
 pub(super) fn parse_scan_page(value: RespValue) -> RedisRespResult<ScanPage> {
-    let RespValue::Array(Some(mut outer)) = value else {
+    let RespValue::Array(Some(outer)) = value else {
         return Err(unexpected("SCAN", "two-element array", &value));
     };
-    if outer.len() != 2 {
-        return Err(RedisRespError::Protocol(
-            "SCAN response must contain cursor and keys".to_string(),
-        ));
-    }
-    let keys = outer.pop().expect("length checked");
-    let cursor = outer.pop().expect("length checked");
+    let [cursor, keys]: [RespValue; 2] = outer.try_into().map_err(|_| {
+        RedisRespError::Protocol("SCAN response must contain cursor and keys".to_string())
+    })?;
     let cursor = match cursor {
         RespValue::Bulk(Some(cursor)) | RespValue::Simple(cursor) => {
             parse_u64(&cursor, "SCAN cursor")?

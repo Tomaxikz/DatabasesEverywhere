@@ -748,8 +748,8 @@ mod tests {
     use crate::subsystems::monitoring::resources::Protocol;
 
     #[tokio::test]
-    async fn native_quota_pools_report_scanned_disk_usage() {
-        let directory = tempfile::tempdir().unwrap();
+    async fn native_quota_pools_report_scanned_disk_usage() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let mut config = Config {
             remote: "https://panel.example.test".into(),
             ..Default::default()
@@ -780,7 +780,9 @@ mod tests {
                 )
                 .await;
 
-            let usage = shared_runtime_disk_usage(&state, &pool).await.unwrap();
+            let usage = shared_runtime_disk_usage(&state, &pool)
+                .await
+                .map_err(anyhow::Error::msg)?;
 
             assert_eq!(usage.bytes, 42, "{method}");
             assert!(matches!(
@@ -788,5 +790,7 @@ mod tests {
                 SharedDiskUsageSource::ResourceDiskSampler
             ));
         }
+
+        Ok(())
     }
 }

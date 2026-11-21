@@ -6,13 +6,15 @@ pub async fn run(pool: &SqlitePool) -> Result<(), sqlx::migrate::MigrateError> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use sqlx::Row;
 
     use super::*;
 
     #[tokio::test]
-    async fn legacy_route_duplicates_are_quarantined_before_unique_indexes() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    async fn legacy_route_duplicates_are_quarantined_before_unique_indexes() -> anyhow::Result<()> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
         sqlx::raw_sql(
             r#"
             CREATE TABLE instance_metadata (
@@ -30,24 +32,21 @@ mod tests {
             "#,
         )
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
         sqlx::raw_sql(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/migrations/20260709120000_enforce_unique_instance_routes.sql"
         )))
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
         let rows = sqlx::query(
             "SELECT instance_id, status, json_extract(metadata_json, '$.status') AS json_status \
              FROM instance_metadata ORDER BY instance_id",
         )
         .fetch_all(&pool)
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(rows[0].get::<String, _>("status"), "running");
         assert_eq!(rows[1].get::<String, _>("status"), "quarantined");
         assert_eq!(rows[2].get::<String, _>("status"), "quarantined");
@@ -59,11 +58,14 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(restart_conflict.is_err());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn legacy_valkey_username_duplicates_are_quarantined_before_unique_index() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    async fn legacy_valkey_username_duplicates_are_quarantined_before_unique_index()
+    -> anyhow::Result<()> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
         sqlx::raw_sql(
             r#"
             CREATE TABLE instance_metadata (
@@ -84,22 +86,19 @@ mod tests {
             "#,
         )
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
         sqlx::raw_sql(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/migrations/20260808120000_add_valkey_route_uniqueness.sql"
         )))
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
         let rows =
             sqlx::query("SELECT instance_id, status FROM instance_metadata ORDER BY instance_id")
                 .fetch_all(&pool)
-                .await
-                .unwrap();
+                .await?;
         assert_eq!(rows[0].get::<String, _>("status"), "running");
         assert_eq!(rows[1].get::<String, _>("status"), "quarantined");
 
@@ -109,11 +108,13 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(restart_conflict.is_err());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn desired_state_migration_preserves_stops_and_retries_failures() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    async fn desired_state_migration_preserves_stops_and_retries_failures() -> anyhow::Result<()> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
         sqlx::raw_sql(
             r#"
             CREATE TABLE instance_metadata (
@@ -131,23 +132,20 @@ mod tests {
             "#,
         )
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
         sqlx::raw_sql(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/migrations/20260809180000_add_instance_desired_state.sql"
         )))
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
         let rows = sqlx::query(
             "SELECT instance_id, desired_state FROM instance_metadata ORDER BY instance_id",
         )
         .fetch_all(&pool)
-        .await
-        .unwrap()
+        .await?
         .into_iter()
         .map(|row| {
             (
@@ -162,11 +160,13 @@ mod tests {
         for instance_id in ["deleting", "quarantined", "stopped"] {
             assert_eq!(rows.get(instance_id).map(String::as_str), Some("stopped"));
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn disk_limit_block_migration_does_not_conflate_operator_stops() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    async fn disk_limit_block_migration_does_not_conflate_operator_stops() -> anyhow::Result<()> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
         sqlx::raw_sql(
             r#"
             CREATE TABLE instance_metadata (
@@ -180,35 +180,34 @@ mod tests {
             "#,
         )
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
         sqlx::raw_sql(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/migrations/20260809190000_add_disk_limit_blocked.sql"
         )))
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
         let blocked = sqlx::query("SELECT disk_limit_blocked FROM instance_metadata")
             .fetch_all(&pool)
-            .await
-            .unwrap();
+            .await?;
         assert!(
             blocked
                 .iter()
                 .all(|row| !row.get::<bool, _>("disk_limit_blocked"))
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn placement_migration_preserves_legacy_runtime_and_restricts_deletion() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    async fn placement_migration_preserves_legacy_runtime_and_restricts_deletion()
+    -> anyhow::Result<()> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(&pool)
-            .await
-            .unwrap();
+            .await?;
         sqlx::raw_sql(
             r#"
             CREATE TABLE instance_metadata (
@@ -244,7 +243,7 @@ mod tests {
         )
         .execute(&pool)
         .await
-        .unwrap();
+        ?;
 
         for status in [
             "creating",
@@ -277,7 +276,7 @@ mod tests {
             ))
             .execute(&pool)
             .await
-            .unwrap();
+            ?;
         }
 
         sqlx::raw_sql(include_str!(concat!(
@@ -285,15 +284,14 @@ mod tests {
             "/migrations/20260827120000_add_engine_runtimes.sql"
         )))
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
         let placement: (String, String) = sqlx::query_as(
             "SELECT deployment_mode, runtime_id FROM instance_metadata WHERE instance_id = 'legacy_one'",
         )
         .fetch_one(&pool)
         .await
-        .unwrap();
+        ?;
         assert_eq!(
             placement,
             ("dedicated".to_string(), "legacy_one".to_string())
@@ -309,15 +307,16 @@ mod tests {
             "#,
         )
         .fetch_all(&pool)
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(migrated_statuses.len(), 7);
         for row in migrated_statuses {
             let instance_id = row.get::<String, _>("instance_id");
             let expected = if instance_id == "legacy_one" {
                 "running"
             } else {
-                instance_id.strip_prefix("legacy_").unwrap()
+                instance_id
+                    .strip_prefix("legacy_")
+                    .context("expected a value from strip_prefix")?
             };
             assert_eq!(row.get::<String, _>("instance_status"), expected);
             assert_eq!(row.get::<String, _>("runtime_status"), expected);
@@ -332,8 +331,7 @@ mod tests {
             "#,
         )
         .fetch_one(&pool)
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(
             runtime,
             (
@@ -351,5 +349,7 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        Ok(())
     }
 }

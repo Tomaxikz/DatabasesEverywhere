@@ -73,21 +73,21 @@ async fn cache_state(limiter: &SoftDiskLimiter, instance_id: &str) -> Option<(us
 }
 
 #[tokio::test]
-async fn full_baseline_then_partial_subtree_reconciliation_updates_usage() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn full_baseline_then_partial_subtree_reconciliation_updates_usage() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir_all(root.join("nested")).unwrap();
-    std::fs::write(root.join("nested/value.bin"), b"one").unwrap();
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::write(root.join("nested/value.bin"), b"one")?;
     let limiter = SoftDiskLimiter::new(hybrid_config());
     let target = target(root.clone());
 
     let full = limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(full.performed, PerformedScanKind::Full);
 
-    std::fs::write(root.join("nested/value.bin"), vec![7_u8; 2 * 1024 * 1024]).unwrap();
+    std::fs::write(root.join("nested/value.bin"), vec![7_u8; 2 * 1024 * 1024])?;
     let partial = limiter
         .scan_hybrid_and_enforce(
             &NoopRuntime,
@@ -97,27 +97,29 @@ async fn full_baseline_then_partial_subtree_reconciliation_updates_usage() {
             },
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(partial.performed, PerformedScanKind::Partial);
     assert_eq!(
         partial.outcome.snapshot().usage.logical_bytes,
         2 * 1024 * 1024
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn root_level_dirty_hint_safely_promotes_to_a_full_scan() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn root_level_dirty_hint_safely_promotes_to_a_full_scan() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&root)?;
     let limiter = SoftDiskLimiter::new(hybrid_config());
     let target = target(root.clone());
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
-    std::fs::write(root.join("root.bin"), vec![1_u8; 1024 * 1024]).unwrap();
+        .map_err(anyhow::Error::msg)?;
+    std::fs::write(root.join("root.bin"), vec![1_u8; 1024 * 1024])?;
 
     let execution = limiter
         .scan_hybrid_and_enforce(
@@ -128,31 +130,33 @@ async fn root_level_dirty_hint_safely_promotes_to_a_full_scan() {
             },
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(execution.performed, PerformedScanKind::Full);
     assert_eq!(
         execution.outcome.snapshot().usage.logical_bytes,
         1024 * 1024
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn same_path_root_replacement_invalidates_the_incremental_cache() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn same_path_root_replacement_invalidates_the_incremental_cache() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir_all(root.join("nested")).unwrap();
-    std::fs::write(root.join("nested/old.bin"), b"old").unwrap();
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::write(root.join("nested/old.bin"), b"old")?;
     let limiter = SoftDiskLimiter::new(hybrid_config());
     let target = target(root.clone());
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
-    std::fs::rename(&root, temporary.path().join("old-data")).unwrap();
-    std::fs::create_dir_all(root.join("nested")).unwrap();
-    std::fs::write(root.join("nested/new.bin"), vec![2_u8; 512 * 1024]).unwrap();
+    std::fs::rename(&root, temporary.path().join("old-data"))?;
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::write(root.join("nested/new.bin"), vec![2_u8; 512 * 1024])?;
     let execution = limiter
         .scan_hybrid_and_enforce(
             &NoopRuntime,
@@ -162,31 +166,38 @@ async fn same_path_root_replacement_invalidates_the_incremental_cache() {
             },
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(execution.performed, PerformedScanKind::Full);
     assert_eq!(execution.outcome.snapshot().usage.logical_bytes, 512 * 1024);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn start_preflight_ignores_cached_usage_and_always_scans_fresh() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn start_preflight_ignores_cached_usage_and_always_scans_fresh() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("value.bin"), b"one").unwrap();
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("value.bin"), b"one")?;
     let limiter = SoftDiskLimiter::new(hybrid_config());
     let target = target(root.clone());
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
-    std::fs::write(root.join("value.bin"), vec![3_u8; 768 * 1024]).unwrap();
-    let snapshot = limiter.ensure_start_allowed(&target).await.unwrap();
+    std::fs::write(root.join("value.bin"), vec![3_u8; 768 * 1024])?;
+    let snapshot = limiter
+        .ensure_start_allowed(&target)
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(snapshot.usage.logical_bytes, 768 * 1024);
     assert!(cache_state(&limiter, &target.instance_id).await.is_none());
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 0);
+
+    Ok(())
 }
 
 #[test]
@@ -207,11 +218,11 @@ fn scanner_fingerprint_changes_with_generation_path_protocol_and_limit() {
 }
 
 #[tokio::test]
-async fn watcher_disabled_uses_streaming_scans_without_retaining_a_tree() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn watcher_disabled_uses_streaming_scans_without_retaining_a_tree() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir_all(root.join("nested")).unwrap();
-    std::fs::write(root.join("nested/value.bin"), b"streamed").unwrap();
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::write(root.join("nested/value.bin"), b"streamed")?;
     let mut config = hybrid_config();
     config.use_inotify = false;
     let limiter = SoftDiskLimiter::new(config);
@@ -220,46 +231,51 @@ async fn watcher_disabled_uses_streaming_scans_without_retaining_a_tree() {
     let execution = limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(execution.performed, PerformedScanKind::Full);
     assert_eq!(execution.outcome.snapshot().usage.logical_bytes, 8);
     assert!(cache_state(&limiter, &target.instance_id).await.is_none());
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn forced_streaming_full_evicts_an_existing_tree_and_measures_fresh_usage() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn forced_streaming_full_evicts_an_existing_tree_and_measures_fresh_usage()
+-> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir_all(root.join("nested")).unwrap();
-    std::fs::write(root.join("nested/value.bin"), b"cached").unwrap();
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::write(root.join("nested/value.bin"), b"cached")?;
     let limiter = SoftDiskLimiter::new(hybrid_config());
     let target = target(root.clone());
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert!(limiter.cached_directories.load(Ordering::Acquire) > 0);
 
-    std::fs::write(root.join("nested/value.bin"), b"fresh-streamed-value").unwrap();
+    std::fs::write(root.join("nested/value.bin"), b"fresh-streamed-value")?;
     let execution = limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::StreamingFull)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(execution.performed, PerformedScanKind::Full);
     assert_eq!(execution.outcome.snapshot().usage.logical_bytes, 20);
     assert!(cache_state(&limiter, &target.instance_id).await.is_none());
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn qdrant_uses_streaming_scans_even_when_inotify_is_enabled() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn qdrant_uses_streaming_scans_even_when_inotify_is_enabled() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir_all(root.join("collections/one")).unwrap();
-    std::fs::write(root.join("collections/one/segment.bin"), b"qdrant").unwrap();
+    std::fs::create_dir_all(root.join("collections/one"))?;
+    std::fs::write(root.join("collections/one/segment.bin"), b"qdrant")?;
     let limiter = SoftDiskLimiter::new(hybrid_config());
     let mut target = target(root);
     target.protocol = Protocol::Qdrant;
@@ -273,21 +289,23 @@ async fn qdrant_uses_streaming_scans_even_when_inotify_is_enabled() {
             },
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(execution.performed, PerformedScanKind::Full);
     assert_eq!(execution.outcome.snapshot().usage.logical_bytes, 6);
     assert!(cache_state(&limiter, &target.instance_id).await.is_none());
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn per_target_cache_bound_falls_back_to_periodic_streaming_scans() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn per_target_cache_bound_falls_back_to_periodic_streaming_scans() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir_all(root.join("one")).unwrap();
-    std::fs::create_dir_all(root.join("two")).unwrap();
-    std::fs::write(root.join("two/value.bin"), b"bounded").unwrap();
+    std::fs::create_dir_all(root.join("one"))?;
+    std::fs::create_dir_all(root.join("two"))?;
+    std::fs::write(root.join("two/value.bin"), b"bounded")?;
     let limiter = SoftDiskLimiter::with_usage_cache_limits(
         hybrid_config(),
         UsageCacheLimits {
@@ -300,7 +318,7 @@ async fn per_target_cache_bound_falls_back_to_periodic_streaming_scans() {
     let full = limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(full.outcome.snapshot().usage.logical_bytes, 7);
     assert_eq!(
         cache_state(&limiter, &target.instance_id).await,
@@ -308,7 +326,7 @@ async fn per_target_cache_bound_falls_back_to_periodic_streaming_scans() {
     );
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 0);
 
-    std::fs::write(root.join("two/value.bin"), b"streaming-fallback").unwrap();
+    std::fs::write(root.join("two/value.bin"), b"streaming-fallback")?;
     let next = limiter
         .scan_hybrid_and_enforce(
             &NoopRuntime,
@@ -318,22 +336,24 @@ async fn per_target_cache_bound_falls_back_to_periodic_streaming_scans() {
             },
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(next.performed, PerformedScanKind::Full);
     assert_eq!(next.outcome.snapshot().usage.logical_bytes, 18);
     assert_eq!(
         cache_state(&limiter, &target.instance_id).await,
         Some((0, true))
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn default_cache_cap_bounds_a_tenant_tree_above_4096_directories() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn default_cache_cap_bounds_a_tenant_tree_above_4096_directories() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&root)?;
     for index in 0..DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET {
-        std::fs::create_dir(root.join(format!("directory-{index}"))).unwrap();
+        std::fs::create_dir(root.join(format!("directory-{index}")))?;
     }
     let mut config = hybrid_config();
     config.max_entries_per_scan = DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET + 16;
@@ -344,7 +364,7 @@ async fn default_cache_cap_bounds_a_tenant_tree_above_4096_directories() {
     let baseline = limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(
         baseline.outcome.snapshot().usage.entries,
         DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET as u64
@@ -366,23 +386,25 @@ async fn default_cache_cap_bounds_a_tenant_tree_above_4096_directories() {
             },
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(dirty_storm.performed, PerformedScanKind::Full);
     assert_eq!(
         cache_state(&limiter, &target.instance_id).await,
         Some((0, true))
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn global_cache_bound_is_released_when_a_target_leaves_monitoring() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn global_cache_bound_is_released_when_a_target_leaves_monitoring() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let first_root = temporary.path().join("first");
     let second_root = temporary.path().join("second");
-    std::fs::create_dir_all(first_root.join("nested")).unwrap();
-    std::fs::create_dir_all(second_root.join("nested")).unwrap();
-    std::fs::write(first_root.join("nested/value"), b"first").unwrap();
-    std::fs::write(second_root.join("nested/value"), b"second").unwrap();
+    std::fs::create_dir_all(first_root.join("nested"))?;
+    std::fs::create_dir_all(second_root.join("nested"))?;
+    std::fs::write(first_root.join("nested/value"), b"first")?;
+    std::fs::write(second_root.join("nested/value"), b"second")?;
     let mut config = hybrid_config();
     config.max_cached_directories_global = 2;
     let limiter = SoftDiskLimiter::new(config);
@@ -393,7 +415,7 @@ async fn global_cache_bound_is_released_when_a_target_leaves_monitoring() {
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &first, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(
         cache_state(&limiter, &first.instance_id).await,
         Some((2, false))
@@ -403,7 +425,7 @@ async fn global_cache_bound_is_released_when_a_target_leaves_monitoring() {
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &second, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(
         cache_state(&limiter, &second.instance_id).await,
         Some((0, true))
@@ -413,20 +435,24 @@ async fn global_cache_bound_is_released_when_a_target_leaves_monitoring() {
     limiter.remove(&first.instance_id).await;
     assert!(cache_state(&limiter, &first.instance_id).await.is_none());
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn monitor_cache_eviction_preserves_growth_and_hysteresis_snapshot() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn monitor_cache_eviction_preserves_growth_and_hysteresis_snapshot() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir_all(root.join("nested")).unwrap();
-    std::fs::write(root.join("nested/value"), b"sample").unwrap();
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::write(root.join("nested/value"), b"sample")?;
     let limiter = SoftDiskLimiter::new(hybrid_config());
     let target = target(root);
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert!(limiter.snapshot(&target).await.is_some());
     assert!(limiter.cached_directories.load(Ordering::Acquire) > 0);
 
@@ -435,17 +461,25 @@ async fn monitor_cache_eviction_preserves_growth_and_hysteresis_snapshot() {
     assert!(cache_state(&limiter, &target.instance_id).await.is_none());
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 0);
     assert_eq!(
-        limiter.snapshot(&target).await.unwrap().usage.logical_bytes,
+        limiter
+            .snapshot(&target)
+            .await
+            .context("snapshot should provide a value")?
+            .usage
+            .logical_bytes,
         6
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn incremental_cache_growth_over_global_bound_keeps_usage_then_switches_to_streaming() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn incremental_cache_growth_over_global_bound_keeps_usage_then_switches_to_streaming()
+-> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir_all(root.join("nested")).unwrap();
-    std::fs::write(root.join("nested/old.bin"), b"old").unwrap();
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::write(root.join("nested/old.bin"), b"old")?;
     let limiter = SoftDiskLimiter::with_usage_cache_limits(
         hybrid_config(),
         UsageCacheLimits {
@@ -457,11 +491,11 @@ async fn incremental_cache_growth_over_global_bound_keeps_usage_then_switches_to
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 2);
 
-    std::fs::create_dir(root.join("nested/new")).unwrap();
-    std::fs::write(root.join("nested/new/value.bin"), b"new-value").unwrap();
+    std::fs::create_dir(root.join("nested/new"))?;
+    std::fs::write(root.join("nested/new/value.bin"), b"new-value")?;
     let execution = limiter
         .scan_hybrid_and_enforce(
             &NoopRuntime,
@@ -471,7 +505,7 @@ async fn incremental_cache_growth_over_global_bound_keeps_usage_then_switches_to
             },
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(execution.performed, PerformedScanKind::Partial);
     assert_eq!(execution.outcome.snapshot().usage.logical_bytes, 12);
@@ -480,14 +514,17 @@ async fn incremental_cache_growth_over_global_bound_keeps_usage_then_switches_to
         Some((0, true))
     );
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn incremental_growth_past_per_target_cap_falls_back_without_partial_commit() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn incremental_growth_past_per_target_cap_falls_back_without_partial_commit()
+-> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("data");
-    std::fs::create_dir_all(root.join("nested")).unwrap();
-    std::fs::write(root.join("nested/old.bin"), b"old").unwrap();
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::write(root.join("nested/old.bin"), b"old")?;
     let limiter = SoftDiskLimiter::with_usage_cache_limits(
         hybrid_config(),
         UsageCacheLimits {
@@ -499,14 +536,14 @@ async fn incremental_growth_past_per_target_cap_falls_back_without_partial_commi
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &target, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(
         cache_state(&limiter, &target.instance_id).await,
         Some((2, false))
     );
 
-    std::fs::create_dir(root.join("nested/new")).unwrap();
-    std::fs::write(root.join("nested/new/value.bin"), b"new-value").unwrap();
+    std::fs::create_dir(root.join("nested/new"))?;
+    std::fs::write(root.join("nested/new/value.bin"), b"new-value")?;
     let execution = limiter
         .scan_hybrid_and_enforce(
             &NoopRuntime,
@@ -516,7 +553,7 @@ async fn incremental_growth_past_per_target_cap_falls_back_without_partial_commi
             },
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(execution.performed, PerformedScanKind::Full);
     assert_eq!(execution.outcome.snapshot().usage.logical_bytes, 12);
@@ -525,15 +562,18 @@ async fn incremental_growth_past_per_target_cap_falls_back_without_partial_commi
         Some((0, true))
     );
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn incremental_cache_shrink_releases_global_capacity_for_another_target() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn incremental_cache_shrink_releases_global_capacity_for_another_target() -> anyhow::Result<()>
+{
+    let temporary = tempfile::tempdir()?;
     let first_root = temporary.path().join("first");
     let second_root = temporary.path().join("second");
-    std::fs::create_dir_all(first_root.join("nested/removed")).unwrap();
-    std::fs::create_dir_all(second_root.join("nested")).unwrap();
+    std::fs::create_dir_all(first_root.join("nested/removed"))?;
+    std::fs::create_dir_all(second_root.join("nested"))?;
     let limiter = SoftDiskLimiter::with_usage_cache_limits(
         hybrid_config(),
         UsageCacheLimits {
@@ -548,10 +588,10 @@ async fn incremental_cache_shrink_releases_global_capacity_for_another_target() 
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &first, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 3);
 
-    std::fs::remove_dir(first_root.join("nested/removed")).unwrap();
+    std::fs::remove_dir(first_root.join("nested/removed"))?;
     limiter
         .scan_hybrid_and_enforce(
             &NoopRuntime,
@@ -561,7 +601,7 @@ async fn incremental_cache_shrink_releases_global_capacity_for_another_target() 
             },
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(
         cache_state(&limiter, &first.instance_id).await,
         Some((2, false))
@@ -571,12 +611,14 @@ async fn incremental_cache_shrink_releases_global_capacity_for_another_target() 
     limiter
         .scan_hybrid_and_enforce(&NoopRuntime, &second, HybridScanRequest::Full)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(
         cache_state(&limiter, &second.instance_id).await,
         Some((2, false))
     );
     assert_eq!(limiter.cached_directories.load(Ordering::Acquire), 4);
+
+    Ok(())
 }
 
 fn growth_tracker(sampled_at: Instant, growth: f64) -> TrackerState {

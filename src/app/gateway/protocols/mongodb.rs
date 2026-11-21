@@ -94,8 +94,8 @@ where
     raw.resize(len, 0);
     stream.read_exact(&mut raw[4..]).await?;
 
-    let request_id = i32::from_le_bytes(raw[4..8].try_into().unwrap());
-    let op_code = i32::from_le_bytes(raw[12..16].try_into().unwrap());
+    let request_id = wire_i32(&raw, 4)?;
+    let op_code = wire_i32(&raw, 12)?;
     let payload = &raw[MESSAGE_HEADER_LEN..];
     let body = match op_code {
         OP_MSG => Some(parse_op_msg_body(payload)?),
@@ -302,6 +302,14 @@ pub fn command_error(message: &str, code: i32) -> Document {
     }
 }
 
+fn wire_i32(message: &[u8], offset: usize) -> Result<i32, MongodbProxyError> {
+    let bytes = message
+        .get(offset..)
+        .and_then(|tail| tail.first_chunk())
+        .ok_or(MongodbProxyError::MalformedMessage)?;
+    Ok(i32::from_le_bytes(*bytes))
+}
+
 fn parse_op_msg_body(payload: &[u8]) -> Result<Document, MongodbProxyError> {
     if payload.len() < 5 {
         return Err(MongodbProxyError::MalformedMessage);
@@ -316,10 +324,7 @@ fn parse_op_msg_body(payload: &[u8]) -> Result<Document, MongodbProxyError> {
                 return Document::from_reader(&mut cursor).map_err(MongodbProxyError::BsonDecode);
             }
             1 => {
-                if offset + 4 > payload.len() {
-                    return Err(MongodbProxyError::MalformedMessage);
-                }
-                let size = i32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap());
+                let size = wire_i32(payload, offset)?;
                 if size <= 4 {
                     return Err(MongodbProxyError::MalformedMessage);
                 }
@@ -523,23 +528,29 @@ pub fn test_sasl_start_message(username: &str, database: &str) -> MongoMessage {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn parses_sasl_start_route() {
-        let route =
-            parse_sasl_start_route(&test_sasl_start_message("app_mongo_1", "mongo_1")).unwrap();
+    fn parses_sasl_start_route() -> anyhow::Result<()> {
+        let route = parse_sasl_start_route(&test_sasl_start_message("app_mongo_1", "mongo_1"))?;
 
         assert_eq!(route.username, "app_mongo_1");
         assert_eq!(route.database, "mongo_1");
+
+        Ok(())
     }
 
     #[test]
-    fn parses_escaped_scram_username() {
+    fn parses_escaped_scram_username() -> anyhow::Result<()> {
         assert_eq!(
-            scram_username("n,,n=user=2Cname=3D1,r=nonce").unwrap(),
+            scram_username("n,,n=user=2Cname=3D1,r=nonce")
+                .context("scram username should provide a value")?,
             "user,name=1"
         );
+
+        Ok(())
     }
 
     #[test]
@@ -562,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn speculative_scram_is_the_only_hello_route() {
+    fn speculative_scram_is_the_only_hello_route() -> anyhow::Result<()> {
         let message = MongoMessage {
             request_id: 1,
             op_code: OP_MSG,
@@ -584,16 +595,18 @@ mod tests {
         };
 
         assert_eq!(
-            parse_hello_speculative_route(&message).unwrap(),
+            parse_hello_speculative_route(&message)?,
             Some(MongodbRoute {
                 username: "app_mongo_1".to_string(),
                 database: "mongo_1".to_string(),
             })
         );
+
+        Ok(())
     }
 
     #[test]
-    fn credential_free_hello_uses_fallback_and_fallback_is_complete() {
+    fn credential_free_hello_uses_fallback_and_fallback_is_complete() -> anyhow::Result<()> {
         let message = MongoMessage {
             request_id: 1,
             op_code: OP_MSG,
@@ -601,7 +614,7 @@ mod tests {
             raw: Vec::new(),
         };
 
-        assert!(parse_hello_speculative_route(&message).unwrap().is_none());
+        assert!(parse_hello_speculative_route(&message)?.is_none());
         let response = hello_response(&message);
         for field in [
             "isWritablePrimary",
@@ -616,10 +629,12 @@ mod tests {
         ] {
             assert!(response.contains_key(field), "missing hello field {field}");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn mechanism_queries_never_select_or_validate_a_route() {
+    fn mechanism_queries_never_select_or_validate_a_route() -> anyhow::Result<()> {
         for route in [
             "missing_separator",
             ".missing_database",
@@ -638,12 +653,14 @@ mod tests {
                 raw: Vec::new(),
             };
 
-            assert!(parse_hello_speculative_route(&message).unwrap().is_none());
+            assert!(parse_hello_speculative_route(&message)?.is_none());
         }
+
+        Ok(())
     }
 
     #[test]
-    fn auth_replies_and_continuations_stay_bound_to_one_database() {
+    fn auth_replies_and_continuations_stay_bound_to_one_database() -> anyhow::Result<()> {
         let route = MongodbRoute {
             username: "tenant_user".to_string(),
             database: "tenant_db".to_string(),
@@ -664,7 +681,13 @@ mod tests {
         };
         assert!(validate_sasl_continue(&continued, &route).is_ok());
         let mut changed = continued;
-        changed.body.as_mut().unwrap().insert("$db", "victim_db");
+        changed
+            .body
+            .as_mut()
+            .context(
+                "auth replies and continuations stay bound to one database should provide a value",
+            )?
+            .insert("$db", "victim_db");
         assert!(matches!(
             validate_sasl_continue(&changed, &route),
             Err(MongodbProxyError::AuthIdentityChanged)
@@ -699,15 +722,20 @@ mod tests {
                 body: Some(body),
                 raw: Vec::new(),
             };
-            assert_eq!(auth_reply_state(&response, speculative).unwrap(), expected);
+            assert_eq!(auth_reply_state(&response, speculative)?, expected);
         }
+
+        Ok(())
     }
 
     #[tokio::test]
     async fn rejects_declared_message_over_routing_limit_before_payload_read() {
         let (mut client, mut gateway) = tokio::io::duplex(16);
         tokio::spawn(async move {
-            client.write_all(&(65_537_i32).to_le_bytes()).await.unwrap();
+            client
+                .write_all(&(65_537_i32).to_le_bytes())
+                .await
+                .expect("to le bytes should succeed");
         });
 
         assert!(matches!(

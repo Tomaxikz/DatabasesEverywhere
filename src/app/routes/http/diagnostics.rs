@@ -80,17 +80,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn internal_diagnostics_never_expose_the_cause() {
+    fn internal_diagnostics_never_expose_the_cause() -> anyhow::Result<()> {
         let diagnostic = PublicDiagnostic::internal(
             "container operation",
             "password=hunter2 path=/var/lib/private",
         );
 
-        let encoded = serde_json::to_string(&diagnostic).unwrap();
+        let encoded = serde_json::to_string(&diagnostic)?;
         assert_eq!(diagnostic.code, "internal_error");
         assert!(diagnostic.error_id.is_some());
         assert!(!encoded.contains("hunter2"));
         assert!(!encoded.contains("/var/lib/private"));
+
+        Ok(())
     }
 
     #[test]

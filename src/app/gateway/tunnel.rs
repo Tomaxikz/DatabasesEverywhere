@@ -323,7 +323,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn small_buffers_preserve_large_transfers_and_half_closes() {
+    async fn small_buffers_preserve_large_transfers_and_half_closes() -> anyhow::Result<()> {
         let (client, mut client_proxy) = io::duplex(1024);
         let (backend_proxy, database) = io::duplex(1024);
         let network = NetworkCounter::default();
@@ -339,7 +339,8 @@ mod tests {
                 write.write_all(&request).await?;
                 write.shutdown().await
             };
-            tokio::try_join!(send, read.read_to_end(&mut received)).unwrap();
+            tokio::try_join!(send, read.read_to_end(&mut received))
+                .expect("read to end should succeed");
             received
         };
         let database_exchange = async {
@@ -347,10 +348,18 @@ mod tests {
             let mut received = Vec::new();
             // HTTP servers may need the entire POST body before producing
             // even their first response byte. The gateway must not hold it.
-            read.read_to_end(&mut received).await.unwrap();
-            write.write_all(b"!").await.unwrap();
-            write.write_all(&response).await.unwrap();
-            write.shutdown().await.unwrap();
+            read.read_to_end(&mut received)
+                .await
+                .expect("read to end should succeed");
+            write
+                .write_all(b"!")
+                .await
+                .expect("write all should succeed");
+            write
+                .write_all(&response)
+                .await
+                .expect("write all should succeed");
+            write.shutdown().await.expect("shutdown should succeed");
             received
         };
         let (forwarded, reply, query) = timeout(Duration::from_secs(5), async {
@@ -360,9 +369,8 @@ mod tests {
                 database_exchange,
             )
         })
-        .await
-        .unwrap();
-        forwarded.unwrap();
+        .await?;
+        forwarded?;
         assert_eq!(query, request);
         assert_eq!(reply[0], b'!');
         assert_eq!(reply[1..], response);
@@ -370,6 +378,8 @@ mod tests {
             network.snapshot(),
             (request.len() as u64, response.len() as u64 + 1)
         );
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -379,74 +389,91 @@ mod tests {
             port: 5432,
         })
         .await
-        .unwrap_err();
+        .expect_err("to string should return an error");
 
         assert!(matches!(error, TunnelError::LegacyDockerTcp));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn first_reply_timeout_tracks_upload_progress_not_total_request_time() {
+    async fn first_reply_timeout_tracks_upload_progress_not_total_request_time()
+    -> anyhow::Result<()> {
         let (mut client, mut client_proxy) = io::duplex(64);
         let (mut backend, mut database) = io::duplex(1);
         let forward = tunnel_streams(&mut client_proxy, &mut backend, "test".into());
         let upload = async {
-            client.write_all(b"bodybodybodybody").await.unwrap();
-            client.shutdown().await.unwrap();
+            client
+                .write_all(b"bodybodybodybody")
+                .await
+                .expect("write all should succeed");
+            client.shutdown().await.expect("shutdown should succeed");
             let mut reply = Vec::new();
-            client.read_to_end(&mut reply).await.unwrap();
+            client
+                .read_to_end(&mut reply)
+                .await
+                .expect("read to end should succeed");
             assert_eq!(reply, b"OK");
         };
         let response = async {
             let mut body = Vec::new();
             for _ in 0..16 {
                 tokio::time::sleep(Duration::from_secs(20)).await;
-                body.push(database.read_u8().await.unwrap());
+                body.push(database.read_u8().await.expect("read u8 should succeed"));
             }
             assert_eq!(body, b"bodybodybodybody");
-            database.write_all(b"OK").await.unwrap();
-            database.shutdown().await.unwrap();
+            database
+                .write_all(b"OK")
+                .await
+                .expect("write all should succeed");
+            database.shutdown().await.expect("shutdown should succeed");
         };
         let (result, (), ()) = tokio::join!(forward, upload, response);
-        result.unwrap();
+        result?;
+
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
-    async fn silent_backends_still_time_out_with_and_without_a_client_half_close() {
+    async fn silent_backends_still_time_out_with_and_without_a_client_half_close()
+    -> anyhow::Result<()> {
         for half_close in [false, true] {
             let (mut client, mut client_proxy) = io::duplex(64);
             let (mut backend, _database) = io::duplex(64);
             if half_close {
-                client.shutdown().await.unwrap();
+                client.shutdown().await?;
             }
             assert!(matches!(
                 tunnel_streams(&mut client_proxy, &mut backend, "test".into()).await,
                 Err(TunnelError::FirstResponseTimeout { .. })
             ));
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn metered_backend_reports_live_rx_and_tx_bytes() {
+    async fn metered_backend_reports_live_rx_and_tx_bytes() -> anyhow::Result<()> {
         let network = NetworkCounter::default();
         let (stream, mut peer) = tokio::io::duplex(64);
         let sessions = crate::gateway::sessions::TenantSessions::default();
         let mut metered = MeteredBackend::new(stream, network.clone(), sessions.open("tenant"));
 
-        metered.write_all(b"request").await.unwrap();
+        metered.write_all(b"request").await?;
         let mut request = [0_u8; 7];
-        peer.read_exact(&mut request).await.unwrap();
+        peer.read_exact(&mut request).await?;
         assert_eq!(&request, b"request");
 
-        peer.write_all(b"response").await.unwrap();
+        peer.write_all(b"response").await?;
         let mut response = [0_u8; 8];
-        metered.read_exact(&mut response).await.unwrap();
+        metered.read_exact(&mut response).await?;
         assert_eq!(&response, b"response");
 
         assert_eq!(network.snapshot(), (7, 8));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tenant_cancellation_wakes_and_closes_a_blocked_backend_read() {
+    async fn tenant_cancellation_wakes_and_closes_a_blocked_backend_read() -> anyhow::Result<()> {
         let sessions = crate::gateway::sessions::TenantSessions::default();
         let (stream, _peer) = tokio::io::duplex(64);
         let mut metered =
@@ -458,7 +485,11 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(sessions.cancel("tenant"), 1);
-        let error = read.await.unwrap().unwrap_err();
+        let error = read.await?.expect_err(
+            "tenant cancellation wakes and closes a blocked backend read should return an error",
+        );
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+
+        Ok(())
     }
 }

@@ -341,6 +341,8 @@ fn replication_secrets(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     const LABEL: &str = "dbev-0123456789abcdef0123456789abcdef";
@@ -373,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_runs_bounded_in_a_helper_and_reports_into_staging() {
+    fn preflight_runs_bounded_in_a_helper_and_reports_into_staging() -> anyhow::Result<()> {
         let script = preflight_exec_script("dbe_admin", "app's db");
         assert!(script.starts_with("set -eu\numask 077\n"));
         assert!(script.contains(&format!("POSTGRES_USER={}", sh_quote("dbe_admin"))));
@@ -385,11 +387,16 @@ mod tests {
             sh_quote(&format!("{BACKUP_HELPER_STAGING}/{PREFLIGHT_REPORT}"))
         )));
         assert!(script.contains(preflight_script()));
-        let probe = script.split(preflight_script()).nth(1).unwrap();
+        let probe = script
+            .split(preflight_script())
+            .nth(1)
+            .context("expected a value from nth")?;
         assert!(probe.contains(&replication_role_ownership_preflight_sql()));
         assert!(probe.ends_with("\nSQL\n"));
         assert!(script.len() < 64 * 1024);
         assert!(PREFLIGHT_HELPER_SUFFIX.len() <= 16);
+
+        Ok(())
     }
 
     #[test]

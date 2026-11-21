@@ -47,7 +47,7 @@ fn shared_native_quota_detection_requires_supported_filesystem_and_mount_option(
 }
 
 #[tokio::test]
-async fn non_project_modes_fall_back_before_touching_the_tenant_path() {
+async fn non_project_modes_fall_back_before_touching_the_tenant_path() -> anyhow::Result<()> {
     let limiter = DiskLimiter::new(DiskConfig::default());
     let enforcement = limiter
         .apply_path_quota(
@@ -56,19 +56,20 @@ async fn non_project_modes_fall_back_before_touching_the_tenant_path() {
             Path::new("/definitely/missing/registry"),
             1024,
         )
-        .await
-        .unwrap();
+        .await?;
 
     assert!(!enforcement.enforced);
     assert_eq!(enforcement.method, DiskLimitMode::SoftScanner.method());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn path_usage_accepts_only_the_exact_active_owner_claim() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn path_usage_accepts_only_the_exact_active_owner_claim() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let registry_root = temporary.path();
     let data_path = registry_root.join("tenant-data");
-    std::fs::create_dir(&data_path).unwrap();
+    std::fs::create_dir(&data_path)?;
     let config = DiskConfig {
         mode: DiskLimitMode::ProjectQuota,
         ..DiskConfig::default()
@@ -76,41 +77,37 @@ async fn path_usage_accepts_only_the_exact_active_owner_claim() {
     let project_id_base = config.project_id_base;
     let limiter = DiskLimiter::new(config);
 
-    let project_id = project_id::allocate_in("tenant-a", registry_root, project_id_base)
-        .await
-        .unwrap();
+    let project_id = project_id::allocate_in("tenant-a", registry_root, project_id_base).await?;
     let pending = limiter
         .path_quota_usage_bytes("tenant-a", &data_path, registry_root)
         .await
-        .unwrap_err();
+        .expect_err("path quota usage bytes should return an error");
     assert!(matches!(
         pending,
         DiskLimitError::ProjectIdNotFound { owner_id, .. } if owner_id == "tenant-a"
     ));
 
-    project_id::activate_in("tenant-a", registry_root, project_id)
-        .await
-        .unwrap();
+    project_id::activate_in("tenant-a", registry_root, project_id).await?;
     let wrong_owner = limiter
         .path_quota_usage_bytes("tenant-b", &data_path, registry_root)
         .await
-        .unwrap_err();
+        .expect_err("path quota usage bytes should return an error");
     assert!(matches!(
         wrong_owner,
         DiskLimitError::ProjectIdNotFound { owner_id, .. } if owner_id == "tenant-b"
     ));
 
-    project_id::release_in("tenant-a", registry_root, project_id_base)
-        .await
-        .unwrap();
+    project_id::release_in("tenant-a", registry_root, project_id_base).await?;
     let released = limiter
         .path_quota_usage_bytes("tenant-a", &data_path, registry_root)
         .await
-        .unwrap_err();
+        .expect_err("path quota usage bytes should return an error");
     assert!(matches!(
         released,
         DiskLimitError::ProjectIdNotFound { owner_id, .. } if owner_id == "tenant-a"
     ));
+
+    Ok(())
 }
 
 #[test]
@@ -174,7 +171,8 @@ fn physical_replacement_accepts_recursive_project_quota_backends() {
         assert!(check_project_quota_restore(data, fstype).is_ok());
     }
     for fstype in ["btrfs", "zfs"] {
-        let error = check_project_quota_restore(data, fstype).unwrap_err();
+        let error = check_project_quota_restore(data, fstype)
+            .expect_err("check project quota restore should return an error");
         assert!(matches!(
             error,
             DiskLimitError::UnsupportedPhysicalDataReplacement {
@@ -193,42 +191,41 @@ fn every_native_quota_backend_requires_a_transactional_major_upgrade_cutover() {
         ..DiskConfig::default()
     });
 
-    let error = limiter.check_upgrade_cutover(data).unwrap_err();
+    let error = limiter
+        .check_upgrade_cutover(data)
+        .expect_err("check upgrade cutover should return an error");
     assert!(error.to_string().contains("transactional native-quota"));
 }
 
 #[tokio::test]
-async fn project_quota_runtime_teardown_preserves_staged_data() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn project_quota_runtime_teardown_preserves_staged_data() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let marker = temporary.path().join("imported-data");
-    std::fs::write(&marker, b"preserve me").unwrap();
+    std::fs::write(&marker, b"preserve me")?;
     let limiter = DiskLimiter::new(DiskConfig {
         mode: DiskLimitMode::ProjectQuota,
         ..DiskConfig::default()
     });
 
-    limiter
-        .teardown_instance_mount(temporary.path())
-        .await
-        .unwrap();
+    limiter.teardown_instance_mount(temporary.path()).await?;
 
-    assert_eq!(std::fs::read(marker).unwrap(), b"preserve me");
+    assert_eq!(std::fs::read(marker)?, b"preserve me");
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn instance_release_fails_closed_with_an_unremovable_pending_claim() {
-    let temporary = tempfile::tempdir_in("/dev/shm").unwrap();
+async fn instance_release_fails_closed_with_an_unremovable_pending_claim() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir_in("/dev/shm")?;
     let data_path = temporary.path().join("instance-data");
-    std::fs::create_dir(&data_path).unwrap();
+    std::fs::create_dir(&data_path)?;
     let config = DiskConfig {
         mode: DiskLimitMode::ProjectQuota,
         ..DiskConfig::default()
     };
     let project_id_base = config.project_id_base;
     let limiter = DiskLimiter::new(config);
-    project_id::allocate_in("instance-one", temporary.path(), project_id_base)
-        .await
-        .unwrap();
+    project_id::allocate_in("instance-one", temporary.path(), project_id_base).await?;
 
     let error = limiter
         .release_instance_storage("instance-one", &data_path)
@@ -240,15 +237,16 @@ async fn instance_release_fails_closed_with_an_unremovable_pending_claim() {
         DiskLimitError::NativeProjectQuotaUnavailable { path } if path == data_path
     ));
     let claim = project_id::find_claim_in("instance-one", temporary.path(), project_id_base)
-        .await
-        .unwrap()
+        .await?
         .expect("failed cleanup must retain the claim");
     assert_eq!(claim.state, project_id::ProjectIdState::Pending);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn missing_instance_path_still_checks_its_project_claim() {
-    let temporary = tempfile::tempdir_in("/dev/shm").unwrap();
+async fn missing_instance_path_still_checks_its_project_claim() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir_in("/dev/shm")?;
     let data_path = temporary.path().join("missing-instance-data");
     let config = DiskConfig {
         mode: DiskLimitMode::ProjectQuota,
@@ -256,9 +254,7 @@ async fn missing_instance_path_still_checks_its_project_claim() {
     };
     let project_id_base = config.project_id_base;
     let limiter = DiskLimiter::new(config);
-    project_id::allocate_in("instance-two", temporary.path(), project_id_base)
-        .await
-        .unwrap();
+    project_id::allocate_in("instance-two", temporary.path(), project_id_base).await?;
 
     let error = limiter
         .release_instance_storage("instance-two", &data_path)
@@ -271,8 +267,9 @@ async fn missing_instance_path_still_checks_its_project_claim() {
         DiskLimitError::NativeProjectQuotaUnavailable { path } if path == data_path
     ));
     let claim = project_id::find_claim_in("instance-two", temporary.path(), project_id_base)
-        .await
-        .unwrap()
+        .await?
         .expect("failed cleanup must retain the pending claim");
     assert_eq!(claim.state, project_id::ProjectIdState::Pending);
+
+    Ok(())
 }

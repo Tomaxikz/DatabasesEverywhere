@@ -197,15 +197,17 @@ fn fill_runtime_id(metadata: &mut InstanceMetadata) {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::{
         server::metadata::InstanceMetadata, storage::sqlite, utils::limits::InstanceLimits,
     };
 
     #[tokio::test]
-    async fn upsert_fills_legacy_dedicated_runtime_id_in_memory() {
-        let directory = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(directory.path()).await.unwrap();
+    async fn upsert_fills_legacy_dedicated_runtime_id_in_memory() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pool = sqlite::connect(directory.path()).await?;
         let store = InstanceStore::default();
         let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool));
         let metadata: InstanceMetadata = serde_json::from_value(serde_json::json!({
@@ -220,16 +222,17 @@ mod tests {
             "limits": InstanceLimits::default(),
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
-        }))
-        .unwrap();
+        }))?;
 
-        manager.upsert(metadata).await.unwrap();
+        manager.upsert(metadata).await?;
 
-        let stored = store.get("dedicated-one").await.unwrap();
+        let stored = store
+            .get("dedicated-one")
+            .await
+            .context("missing dedicated-one entry")?;
         assert_eq!(stored.runtime_id, "dedicated-one");
-        assert_eq!(
-            serde_json::to_value(stored).unwrap()["runtime_id"],
-            "dedicated-one"
-        );
+        assert_eq!(serde_json::to_value(stored)?["runtime_id"], "dedicated-one");
+
+        Ok(())
     }
 }

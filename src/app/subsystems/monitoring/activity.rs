@@ -230,27 +230,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_query_rejects_unknown_and_overflowing_values() {
+    async fn history_query_rejects_unknown_and_overflowing_values() -> anyhow::Result<()> {
         for uri in [
             "/activity/history?unknown=1",
             "/activity/history?limit=70000",
         ] {
-            let request = Request::builder().uri(uri).body(()).unwrap();
+            let request = Request::builder().uri(uri).body(())?;
             let (mut parts, _) = request.into_parts();
             let error = ApiQuery::<HistoryQuery>::from_request_parts(&mut parts, &())
                 .await
-                .unwrap_err();
+                .expect_err("from request parts should return an error");
             assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
         }
+
+        Ok(())
     }
 
     #[test]
-    fn history_limit_matches_the_published_bounds() {
+    fn history_limit_matches_the_published_bounds() -> anyhow::Result<()> {
         assert!(history_limit(Some(0)).is_err());
-        assert_eq!(history_limit(None).unwrap(), DEFAULT_HISTORY_ROWS);
-        assert_eq!(
-            history_limit(Some(MAX_HISTORY_ROWS)).unwrap(),
-            MAX_HISTORY_ROWS
-        );
+        assert_eq!(history_limit(None)?, DEFAULT_HISTORY_ROWS);
+        assert_eq!(history_limit(Some(MAX_HISTORY_ROWS))?, MAX_HISTORY_ROWS);
+
+        Ok(())
     }
 }

@@ -629,13 +629,15 @@ impl From<SharedDiskUsageSource> for PoolMetricSource {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use std::time::Duration;
 
     use super::*;
     use crate::subsystems::monitoring::resources::CachedRuntimeStats;
 
     #[test]
-    fn oom_diagnostic_requires_confirmed_oom_and_an_inactive_container() {
+    fn oom_diagnostic_requires_confirmed_oom_and_an_inactive_container() -> anyhow::Result<()> {
         use crate::runtime::docker::{DockerContainerStatus, DockerInstanceInspection};
         let mut inspection = DockerInstanceInspection {
             status: DockerContainerStatus::Stopped,
@@ -645,7 +647,8 @@ mod tests {
             health: None,
             image: None,
         };
-        let diagnostic = oom_diagnostic(&inspection).unwrap();
+        let diagnostic =
+            oom_diagnostic(&inspection).context("expected a value from oom_diagnostic")?;
         assert_eq!(diagnostic.code, "pool_oom_killed");
         assert!(diagnostic.message.contains("1024 MiB"));
         inspection.oom_killed = false;
@@ -655,7 +658,14 @@ mod tests {
         assert!(oom_diagnostic(&inspection).is_none());
         inspection.status = DockerContainerStatus::Stopped;
         inspection.memory_limit_bytes = None;
-        assert!(!oom_diagnostic(&inspection).unwrap().message.contains("MiB"));
+        assert!(
+            !oom_diagnostic(&inspection)
+                .context("oom diagnostic should provide a value")?
+                .message
+                .contains("MiB")
+        );
+
+        Ok(())
     }
 
     async fn get_pool_route(
@@ -667,19 +677,22 @@ mod tests {
             .uri(format!("/api/pools/pool_read/{suffix}"))
             .header(http::header::AUTHORIZATION, "Bearer secret")
             .body(axum::body::Body::empty())
-            .unwrap();
+            .expect("empty should succeed");
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             crate::routes::http::router::build_router(state.clone()).oneshot(request),
         )
         .await
         .expect("pool reads must not wait for creation to release its lock")
-        .unwrap();
+        .expect("expected a value from expect");
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
-            .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap())
+            .expect("into body should succeed");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("from slice should succeed"),
+        )
     }
 
     async fn reserve_child(state: &AppState, pool: &EngineRuntime, id: &str) -> InstanceMetadata {
@@ -693,7 +706,7 @@ mod tests {
         state
             .placements
             .reserve(crate::server::placement::ReserveTenant {
-                owner: pool.owner.clone().unwrap(),
+                owner: pool.owner.clone().expect("expected a value from clone"),
                 instance_id: id,
                 runtime_id: &pool.runtime_id,
                 database: &metadata.database.name,
@@ -701,7 +714,7 @@ mod tests {
                 limits: &metadata.limits,
             })
             .await
-            .unwrap();
+            .expect("reserve should succeed");
         state
             .resource_cache
             .store_disk_usage(
@@ -716,12 +729,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_reads_remain_available_at_each_creation_stage() {
+    async fn pool_reads_remain_available_at_each_creation_stage() -> anyhow::Result<()> {
         for protocol in Protocol::ALL
             .into_iter()
             .filter(|protocol| DeploymentMode::Shared.supports(*protocol))
         {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir()?;
             let mut config = crate::config::Config {
                 remote: "https://panel.example.test".into(),
                 ..Default::default()
@@ -734,27 +747,32 @@ mod tests {
                 "test-image",
             );
             pool.limits.disk_mib = 8192;
-            state.placements.save(&pool).await.unwrap();
+            state.placements.save(&pool).await?;
             let old = reserve_child(&state, &pool, "old").await;
-            state.placements.mark_provisioned("old").await.unwrap();
-            state.manager.upsert(old).await.unwrap();
+            state.placements.mark_provisioned("old").await?;
+            state.manager.upsert(old).await?;
 
             let permit = state
                 .install_progress
                 .try_begin_creation("new", protocol, "test-image")
-                .unwrap();
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
             let operation = state.instance_locks.lock(&pool.runtime_id).await;
             let new = reserve_child(&state, &pool, "new").await;
             for stage in 0..3 {
                 if stage == 1 {
-                    state.placements.mark_provisioned("new").await.unwrap();
+                    state.placements.mark_provisioned("new").await?;
                 }
                 if stage == 2 {
-                    state.manager.upsert_fenced(new.clone()).await.unwrap();
+                    state.manager.upsert_fenced(new.clone()).await?;
                 }
                 let (status, body) = get_pool_route(&state, "instances").await;
                 assert_eq!(status, http::StatusCode::OK, "{protocol}/{stage}: {body}");
-                assert_eq!(body.as_array().unwrap().len(), 1);
+                assert_eq!(
+                    body.as_array()
+                        .context("as array should provide a value")?
+                        .len(),
+                    1
+                );
                 assert_eq!(body[0]["instance_id"], "old");
                 let (status, body) = get_pool_route(&state, "backups").await;
                 assert_eq!(status, http::StatusCode::OK, "{protocol}/{stage}: {body}");
@@ -767,20 +785,28 @@ mod tests {
             assert_eq!(status, http::StatusCode::OK, "{protocol}: {body}");
             let ids = body
                 .as_array()
-                .unwrap()
+                .context("expected an array")?
                 .iter()
-                .map(|row| row["instance_id"].as_str().unwrap())
+                .map(|row| row["instance_id"].as_str().expect("expected a string"))
                 .collect::<Vec<_>>();
             assert_eq!(ids, ["new", "old"]);
-            state.manager.delete("new").await.unwrap();
+            state.manager.delete("new").await?;
             let (status, body) = get_pool_route(&state, "instances").await;
             assert_eq!(status, http::StatusCode::OK);
-            assert_eq!(body.as_array().unwrap().len(), 1);
+            assert_eq!(
+                body.as_array()
+                    .context("as array should provide a value")?
+                    .len(),
+                1
+            );
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_or_mismatched_tenants_are_not_hidden_by_stale_progress() {
+    async fn missing_or_mismatched_tenants_are_not_hidden_by_stale_progress() -> anyhow::Result<()>
+    {
         let (state, _db) = crate::subsystems::test_support::database(crate::config::Config {
             remote: "https://panel.example.test".into(),
             ..Default::default()
@@ -792,7 +818,7 @@ mod tests {
             "test-image",
         );
         pool.limits.disk_mib = 8192;
-        state.placements.save(&pool).await.unwrap();
+        state.placements.save(&pool).await?;
         let mut child = reserve_child(&state, &pool, "lost").await;
         state
             .install_progress
@@ -800,21 +826,21 @@ mod tests {
         let unrelated = state
             .install_progress
             .try_begin_creation("another", pool.protocol, "test-image")
-            .unwrap();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         for provisioned in [false, true] {
             if provisioned {
-                state.placements.mark_provisioned("lost").await.unwrap();
+                state.placements.mark_provisioned("lost").await?;
             }
             let error = crate::subsystems::pools::tenants(&state, &pool)
                 .await
-                .unwrap_err();
+                .expect_err("tenants should return an error");
             assert!(error.to_string().contains("missing tenant lost"));
             assert_eq!(
                 get_pool_route(&state, "instances").await.0,
                 http::StatusCode::INTERNAL_SERVER_ERROR
             );
         }
-        state.manager.upsert(child.clone()).await.unwrap();
+        state.manager.upsert(child.clone()).await?;
         state.instances.remove("lost").await;
         assert!(
             crate::subsystems::pools::tenants(&state, &pool)
@@ -825,7 +851,12 @@ mod tests {
         for mismatch in ["owner", "protocol", "database", "username"] {
             let mut bad = child.clone();
             match mismatch {
-                "owner" => bad.owner.as_mut().unwrap().server_id = "another-server".into(),
+                "owner" => {
+                    bad.owner
+                        .as_mut()
+                        .context("expected a value from as_mut")?
+                        .server_id = "another-server".into()
+                }
                 "protocol" => bad.protocol = Protocol::Mysql,
                 "database" => bad.database.name = "another_db".into(),
                 _ => bad.database.username = "another_user".into(),
@@ -839,16 +870,16 @@ mod tests {
             );
         }
         child.status = InstanceStatus::Quarantined;
-        state.manager.upsert(child).await.unwrap();
-        let tenants = crate::subsystems::pools::tenants(&state, &pool)
-            .await
-            .unwrap();
+        state.manager.upsert(child).await?;
+        let tenants = crate::subsystems::pools::tenants(&state, &pool).await?;
         assert_eq!(tenants[0].status, InstanceStatus::Quarantined);
         drop(unrelated);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn provisional_migration_targets_are_not_public_pool_members() {
+    async fn provisional_migration_targets_are_not_public_pool_members() -> anyhow::Result<()> {
         let (state, _db) = crate::subsystems::test_support::database(crate::config::Config {
             remote: "https://panel.example.test".into(),
             ..Default::default()
@@ -860,10 +891,10 @@ mod tests {
             "test-image",
         );
         pool.limits.disk_mib = 8192;
-        state.placements.save(&pool).await.unwrap();
+        state.placements.save(&pool).await?;
         let mut source = crate::server::test_support::metadata("source", pool.protocol);
         source.owner = pool.owner.clone();
-        state.manager.upsert(source.clone()).await.unwrap();
+        state.manager.upsert(source.clone()).await?;
         let migration = state
             .placements
             .migrations()
@@ -873,15 +904,10 @@ mod tests {
                 Some(&pool.runtime_id),
                 None,
             )
-            .await
-            .unwrap();
+            .await?;
         let temporary_id = format!("migration_{}", migration.migration_id.replace('-', ""));
         reserve_child(&state, &pool, &temporary_id).await;
-        state
-            .placements
-            .mark_provisioned(&temporary_id)
-            .await
-            .unwrap();
+        state.placements.mark_provisioned(&temporary_id).await?;
         let (status, body) = get_pool_route(&state, "instances").await;
         assert_eq!(status, http::StatusCode::OK, "{body}");
         assert_eq!(body, serde_json::json!([]));
@@ -890,10 +916,11 @@ mod tests {
             state
                 .placements
                 .get_reservation(&temporary_id)
-                .await
-                .unwrap()
+                .await?
                 .is_some()
         );
+
+        Ok(())
     }
 
     fn clock() -> ReportClock {
@@ -904,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_metric_distinguishes_fresh_stale_warming_and_stopped() {
+    fn runtime_metric_distinguishes_fresh_stale_warming_and_stopped() -> anyhow::Result<()> {
         let clock = clock();
         let fresh = RuntimeStatsSnapshot {
             sample: Some(CachedRuntimeStats {
@@ -946,7 +973,7 @@ mod tests {
         assert_eq!(usage, None);
         assert_eq!(sample.state, PoolMetricState::Stale);
         assert!(!sample.fresh);
-        assert_eq!(sample.diagnostic.unwrap().code, "stale_sample");
+        assert_eq!(sample.diagnostic.context("runtime metric distinguishes fresh stale warming and stopped should provide a value")?.code, "stale_sample");
 
         let warming = RuntimeStatsSnapshot {
             sample: None,
@@ -969,10 +996,12 @@ mod tests {
             clock,
         );
         assert_eq!(sample.state, PoolMetricState::Stopped);
+
+        Ok(())
     }
 
     #[test]
-    fn missing_or_failed_samples_have_bounded_public_diagnostics() {
+    fn missing_or_failed_samples_have_bounded_public_diagnostics() -> anyhow::Result<()> {
         let clock = clock();
         let missing = RuntimeStatsSnapshot::default();
         let (_, sample) = runtime_metric::<u64>(
@@ -983,7 +1012,7 @@ mod tests {
             clock,
         );
         assert_eq!(sample.state, PoolMetricState::Failed);
-        assert_eq!(sample.diagnostic.unwrap().code, "sampler_unavailable");
+        assert_eq!(sample.diagnostic.context("missing or failed samples have bounded public diagnostics should provide a value")?.code, "sampler_unavailable");
 
         let error = Err("secret=/var/lib/private password=hunter2".to_string());
         let (_, sample) = disk_metric(
@@ -992,7 +1021,7 @@ mod tests {
             Some(&error),
             clock,
         );
-        let encoded = serde_json::to_string(&sample).unwrap();
+        let encoded = serde_json::to_string(&sample)?;
         assert_eq!(sample.state, PoolMetricState::Failed);
         assert!(encoded.contains("disk_sample_failed"));
         assert!(!encoded.contains("hunter2"));
@@ -1006,6 +1035,8 @@ mod tests {
             clock,
         );
         assert_eq!(sample.state, PoolMetricState::Warming);
+
+        Ok(())
     }
 
     #[test]

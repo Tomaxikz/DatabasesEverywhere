@@ -168,7 +168,7 @@ mod tests {
     use super::*;
 
     fn current_owner(path: &Path) -> HostOwner {
-        let metadata = fs::metadata(path).unwrap();
+        let metadata = fs::metadata(path).expect("metadata should succeed");
         HostOwner {
             uid: metadata.uid(),
             gid: metadata.gid(),
@@ -176,13 +176,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_pool_socket_directory_is_recreated_without_touching_data() {
-        let temp = tempfile::tempdir().unwrap();
+    fn missing_pool_socket_directory_is_recreated_without_touching_data() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("sockets");
         let data = temp.path().join("data");
-        fs::create_dir(&root).unwrap();
-        fs::create_dir(&data).unwrap();
-        fs::write(data.join("keep"), b"database data").unwrap();
+        fs::create_dir(&root)?;
+        fs::create_dir(&data)?;
+        fs::write(data.join("keep"), b"database data")?;
         let owner = current_owner(&root);
         for protocol in [
             Protocol::Postgres,
@@ -192,83 +192,86 @@ mod tests {
             Protocol::Clickhouse,
         ] {
             let path = root.join(format!("pool_{protocol}"));
-            ensure_socket_directory(&path, owner).unwrap();
-            let metadata = fs::metadata(&path).unwrap();
+            ensure_socket_directory(&path, owner)?;
+            let metadata = fs::metadata(&path)?;
             assert_eq!((metadata.uid(), metadata.gid()), (owner.uid, owner.gid));
             assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
             assert!(socket_target(protocol).is_ok());
         }
-        assert_eq!(fs::read(data.join("keep")).unwrap(), b"database data");
+        assert_eq!(fs::read(data.join("keep"))?, b"database data");
         assert!(!temp.path().join("runtime-configs").exists());
+
+        Ok(())
     }
 
     #[test]
-    fn repeated_preparation_preserves_live_socket_and_child_ownership() {
-        let temp = tempfile::tempdir().unwrap();
+    fn repeated_preparation_preserves_live_socket_and_child_ownership() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let path = temp.path().join("pool");
         let owner = current_owner(temp.path());
-        ensure_socket_directory(&path, owner).unwrap();
+        ensure_socket_directory(&path, owner)?;
         let socket = path.join("live.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let before = fs::symlink_metadata(&socket).unwrap();
-        ensure_socket_directory(&path, owner).unwrap();
-        let after = fs::symlink_metadata(&socket).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let before = fs::symlink_metadata(&socket)?;
+        ensure_socket_directory(&path, owner)?;
+        let after = fs::symlink_metadata(&socket)?;
         assert_eq!(before.ino(), after.ino());
         assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
         assert!(std::os::unix::net::UnixStream::connect(socket).is_ok());
+
+        Ok(())
     }
 
     #[test]
-    fn socket_preparation_rejects_symlinks_and_non_directories() {
-        let temp = tempfile::tempdir().unwrap();
+    fn socket_preparation_rejects_symlinks_and_non_directories() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let owner = current_owner(temp.path());
         let outside = temp.path().join("outside");
-        fs::create_dir(&outside).unwrap();
-        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(&outside)?;
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755))?;
         let link = temp.path().join("link");
-        symlink(&outside, &link).unwrap();
+        symlink(&outside, &link)?;
         assert!(ensure_socket_directory(&link, owner).is_err());
         assert!(ensure_socket_directory(&link.join("pool"), owner).is_err());
         assert!(!outside.join("pool").exists());
-        assert_eq!(
-            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
+        assert_eq!(fs::metadata(&outside)?.permissions().mode() & 0o777, 0o755);
         let file = temp.path().join("file");
-        fs::write(&file, b"keep").unwrap();
+        fs::write(&file, b"keep")?;
         assert!(ensure_socket_directory(&file, owner).is_err());
-        assert_eq!(fs::read(file).unwrap(), b"keep");
+        assert_eq!(fs::read(file)?, b"keep");
+
+        Ok(())
     }
 
     #[test]
-    fn socket_owner_uses_host_ids_for_rootless_and_configured_ids_for_docker() {
+    fn socket_owner_uses_host_ids_for_rootless_and_configured_ids_for_docker() -> anyhow::Result<()>
+    {
         assert_eq!(
-            socket_owner(Some((1000, 1001)), Some("999:999")).unwrap(),
+            socket_owner(Some((1000, 1001)), Some("999:999"))?,
             HostOwner {
                 uid: 1000,
                 gid: 1001
             }
         );
         assert_eq!(
-            socket_owner(None, Some("101:102")).unwrap(),
+            socket_owner(None, Some("101:102"))?,
             HostOwner { uid: 101, gid: 102 }
         );
         assert_eq!(
-            socket_owner(None, Some("999")).unwrap(),
+            socket_owner(None, Some("999"))?,
             HostOwner { uid: 999, gid: 999 }
         );
-        assert_eq!(
-            socket_owner(None, None).unwrap(),
-            HostOwner { uid: 0, gid: 0 }
-        );
+        assert_eq!(socket_owner(None, None)?, HostOwner { uid: 0, gid: 0 });
         for user in ["database", "101:group", "-1:0", "4294967295:0"] {
             assert!(socket_owner(None, Some(user)).is_err());
         }
         assert!(socket_owner(Some((0, 0)), None).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn every_shared_engine_uses_its_configured_socket_mount() {
+    fn every_shared_engine_uses_its_configured_socket_mount() -> anyhow::Result<()> {
         for (protocol, target) in [
             (Protocol::Postgres, "/var/run/postgresql"),
             (Protocol::Mysql, "/var/run/mysqld"),
@@ -276,10 +279,12 @@ mod tests {
             (Protocol::Mongodb, "/run/dbev"),
             (Protocol::Clickhouse, "/run/dbev"),
         ] {
-            assert_eq!(socket_target(protocol).unwrap(), target);
+            assert_eq!(socket_target(protocol)?, target);
         }
         for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
             assert!(socket_target(protocol).is_err());
         }
+
+        Ok(())
     }
 }

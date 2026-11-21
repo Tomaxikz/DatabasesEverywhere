@@ -60,6 +60,12 @@ impl<R: Read> BoundedInput<R> {
         self.next_buffer_byte()
     }
 
+    pub(super) fn require_byte(&mut self) -> Result<u8, MysqlSqlRewriteError> {
+        self.next_byte()?.ok_or(MysqlSqlRewriteError::Malformed(
+            "unexpected end of SQL input",
+        ))
+    }
+
     pub(super) fn next_buffer_byte(&mut self) -> Result<Option<u8>, MysqlSqlRewriteError> {
         self.fill_buffer()?;
         if self.start == self.end {

@@ -138,13 +138,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tenant_user_sql_accepts_only_native_password_hashes() {
+    fn tenant_user_sql_accepts_only_native_password_hashes() -> anyhow::Result<()> {
         let sql = tenant_user_sql(
             "app_db",
             "app_user",
             "0123456789abcdef0123456789abcdef01234567",
-        )
-        .unwrap();
+        )?;
 
         assert!(sql.contains("CREATE DATABASE IF NOT EXISTS `app_db`"));
         assert!(sql.contains("ALTER USER `app_user`@'%'"));
@@ -152,16 +151,17 @@ mod tests {
         assert!(sql.contains("GRANT ALL PRIVILEGES ON `app\\_db`.* TO `app_user`@'%'"));
         assert!(!sql.contains("REVOKE ALL PRIVILEGES"));
         assert!(tenant_user_sql("db", "user", "not-a-hash").is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn shared_tenant_user_has_scoped_privileges() {
+    fn shared_tenant_user_has_scoped_privileges() -> anyhow::Result<()> {
         let sql = shared_tenant_user_sql(
             "app_db",
             "app_user",
             "0123456789abcdef0123456789abcdef01234567",
-        )
-        .unwrap();
+        )?;
 
         assert!(sql.contains("REVOKE ALL PRIVILEGES, GRANT OPTION"));
         assert!(sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE"));
@@ -173,6 +173,8 @@ mod tests {
         }
         assert_eq!(sql.matches("REVOKE ALL PRIVILEGES").count(), 1);
         assert!(sql.contains(&mysql_shared_grant_sql("app_db", "app_user")));
+
+        Ok(())
     }
 
     #[test]
@@ -198,13 +200,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_grants_never_cross_schema_boundaries() {
+    fn shared_grants_never_cross_schema_boundaries() -> anyhow::Result<()> {
         let create = shared_tenant_user_sql(
             "tenant_db",
             "tenant_user",
             "0123456789abcdef0123456789abcdef01234567",
-        )
-        .unwrap();
+        )?;
 
         assert!(create.contains("ON `tenant\\_db`.*"));
         assert!(!create.contains("ON *.*"));
@@ -212,6 +213,8 @@ mod tests {
         assert!(!create.contains(" PROCESS"));
         assert!(!create.contains(" SUPER"));
         assert!(!create.contains("GRANT OPTION TO"));
+
+        Ok(())
     }
 
     #[test]
@@ -228,13 +231,15 @@ mod tests {
     }
 
     #[test]
-    fn password_reset_is_account_scoped_and_accepts_only_a_verifier() {
-        let sql = reset_tenant_password_sql("app_user", "0123456789abcdef0123456789abcdef01234567")
-            .unwrap();
+    fn password_reset_is_account_scoped_and_accepts_only_a_verifier() -> anyhow::Result<()> {
+        let sql =
+            reset_tenant_password_sql("app_user", "0123456789abcdef0123456789abcdef01234567")?;
         assert_eq!(
             sql,
             "ALTER USER `app_user`@'%' IDENTIFIED BY PASSWORD '*0123456789ABCDEF0123456789ABCDEF01234567';"
         );
         assert!(reset_tenant_password_sql("app_user", "plaintext").is_err());
+
+        Ok(())
     }
 }

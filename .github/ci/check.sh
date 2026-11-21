@@ -27,7 +27,7 @@ lint() {
   cargo fmt --all -- --check
 
   section "Strict Clippy"
-  cargo clippy --workspace --all-targets --locked -- -D warnings
+  cargo clippy --workspace --all-targets --locked -- -D warnings -D clippy::unwrap_used
 }
 
 test_all() {

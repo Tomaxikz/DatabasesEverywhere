@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_hard_quota_clears_the_legacy_soft_fence() {
+    fn restored_hard_quota_clears_the_legacy_soft_fence() -> anyhow::Result<()> {
         let mut metadata = shared_metadata();
         metadata.disk_limit_blocked = true;
         let enforcement = DiskEnforcement {
@@ -668,17 +668,16 @@ mod tests {
             container_data_path: None,
         };
 
-        assert!(
-            tenant::disk::update_state(
-                &mut metadata.limits,
-                &mut metadata.disk_limit_blocked,
-                &enforcement,
-            )
-            .unwrap()
-        );
+        assert!(tenant::disk::update_state(
+            &mut metadata.limits,
+            &mut metadata.disk_limit_blocked,
+            &enforcement,
+        )?);
         assert!(metadata.limits.disk_enforced);
         assert!(!metadata.disk_limit_blocked);
         assert_eq!(access_for(&metadata), TenantAccess::Open);
+
+        Ok(())
     }
 
     #[test]

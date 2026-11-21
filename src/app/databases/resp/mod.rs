@@ -209,24 +209,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acl_replacement_does_not_follow_the_destination_symlink() {
+    async fn acl_replacement_does_not_follow_the_destination_symlink() -> anyhow::Result<()> {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let victim = directory.path().join("victim");
         let acl = directory.path().join("users.acl");
-        std::fs::write(&victim, b"untouched").unwrap();
-        symlink(&victim, &acl).unwrap();
+        std::fs::write(&victim, b"untouched")?;
+        symlink(&victim, &acl)?;
 
         write_acl_file(
             directory.path(),
             "app_user",
             &SecretString::from("new-password"),
         )
-        .await
-        .unwrap();
+        .await?;
 
-        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
-        assert!(!std::fs::symlink_metadata(acl).unwrap().is_symlink());
+        assert_eq!(std::fs::read(victim)?, b"untouched");
+        assert!(!std::fs::symlink_metadata(acl)?.is_symlink());
+
+        Ok(())
     }
 }

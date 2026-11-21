@@ -105,9 +105,7 @@ pub(super) fn read_qualified_identifier<R: Read>(
 ) -> Result<Option<QualifiedIdentifier>, MysqlSqlRewriteError> {
     match input.peek_byte()? {
         Some(b'`') | Some(b'"') => {
-            let quote = input
-                .next_byte()?
-                .expect("peek confirmed a quoted identifier");
+            let quote = input.require_byte()?;
             let identifier = read_delimited_identifier(input, quote, executable_comment)?;
             Ok(Some(QualifiedIdentifier {
                 raw: identifier.raw,
@@ -129,11 +127,7 @@ pub(super) fn read_qualified_identifier<R: Read>(
                         "unquoted identifier in source qualifier exceeds the token limit",
                     ));
                 }
-                raw.push(
-                    input
-                        .next_byte()?
-                        .expect("peek confirmed an unquoted identifier byte"),
-                );
+                raw.push(input.require_byte()?);
             }
             Ok(Some(QualifiedIdentifier {
                 raw,
@@ -156,14 +150,11 @@ pub(super) fn read_qualifier_gap<R: Read>(
     loop {
         match input.peek_byte()? {
             Some(byte) if byte.is_ascii_whitespace() => {
-                let byte = input.next_byte()?.expect("peek confirmed whitespace");
+                let byte = input.require_byte()?;
                 push_gap_byte(&mut gap, byte)?;
             }
             Some(b'#') => {
-                push_gap_byte(
-                    &mut gap,
-                    input.next_byte()?.expect("peek confirmed a hash comment"),
-                )?;
+                push_gap_byte(&mut gap, input.require_byte()?)?;
                 read_gap_line_comment(input, &mut gap, executable_comment)?;
             }
             Some(b'-')
@@ -172,8 +163,8 @@ pub(super) fn read_qualifier_gap<R: Read>(
                         next.is_ascii_whitespace() || next.is_ascii_control()
                     }) =>
             {
-                push_gap_byte(&mut gap, input.next_byte()?.expect("peek confirmed dash"))?;
-                push_gap_byte(&mut gap, input.next_byte()?.expect("peek confirmed dash"))?;
+                push_gap_byte(&mut gap, input.require_byte()?)?;
+                push_gap_byte(&mut gap, input.require_byte()?)?;
                 read_gap_line_comment(input, &mut gap, executable_comment)?;
             }
             Some(b'/') if input.peek_nth_byte(1)? == Some(b'*') => {
@@ -190,8 +181,8 @@ pub(super) fn read_qualifier_gap<R: Read>(
                         "executable comment inside a source qualifier is unsupported",
                     ));
                 }
-                push_gap_byte(&mut gap, input.next_byte()?.expect("peek confirmed slash"))?;
-                push_gap_byte(&mut gap, input.next_byte()?.expect("peek confirmed star"))?;
+                push_gap_byte(&mut gap, input.require_byte()?)?;
+                push_gap_byte(&mut gap, input.require_byte()?)?;
                 read_gap_block_comment(input, &mut gap)?;
             }
             _ => return Ok(gap),
@@ -236,12 +227,7 @@ pub(super) fn read_gap_block_comment<R: Read>(
         ))?;
         push_gap_byte(gap, byte)?;
         if byte == b'*' && input.peek_byte()? == Some(b'/') {
-            push_gap_byte(
-                gap,
-                input
-                    .next_byte()?
-                    .expect("peek confirmed block comment terminator"),
-            )?;
+            push_gap_byte(gap, input.require_byte()?)?;
             return Ok(());
         }
     }

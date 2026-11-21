@@ -693,6 +693,8 @@ fn staging_bytes(root: &Path, stop_after: u64) -> Result<u64, IoError> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     const TAG: &str = "dbev_bk_0123456789abcdef0123456789abcdef";
@@ -736,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_body_is_isolated_and_limited_independently_of_the_database() {
+    fn helper_body_is_isolated_and_limited_independently_of_the_database() -> anyhow::Result<()> {
         let staging = Path::new("/backups/.staging/inst_one/.job.capture");
         let spec = spec(staging);
         let body = helper_body(HelperBody {
@@ -747,7 +749,10 @@ mod tests {
             rootless_podman: false,
             node_id: "node-a",
         });
-        let host = body.host_config.as_ref().unwrap();
+        let host = body
+            .host_config
+            .as_ref()
+            .context("expected a value from as_ref")?;
         assert_eq!(host.network_mode.as_deref(), Some("none"));
         assert_eq!(body.network_disabled, Some(true));
         assert_eq!(host.readonly_rootfs, Some(true));
@@ -756,14 +761,17 @@ mod tests {
         assert!(
             host.security_opt
                 .as_ref()
-                .unwrap()
+                .context("helper body is isolated and limited independently of the database should provide a value")?
                 .contains(&"no-new-privileges".to_string())
         );
         assert_eq!(host.memory, mib_to_bytes(HELPER_MEMORY_MIB));
         assert_eq!(host.memory_swap, host.memory);
         assert_eq!(host.pids_limit, Some(HELPER_PIDS_LIMIT));
         assert_eq!(host.auto_remove, Some(false));
-        let mounts = host.mounts.as_ref().unwrap();
+        let mounts = host
+            .mounts
+            .as_ref()
+            .context("expected a value from as_ref")?;
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].target.as_deref(), Some(BACKUP_HELPER_STAGING));
         assert_eq!(mounts[0].read_only, Some(false));
@@ -771,10 +779,15 @@ mod tests {
         assert_eq!(mounts[1].read_only, Some(true));
         assert_eq!(body.user.as_deref(), Some("999:999"));
         assert_eq!(body.image.as_deref(), Some("sha256:abc"));
-        let labels = body.labels.as_ref().unwrap();
+        let labels = body
+            .labels
+            .as_ref()
+            .context("expected a value from as_ref")?;
         assert!(is_owned_helper(labels, "node-a"));
         assert!(!is_owned_helper(labels, "node-b"));
-        assert!(!body.cmd.as_ref().unwrap()[1].contains("hunter2"));
+        assert!(!body.cmd.as_ref().context("helper body is isolated and limited independently of the database should provide a value")?[1].contains("hunter2"));
+
+        Ok(())
     }
 
     #[test]
@@ -801,15 +814,17 @@ mod tests {
     }
 
     #[test]
-    fn staging_measurement_stops_past_the_budget_and_skips_links() {
-        let root = tempfile::tempdir().unwrap();
-        assert_eq!(staging_bytes(&root.path().join("missing"), 10).unwrap(), 0);
-        std::fs::create_dir_all(root.path().join("pgdata/pg_wal")).unwrap();
-        std::fs::write(root.path().join("pgdata/PG_VERSION"), b"18\n").unwrap();
-        std::fs::write(root.path().join("pgdata/pg_wal/segment"), vec![0_u8; 100]).unwrap();
-        std::os::unix::fs::symlink("/etc", root.path().join("pgdata/link")).unwrap();
-        assert_eq!(staging_bytes(root.path(), 1024).unwrap(), 103);
-        assert!(staging_bytes(root.path(), 50).unwrap() > 50);
+    fn staging_measurement_stops_past_the_budget_and_skips_links() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        assert_eq!(staging_bytes(&root.path().join("missing"), 10)?, 0);
+        std::fs::create_dir_all(root.path().join("pgdata/pg_wal"))?;
+        std::fs::write(root.path().join("pgdata/PG_VERSION"), b"18\n")?;
+        std::fs::write(root.path().join("pgdata/pg_wal/segment"), vec![0_u8; 100])?;
+        std::os::unix::fs::symlink("/etc", root.path().join("pgdata/link"))?;
+        assert_eq!(staging_bytes(root.path(), 1024)?, 103);
+        assert!(staging_bytes(root.path(), 50)? > 50);
+
+        Ok(())
     }
 
     #[test]

@@ -192,19 +192,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_user_and_optional_database() {
+    fn parses_user_and_optional_database() -> anyhow::Result<()> {
         let packet = startup_packet(&[("user", "app"), ("database", "app_db")]);
 
-        let route = parse_startup_route(&packet).unwrap();
+        let route = parse_startup_route(&packet)?;
 
         assert_eq!(route.user, "app");
         assert_eq!(route.database.as_deref(), Some("app_db"));
 
         let packet = startup_packet(&[("user", "app")]);
 
-        let route = parse_startup_route(&packet).unwrap();
+        let route = parse_startup_route(&packet)?;
 
         assert_eq!(route.database, None);
+
+        Ok(())
     }
 
     fn startup_packet(fields: &[(&str, &str)]) -> Vec<u8> {

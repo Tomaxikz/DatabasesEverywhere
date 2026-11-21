@@ -345,6 +345,8 @@ impl WatchOperationQueue {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     fn desired(name: &str) -> DesiredWatch {
@@ -356,24 +358,30 @@ mod tests {
     }
 
     #[test]
-    fn repeated_reconciliation_coalesces_to_one_registration() {
+    fn repeated_reconciliation_coalesces_to_one_registration() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.upsert("one".to_string(), desired("one"));
         queue.upsert("one".to_string(), desired("one"));
         assert_eq!(queue.pending_len(), 1);
 
-        let operation = queue.next(Duration::ZERO).unwrap();
+        let operation = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         assert!(queue.next(Duration::ZERO).is_none());
         assert!(queue.complete(&operation, true, Duration::ZERO, Duration::from_secs(15)));
         assert!(queue.next(Duration::ZERO).is_none());
         assert!(queue.is_confirmed("one", "fingerprint-one"));
+
+        Ok(())
     }
 
     #[test]
-    fn stale_registration_completion_cannot_confirm_a_replaced_root() {
+    fn stale_registration_completion_cannot_confirm_a_replaced_root() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.upsert("one".to_string(), desired("one"));
-        let stale = queue.next(Duration::ZERO).unwrap();
+        let stale = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         queue.upsert("one".to_string(), desired("replacement"));
         assert!(!queue.is_current_registration(&stale));
         assert!(queue.complete(&stale, true, Duration::ZERO, Duration::from_secs(15)));
@@ -383,13 +391,17 @@ mod tests {
             Some(WatchOperation::Register { desired, .. })
                 if desired.fingerprint == "fingerprint-replacement"
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn removal_during_registration_is_coalesced_into_one_unregister() {
+    fn removal_during_registration_is_coalesced_into_one_unregister() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.upsert("one".to_string(), desired("one"));
-        let register = queue.next(Duration::ZERO).unwrap();
+        let register = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         queue.remove("one", None);
         assert!(queue.complete(&register, true, Duration::ZERO, Duration::from_secs(15)));
         queue.resolve_retirement(
@@ -400,13 +412,17 @@ mod tests {
             queue.next(Duration::ZERO),
             Some(WatchOperation::Unregister { target_id, .. }) if target_id == "one"
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn late_registration_completion_preserves_an_existing_retirement_token() {
+    fn late_registration_completion_preserves_an_existing_retirement_token() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.upsert("one".to_string(), desired("one"));
-        let register = queue.next(Duration::ZERO).unwrap();
+        let register = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         queue.remove(
             "one",
             Some(RetiredWatch::for_test(PathBuf::from("/srv/one"))),
@@ -420,14 +436,18 @@ mod tests {
             queue.next(Duration::ZERO),
             Some(WatchOperation::Unregister { target_id, .. }) if target_id == "one"
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn rapid_same_desire_readd_does_not_confirm_a_stale_registration() {
+    fn rapid_same_desire_readd_does_not_confirm_a_stale_registration() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         let desired = desired("one");
         queue.upsert("one".to_string(), desired.clone());
-        let stale_register = queue.next(Duration::ZERO).unwrap();
+        let stale_register = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         queue.remove(
             "one",
             Some(RetiredWatch::for_test(PathBuf::from("/srv/one"))),
@@ -444,7 +464,9 @@ mod tests {
         queue.resolve_retirement("one", None);
 
         assert!(!queue.is_current_desire_confirmed("one"));
-        let unregister = queue.next(Duration::ZERO).unwrap();
+        let unregister = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         assert!(matches!(
             &unregister,
             WatchOperation::Unregister { target_id, .. } if target_id == "one"
@@ -454,12 +476,16 @@ mod tests {
             queue.next(Duration::ZERO),
             Some(WatchOperation::Register { target_id, .. }) if target_id == "one"
         ));
+
+        Ok(())
     }
 
     fn assert_applied_remove_readd_order(replacement: DesiredWatch) {
         let mut queue = WatchOperationQueue::default();
         queue.upsert("one".to_string(), desired("one"));
-        let initial = queue.next(Duration::ZERO).unwrap();
+        let initial = queue
+            .next(Duration::ZERO)
+            .expect("expected a value from next");
         assert!(queue.complete(&initial, true, Duration::ZERO, Duration::from_secs(15)));
         queue.remove(
             "one",
@@ -467,7 +493,9 @@ mod tests {
         );
         queue.upsert("one".to_string(), replacement.clone());
 
-        let unregister = queue.next(Duration::ZERO).unwrap();
+        let unregister = queue
+            .next(Duration::ZERO)
+            .expect("expected a value from next");
         assert!(matches!(&unregister, WatchOperation::Unregister { .. }));
         assert!(queue.complete(&unregister, true, Duration::ZERO, Duration::from_secs(15)));
         assert!(matches!(
@@ -484,13 +512,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_unregister_completion_cannot_erase_a_newer_retirement_token() {
+    fn stale_unregister_completion_cannot_erase_a_newer_retirement_token() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.remove(
             "one",
             Some(RetiredWatch::for_test(PathBuf::from("/srv/old"))),
         );
-        let stale = queue.next(Duration::ZERO).unwrap();
+        let stale = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         queue.remove(
             "one",
             Some(RetiredWatch::for_test(PathBuf::from("/srv/new"))),
@@ -504,16 +534,22 @@ mod tests {
             Some(WatchOperation::Unregister { retired, .. })
                 if retired == RetiredWatch::for_test(PathBuf::from("/srv/new"))
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn late_changed_root_registration_preserves_both_retirement_tokens() {
+    fn late_changed_root_registration_preserves_both_retirement_tokens() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.upsert("one".to_string(), desired("old"));
-        let initial = queue.next(Duration::ZERO).unwrap();
+        let initial = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         assert!(queue.complete(&initial, true, Duration::ZERO, Duration::from_secs(15)));
         queue.upsert("one".to_string(), desired("new"));
-        let changed_register = queue.next(Duration::ZERO).unwrap();
+        let changed_register = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
 
         let old = RetiredWatch::for_test(PathBuf::from("/srv/old"));
         let new = RetiredWatch::for_test(PathBuf::from("/srv/new"));
@@ -526,7 +562,9 @@ mod tests {
         ));
         queue.resolve_retirement("one", Some(new.clone()));
 
-        let unregister_old = queue.next(Duration::ZERO).unwrap();
+        let unregister_old = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         assert!(matches!(
             &unregister_old,
             WatchOperation::Unregister { retired, .. } if retired == &old
@@ -537,7 +575,9 @@ mod tests {
             Duration::ZERO,
             Duration::from_secs(15)
         ));
-        let unregister_new = queue.next(Duration::ZERO).unwrap();
+        let unregister_new = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         assert!(matches!(
             &unregister_new,
             WatchOperation::Unregister { retired, .. } if retired == &new
@@ -550,13 +590,17 @@ mod tests {
         ));
         assert!(!queue.retirement_pending("one"));
         assert!(queue.next(Duration::ZERO).is_none());
+
+        Ok(())
     }
 
     #[test]
-    fn missing_retirement_token_clears_only_an_unresolved_placeholder() {
+    fn missing_retirement_token_clears_only_an_unresolved_placeholder() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.upsert("one".to_string(), desired("one"));
-        let register = queue.next(Duration::ZERO).unwrap();
+        let register = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         queue.remove("one", None);
         assert!(queue.retirement_pending("one"));
         assert!(queue.complete(&register, false, Duration::ZERO, Duration::from_secs(15)));
@@ -565,26 +609,34 @@ mod tests {
 
         assert!(!queue.retirement_pending("one"));
         assert!(queue.next(Duration::ZERO).is_none());
+
+        Ok(())
     }
 
     #[test]
-    fn failed_registration_uses_bounded_retry_delay() {
+    fn failed_registration_uses_bounded_retry_delay() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.upsert("one".to_string(), desired("one"));
-        let operation = queue.next(Duration::ZERO).unwrap();
+        let operation = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         queue.complete(&operation, false, Duration::ZERO, Duration::from_secs(15));
         assert!(queue.next(Duration::from_secs(14)).is_none());
         assert!(matches!(
             queue.next(Duration::from_secs(15)),
             Some(WatchOperation::Register { .. })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn a_stalled_operation_is_reported_once_without_spawning_another() {
+    fn a_stalled_operation_is_reported_once_without_spawning_another() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.upsert("one".to_string(), desired("one"));
-        let operation = queue.next(Duration::from_secs(1)).unwrap();
+        let operation = queue
+            .next(Duration::from_secs(1))
+            .context("expected a value from next")?;
         assert!(queue.next(Duration::from_secs(2)).is_none());
         assert!(
             queue
@@ -600,21 +652,27 @@ mod tests {
                 .take_stalled(Duration::from_secs(60), Duration::from_secs(30))
                 .is_none()
         );
+
+        Ok(())
     }
 
     #[test]
-    fn retries_wait_behind_registration_and_are_coalesced() {
+    fn retries_wait_behind_registration_and_are_coalesced() -> anyhow::Result<()> {
         let mut queue = WatchOperationQueue::default();
         queue.request_retry();
         queue.request_retry();
         queue.upsert("one".to_string(), desired("one"));
-        let registration = queue.next(Duration::ZERO).unwrap();
+        let registration = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         assert!(matches!(registration, WatchOperation::Register { .. }));
         queue.complete(&registration, true, Duration::ZERO, Duration::from_secs(15));
         assert_eq!(
             queue.next(Duration::ZERO),
             Some(WatchOperation::RetryDegraded)
         );
+
+        Ok(())
     }
 
     #[test]

@@ -177,15 +177,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn omitted_dedicated_mode_keeps_legacy_offline_backups() {
-        let legacy: BackupConfig = yaml_serde::from_str("enabled: true\n").unwrap();
+    fn omitted_dedicated_mode_keeps_legacy_offline_backups() -> anyhow::Result<()> {
+        let legacy: BackupConfig = yaml_serde::from_str("enabled: true\n")?;
         assert_eq!(legacy.dedicated_mode, DedicatedBackupMode::Offline);
         assert_eq!(
             BackupConfig::default().dedicated_mode,
             DedicatedBackupMode::Offline
         );
-        let online: BackupConfig = yaml_serde::from_str("dedicated_mode: online\n").unwrap();
+        let online: BackupConfig = yaml_serde::from_str("dedicated_mode: online\n")?;
         assert_eq!(online.dedicated_mode, DedicatedBackupMode::Online);
         assert!(yaml_serde::from_str::<BackupConfig>("dedicated_mode: hot\n").is_err());
+
+        Ok(())
     }
 }

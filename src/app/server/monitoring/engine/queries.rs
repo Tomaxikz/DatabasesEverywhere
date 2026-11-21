@@ -277,9 +277,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mysql_preparation_detects_version_specific_columns() {
+    fn mysql_preparation_detects_version_specific_columns() -> anyhow::Result<()> {
         assert_eq!(
-            parse_mysql_capabilities("__DBE_CAPS__\t1\t0\n").unwrap(),
+            parse_mysql_capabilities("__DBE_CAPS__\t1\t0\n")?,
             Capabilities {
                 cpu: true,
                 memory: false,
@@ -287,7 +287,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_mysql_capabilities("notice\n__DBE_CAPS__\t1\t1\n").unwrap(),
+            parse_mysql_capabilities("notice\n__DBE_CAPS__\t1\t1\n")?,
             Capabilities {
                 cpu: true,
                 memory: true,
@@ -296,10 +296,12 @@ mod tests {
         );
         assert!(parse_mysql_capabilities("__DBE_CAPS__\tmaybe\t1").is_err());
         assert!(parse_mysql_capabilities("1\t1").is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn mysql_parser_converts_picoseconds_without_float_rounding() {
+    fn mysql_parser_converts_picoseconds_without_float_rounding() -> anyhow::Result<()> {
         let rows = parse_mysql_rows(
             "__DBE_READY__\t1\ntenant_a\t1234567890123\t987654\n",
             Capabilities {
@@ -307,14 +309,15 @@ mod tests {
                 memory: true,
                 operations: false,
             },
-        )
-        .unwrap();
+        )?;
         assert_eq!(rows["tenant_a"].cpu_time_micros, 1_234_567);
         assert_eq!(rows["tenant_a"].peak_query_memory_bytes, 987_654);
+
+        Ok(())
     }
 
     #[test]
-    fn mysql_parser_accepts_capability_specific_null_placeholders() {
+    fn mysql_parser_accepts_capability_specific_null_placeholders() -> anyhow::Result<()> {
         let cpu_only = parse_mysql_rows(
             "__DBE_READY__\t1\ntenant_a\t6000000\tNULL\n",
             Capabilities {
@@ -322,8 +325,7 @@ mod tests {
                 memory: false,
                 operations: false,
             },
-        )
-        .unwrap();
+        )?;
         assert_eq!(cpu_only["tenant_a"].cpu_time_micros, 6);
         assert_eq!(cpu_only["tenant_a"].peak_query_memory_bytes, 0);
 
@@ -334,23 +336,23 @@ mod tests {
                 memory: true,
                 operations: false,
             },
-        )
-        .unwrap();
+        )?;
         assert_eq!(memory_only["tenant_a"].cpu_time_micros, 0);
         assert_eq!(memory_only["tenant_a"].peak_query_memory_bytes, 1024);
+
+        Ok(())
     }
 
     #[test]
-    fn mariadb_seconds_are_converted_safely() {
-        assert_eq!(parse_seconds_micros("12").unwrap(), 12_000_000);
-        assert_eq!(
-            parse_seconds_micros("0.017637000000000003").unwrap(),
-            17_637
-        );
-        assert_eq!(parse_seconds_micros("1.2").unwrap(), 1_200_000);
-        assert_eq!(parse_seconds_micros("1e-6").unwrap(), 1);
+    fn mariadb_seconds_are_converted_safely() -> anyhow::Result<()> {
+        assert_eq!(parse_seconds_micros("12")?, 12_000_000);
+        assert_eq!(parse_seconds_micros("0.017637000000000003")?, 17_637);
+        assert_eq!(parse_seconds_micros("1.2")?, 1_200_000);
+        assert_eq!(parse_seconds_micros("1e-6")?, 1);
         assert!(parse_seconds_micros("-1").is_err());
         assert!(parse_seconds_micros("NaN").is_err());
+
+        Ok(())
     }
 
     #[test]
@@ -372,11 +374,10 @@ mod tests {
     }
 
     #[test]
-    fn clickhouse_parser_keeps_only_aggregate_resource_and_kind_counts() {
+    fn clickhouse_parser_keeps_only_aggregate_resource_and_kind_counts() -> anyhow::Result<()> {
         let (checkpoint, rows) = parse_clickhouse_window(
             "__DBE_CUTOFF__\t1777777777777777\ntenant_a\t1500\t4096\t3\t2\t1\t4\n",
-        )
-        .unwrap();
+        )?;
         assert_eq!(checkpoint, 1_777_777_777_777_777);
         assert_eq!(
             rows["tenant_a"],
@@ -398,6 +399,8 @@ mod tests {
         );
         assert!(parse_clickhouse_window("tenant_a\t1\t2\t3\t4\t5\t6").is_err());
         assert!(parse_clickhouse_window("__DBE_CUTOFF__\tbad\n").is_err());
+
+        Ok(())
     }
 
     #[test]

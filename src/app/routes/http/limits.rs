@@ -559,8 +559,10 @@ fn credential_fingerprint(kind: CredentialKind, credential_identity: &str) -> [u
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     #[tokio::test]
-    async fn custom_concurrency_limits_are_counted_and_released() {
+    async fn custom_concurrency_limits_are_counted_and_released() -> anyhow::Result<()> {
         let limits = crate::config::RuntimeLimits {
             api_requests: 2,
             api_heartbeat_requests: 1,
@@ -568,14 +570,14 @@ mod tests {
             ..Default::default()
         };
         let limiter = ApiRateLimiter::with_limits(600, &limits);
-        let first = limiter.admit_request(false).unwrap();
-        let second = limiter.admit_request(false).unwrap();
+        let first = limiter.admit_request(false)?;
+        let second = limiter.admit_request(false)?;
         assert_eq!(limiter.active_request_count(), 2);
         assert!(matches!(
             limiter.admit_request(false),
             Err(ApiError::RateLimited)
         ));
-        let heartbeat = limiter.admit_request(true).unwrap();
+        let heartbeat = limiter.admit_request(true)?;
         assert!(limiter.admit_request(true).is_err());
         drop((first, second, heartbeat));
         assert_eq!(limiter.active_request_count(), 0);
@@ -583,7 +585,7 @@ mod tests {
         let websocket = limiter
             .admit_websocket("one", now_unix() + 60)
             .await
-            .unwrap();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         assert_eq!(limiter.active_websocket_count(), 1);
         assert!(matches!(
             limiter.admit_websocket("two", now_unix() + 60).await,
@@ -597,6 +599,8 @@ mod tests {
                 .await
                 .is_ok()
         );
+
+        Ok(())
     }
 
     use std::{collections::HashSet, net::Ipv4Addr};
@@ -618,28 +622,27 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_identity_uses_the_socket_peer() {
-        let peer = "192.0.2.7:5000".parse().unwrap();
+    fn unauthenticated_identity_uses_the_socket_peer() -> anyhow::Result<()> {
+        let peer = "192.0.2.7:5000".parse()?;
 
         let identity = rate_limit_identity(&RequestAuthentication::Unauthenticated, Some(peer));
 
         assert_eq!(
             identity.key,
-            peer_rate_limit_key(peer_rate_limit_group(Some(
-                "192.0.2.7:1234".parse().unwrap()
-            )))
+            peer_rate_limit_key(peer_rate_limit_group(Some("192.0.2.7:1234".parse()?)))
         );
         assert!(!identity.trusted);
+
+        Ok(())
     }
 
     #[test]
-    fn valid_api_token_gets_a_stable_trusted_peer_bucket() {
+    fn valid_api_token_gets_a_stable_trusted_peer_bucket() -> anyhow::Result<()> {
         let accepted = crate::auth::api_token::ApiToken::new("secret")
             .from_auth_header(Some("Bearer secret"))
-            .unwrap();
+            .context("expected a value from from_auth_header")?;
         let authentication = RequestAuthentication::Api(accepted);
-        let identity =
-            rate_limit_identity(&authentication, Some("192.0.2.7:5000".parse().unwrap()));
+        let identity = rate_limit_identity(&authentication, Some("192.0.2.7:5000".parse()?));
 
         assert!(matches!(
             identity.key,
@@ -652,15 +655,16 @@ mod tests {
         assert!(identity.trusted);
 
         let same_ip_new_port =
-            rate_limit_identity(&authentication, Some("192.0.2.7:9000".parse().unwrap()));
-        let other_ip =
-            rate_limit_identity(&authentication, Some("192.0.2.8:5000".parse().unwrap()));
+            rate_limit_identity(&authentication, Some("192.0.2.7:9000".parse()?));
+        let other_ip = rate_limit_identity(&authentication, Some("192.0.2.8:5000".parse()?));
         assert_eq!(identity, same_ip_new_port);
         assert_ne!(identity, other_ip);
+
+        Ok(())
     }
 
     #[test]
-    fn valid_websocket_jwt_gets_a_trusted_jti_bucket() {
+    fn valid_websocket_jwt_gets_a_trusted_jti_bucket() -> anyhow::Result<()> {
         let secret = b"test-jwt-signing-key-at-least-32-bytes";
         let (token, _) = jwt::issue_ws_token(
             secret,
@@ -675,12 +679,10 @@ mod tests {
                 )])),
             },
             60,
-        )
-        .unwrap();
-        let claims = jwt::validate_ws_token_claims(&token, secret).unwrap();
+        )?;
+        let claims = jwt::validate_ws_token_claims(&token, secret)?;
         let authentication = RequestAuthentication::WebSocket(Arc::new(claims));
-        let identity =
-            rate_limit_identity(&authentication, Some("192.0.2.7:5000".parse().unwrap()));
+        let identity = rate_limit_identity(&authentication, Some("192.0.2.7:5000".parse()?));
 
         assert!(matches!(
             identity.key,
@@ -691,26 +693,32 @@ mod tests {
         ));
         assert!(!identity.key.audit_label().contains(&token));
         assert!(identity.trusted);
+
+        Ok(())
     }
 
     #[test]
-    fn ipv6_peers_are_grouped_by_64_bit_prefix() {
-        let first = peer_rate_limit_group(Some("[2001:db8:1234:5678::1]:5000".parse().unwrap()));
-        let second = peer_rate_limit_group(Some("[2001:db8:1234:5678::2]:5000".parse().unwrap()));
+    fn ipv6_peers_are_grouped_by_64_bit_prefix() -> anyhow::Result<()> {
+        let first = peer_rate_limit_group(Some("[2001:db8:1234:5678::1]:5000".parse()?));
+        let second = peer_rate_limit_group(Some("[2001:db8:1234:5678::2]:5000".parse()?));
 
         assert_eq!(first, second);
         assert!(matches!(first, PeerGroup::V6(_)));
+
+        Ok(())
     }
 
     #[test]
-    fn ipv4_mapped_ipv6_peers_use_their_ipv4_bucket() {
-        let ipv4 = peer_rate_limit_group(Some("192.0.2.7:5000".parse().unwrap()));
-        let mapped = peer_rate_limit_group(Some("[::ffff:192.0.2.7]:5000".parse().unwrap()));
-        let other_mapped = peer_rate_limit_group(Some("[::ffff:192.0.2.8]:5000".parse().unwrap()));
+    fn ipv4_mapped_ipv6_peers_use_their_ipv4_bucket() -> anyhow::Result<()> {
+        let ipv4 = peer_rate_limit_group(Some("192.0.2.7:5000".parse()?));
+        let mapped = peer_rate_limit_group(Some("[::ffff:192.0.2.7]:5000".parse()?));
+        let other_mapped = peer_rate_limit_group(Some("[::ffff:192.0.2.8]:5000".parse()?));
 
         assert_eq!(mapped, ipv4);
         assert_ne!(mapped, other_mapped);
         assert!(matches!(mapped, PeerGroup::V4([192, 0, 2, 7])));
+
+        Ok(())
     }
 
     #[test]
@@ -819,23 +827,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_jti_is_single_use_until_expiration() {
+    async fn websocket_jti_is_single_use_until_expiration() -> anyhow::Result<()> {
         let limiter = ApiRateLimiter::default();
         let expiration = now_unix() + 60;
 
         let permit = limiter
             .admit_websocket("single-use-jti", expiration)
             .await
-            .unwrap();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         drop(permit);
 
         assert_eq!(
             limiter
                 .admit_websocket("single-use-jti", expiration)
                 .await
-                .unwrap_err(),
+                .expect_err("admit websocket should return an error"),
             WebSocketAdmissionError::Replay
         );
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -847,19 +857,19 @@ mod tests {
             limiter
                 .admit_websocket("expired-jti", now)
                 .await
-                .unwrap_err(),
+                .expect_err("admit websocket should return an error"),
             WebSocketAdmissionError::Expired
         );
     }
 
     #[tokio::test]
-    async fn websocket_connections_are_counted_and_can_be_drained() {
+    async fn websocket_connections_are_counted_and_can_be_drained() -> anyhow::Result<()> {
         let limiter = ApiRateLimiter::default();
         let expiration = now_unix() + 60;
         let permit = limiter
             .admit_websocket("drainable-jti", expiration)
             .await
-            .unwrap();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         assert_eq!(limiter.active_websocket_count(), 1);
 
         tokio::spawn(async move {
@@ -872,14 +882,16 @@ mod tests {
                 .await
         );
         assert_eq!(limiter.active_websocket_count(), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn concurrent_api_requests_are_bounded() {
+    fn concurrent_api_requests_are_bounded() -> anyhow::Result<()> {
         let limiter = ApiRateLimiter::default();
         let mut permits = Vec::with_capacity(MAX_ACTIVE_API_REQUESTS);
         for _ in 0..MAX_ACTIVE_API_REQUESTS {
-            permits.push(limiter.admit_request(false).unwrap());
+            permits.push(limiter.admit_request(false)?);
         }
 
         assert!(matches!(
@@ -889,5 +901,7 @@ mod tests {
         assert!(limiter.admit_request(true).is_ok());
         drop(permits.pop());
         assert!(limiter.admit_request(false).is_ok());
+
+        Ok(())
     }
 }

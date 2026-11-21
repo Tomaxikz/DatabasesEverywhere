@@ -677,19 +677,19 @@ mod tests {
     }
 
     #[test]
-    fn prefers_the_socket_and_falls_back_to_tcp() {
-        let directory = tempfile::tempdir().unwrap();
+    fn prefers_the_socket_and_falls_back_to_tcp() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let socket = directory.path().join("api.sock");
         let mut config = Config::default();
         config.api.socket_path = socket.display().to_string();
         let tcp = ApiTransport::Network(local_api_url(&config));
 
         assert_eq!(ApiTransport::from_config(&config), tcp);
-        std::fs::write(&socket, b"not a socket").unwrap();
+        std::fs::write(&socket, b"not a socket")?;
         assert_eq!(ApiTransport::from_config(&config), tcp);
-        std::fs::remove_file(&socket).unwrap();
+        std::fs::remove_file(&socket)?;
 
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
         assert_eq!(
             ApiTransport::from_config(&config),
             ApiTransport::Socket(socket.clone())
@@ -703,16 +703,18 @@ mod tests {
             ApiTransport::from_config(&config),
             ApiTransport::Socket(directory.path().join("missing.sock"))
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn talks_to_the_daemon_over_its_socket() {
+    async fn talks_to_the_daemon_over_its_socket() -> anyhow::Result<()> {
         use axum::{http::HeaderMap, routing::get};
 
         const TOKEN: &str = "test-api-token-0123456789abcdef-01";
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let socket = directory.path().join("api.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket)?;
         let router = axum::Router::new().route(
             "/api/system",
             get(|headers: HeaderMap| async move {
@@ -736,11 +738,13 @@ mod tests {
         // TCP-only requirements do not apply to the socket.
         config.api.ssl.enabled = true;
         config.api.ssl.require_client_cert = true;
-        let client = ApiClient::from_config(&config).unwrap();
+        let client = ApiClient::from_config(&config)?;
 
         assert_eq!(client.base_url(), format!("unix://{}", socket.display()));
-        assert_eq!(client.system().await.unwrap().version, "9.9.9");
+        assert_eq!(client.system().await?.version, "9.9.9");
         server.abort();
+
+        Ok(())
     }
 
     #[test]
@@ -765,17 +769,18 @@ mod tests {
     }
 
     #[test]
-    fn enabled_protocols_follow_the_system_flags() {
+    fn enabled_protocols_follow_the_system_flags() -> anyhow::Result<()> {
         let system: SystemInfo = serde_json::from_value(serde_json::json!({
             "version": "0.9.0",
             "postgres_enabled": true,
             "redis_enabled": false,
             "qdrant_enabled": true
-        }))
-        .unwrap();
+        }))?;
         assert_eq!(
             system.enabled_protocols(),
             [Protocol::Postgres, Protocol::Qdrant]
         );
+
+        Ok(())
     }
 }

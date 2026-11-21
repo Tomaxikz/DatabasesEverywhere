@@ -89,6 +89,8 @@ pub(super) fn watch_fingerprint(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::super::{
         scanning::{CompletedSoftDiskScan, apply_soft_disk_scan},
         watch_operations::{DesiredWatch, WatchOperationQueue},
@@ -198,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_watch_completion_cannot_revert_a_newer_root_identity() {
+    fn stale_watch_completion_cannot_revert_a_newer_root_identity() -> anyhow::Result<()> {
         let target = target();
         let target_fingerprint = target.scanner_fingerprint();
         let old_identity = identity(1, 2);
@@ -219,7 +221,9 @@ mod tests {
                 root: target.data_path.clone(),
             },
         );
-        let stale = queue.next(Duration::ZERO).unwrap();
+        let stale = queue
+            .next(Duration::ZERO)
+            .context("expected a value from next")?;
         queue.upsert(
             "one".to_string(),
             DesiredWatch {
@@ -257,16 +261,20 @@ mod tests {
             tracker.identity_for("one", &target_fingerprint),
             Some(new_identity)
         );
+
+        Ok(())
     }
 
     #[test]
-    fn stale_scan_completion_cannot_revert_a_newer_root_identity() {
+    fn stale_scan_completion_cannot_revert_a_newer_root_identity() -> anyhow::Result<()> {
         let target = target();
         let fingerprint = target.scanner_fingerprint();
         let old_identity = identity(1, 2);
         let new_identity = identity(1, 3);
         let mut planner = planner(old_identity);
-        let old_candidate = planner.next_candidate(Duration::ZERO).unwrap();
+        let old_candidate = planner
+            .next_candidate(Duration::ZERO)
+            .context("expected a value from next_candidate")?;
         planner.upsert_target(
             Duration::from_secs(1),
             TargetSpec {
@@ -319,9 +327,11 @@ mod tests {
         assert_eq!(
             planner
                 .next_candidate(Duration::from_secs(2))
-                .unwrap()
+                .context("from secs should provide a value")?
                 .root_identity,
             Some(new_identity)
         );
+
+        Ok(())
     }
 }

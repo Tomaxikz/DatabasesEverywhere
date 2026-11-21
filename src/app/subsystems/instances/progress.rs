@@ -482,8 +482,11 @@ fn apply_failure(progress: &mut InstallProgress, diagnostic: PublicDiagnostic) {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     #[test]
-    fn configured_creation_capacity_can_exceed_the_old_progress_cache_limit() {
+    fn configured_creation_capacity_can_exceed_the_old_progress_cache_limit() -> anyhow::Result<()>
+    {
         let capacity = MAX_INSTALL_PROGRESS_ENTRIES + 1;
         let store = InstallProgressStore::with_creation_limit(capacity);
         let mut permits = Vec::new();
@@ -495,7 +498,7 @@ mod tests {
                         Protocol::Postgres,
                         "postgres:18.4",
                     )
-                    .unwrap(),
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?,
             );
         }
         assert!(matches!(
@@ -510,29 +513,40 @@ mod tests {
                 .try_begin_creation("inst_reused", Protocol::Postgres, "postgres:18.4")
                 .is_ok()
         );
+
+        Ok(())
     }
 
     #[test]
-    fn progress_revisions_survive_reuse_but_are_not_public() {
+    fn progress_revisions_survive_reuse_but_are_not_public() -> anyhow::Result<()> {
         let store = InstallProgressStore::default();
         store.begin("tenant", Protocol::Mysql, "mysql:8.4");
         store.complete("tenant", "done");
-        let before = store.get("tenant").unwrap();
+        let before = store.get("tenant").context("missing tenant entry")?;
         store.fail_if_running_api_error(
             "tenant",
             "creation",
             &ApiError::Conflict("ignored".into()),
         );
-        assert_eq!(store.get("tenant").unwrap().revision, before.revision);
-        assert!(
-            serde_json::to_value(&before)
-                .unwrap()
-                .get("revision")
-                .is_none()
+        assert_eq!(
+            store
+                .get("tenant")
+                .context("get should provide a value")?
+                .revision,
+            before.revision
         );
+        assert!(serde_json::to_value(&before)?.get("revision").is_none());
         store.remove("tenant");
         store.begin("tenant", Protocol::Mysql, "mysql:8.4");
-        assert!(store.get("tenant").unwrap().revision > before.revision);
+        assert!(
+            store
+                .get("tenant")
+                .context("get should provide a value")?
+                .revision
+                > before.revision
+        );
+
+        Ok(())
     }
 
     use super::*;
@@ -557,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_progress_failure_exposes_only_public_diagnostic() {
+    fn internal_progress_failure_exposes_only_public_diagnostic() -> anyhow::Result<()> {
         let store = InstallProgressStore::default();
         store.begin("inst-one", Protocol::Postgres, "postgres:test");
         store.fail_internal(
@@ -566,23 +580,26 @@ mod tests {
             "password=hunter2 /var/lib/private",
         );
 
-        let encoded = serde_json::to_string(&store.get("inst-one").unwrap()).unwrap();
+        let encoded =
+            serde_json::to_string(&store.get("inst-one").context("missing inst-one entry")?)?;
         assert!(encoded.contains("internal_error"));
         assert!(!encoded.contains("hunter2"));
         assert!(!encoded.contains("/var/lib/private"));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn creation_admission_is_single_instance_and_drains_on_shutdown() {
+    async fn creation_admission_is_single_instance_and_drains_on_shutdown() -> anyhow::Result<()> {
         let store = InstallProgressStore::default();
         let permit = store
             .try_begin_creation("inst-one", Protocol::Postgres, "postgres:test")
-            .unwrap();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
 
         assert_eq!(
             store
                 .try_begin_creation("inst-one", Protocol::Postgres, "postgres:test")
-                .unwrap_err(),
+                .expect_err("try begin creation should return an error"),
             BeginCreationError::AlreadyRunning
         );
         assert!(store.get("inst-one").is_some());
@@ -596,7 +613,7 @@ mod tests {
         assert_eq!(
             store
                 .try_begin_creation("inst-two", Protocol::Postgres, "postgres:test")
-                .unwrap_err(),
+                .expect_err("try begin creation should return an error"),
             BeginCreationError::ShuttingDown
         );
         drop(permit);
@@ -605,14 +622,16 @@ mod tests {
                 .wait_for_creation_drain(Duration::from_millis(100))
                 .await
         );
+
+        Ok(())
     }
 
     #[test]
-    fn creation_lifetime_is_independent_of_retained_progress() {
+    fn creation_lifetime_is_independent_of_retained_progress() -> anyhow::Result<()> {
         let store = InstallProgressStore::default();
         let permit = store
             .try_begin_creation("tenant", Protocol::Postgres, "postgres:test")
-            .unwrap();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         assert!(store.is_creating("tenant"));
         store.complete("tenant", "ready");
         store.remove("tenant");
@@ -621,7 +640,7 @@ mod tests {
         assert_eq!(
             store
                 .try_begin_creation("tenant", Protocol::Postgres, "postgres:test")
-                .unwrap_err(),
+                .expect_err("try begin creation should return an error"),
             BeginCreationError::AlreadyRunning
         );
         drop(permit);
@@ -629,43 +648,61 @@ mod tests {
         assert_eq!(store.active_creation_count(), 0);
         store.begin("tenant", Protocol::Postgres, "postgres:test");
         assert!(!store.is_creating("tenant"));
+
+        Ok(())
     }
 
     #[test]
-    fn creation_generations_identify_one_instance_creation_attempt() {
+    fn creation_generations_identify_one_instance_creation_attempt() -> anyhow::Result<()> {
         let store = InstallProgressStore::default();
         let permit = store
             .try_begin_instance_creation("inst_one", Protocol::Postgres, "postgres:18.4", true)
-            .unwrap();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let generation = store
             .get("inst_one")
-            .unwrap()
+            .context("missing inst_one entry")?
             .creation_generation()
-            .unwrap();
+            .context("expected a value from creation_generation")?;
         assert!(generation.starts_with(CREATION_GENERATION_PREFIX));
-        assert!(store.get("inst_one").unwrap().creates_dedicated_container());
+        assert!(
+            store
+                .get("inst_one")
+                .context("get should provide a value")?
+                .creates_dedicated_container()
+        );
 
         store.stage("inst_one", "pull", "pulling image");
         store.complete("inst_one", "created");
         assert_eq!(
-            store.get("inst_one").unwrap().creation_generation(),
+            store
+                .get("inst_one")
+                .context("get should provide a value")?
+                .creation_generation(),
             Some(generation.clone()),
             "the attempt survives its own progress updates"
         );
         drop(permit);
 
         store.begin_image_update("inst_one", Protocol::Postgres, "postgres:18.5");
-        assert_eq!(store.get("inst_one").unwrap().creation_generation(), None);
+        assert_eq!(
+            store
+                .get("inst_one")
+                .context("get should provide a value")?
+                .creation_generation(),
+            None
+        );
 
         let _again = store
             .try_begin_instance_creation("inst_two", Protocol::Redis, "redis:8.8.0", false)
-            .unwrap();
-        let other = store.get("inst_two").unwrap();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let other = store.get("inst_two").context("missing inst_two entry")?;
         assert_ne!(other.creation_generation(), Some(generation));
         assert!(!other.creates_dedicated_container());
         assert!(
-            !serde_json::to_string(&other).unwrap().contains("creating:"),
+            !serde_json::to_string(&other)?.contains("creating:"),
             "the attempt never appears on the wire"
         );
+
+        Ok(())
     }
 }

@@ -297,18 +297,23 @@ pub fn limits_from_request(request: &LimitsRequest) -> InstanceLimits {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     #[test]
-    fn shared_creation_requires_explicit_owner_and_disk_only_limits() {
+    fn shared_creation_requires_explicit_owner_and_disk_only_limits() -> anyhow::Result<()> {
         let valid = serde_json::json!({
             "instance_id":"tenant-a", "protocol":"mysql", "deployment_mode":"shared", "pool_id":"pool_test",
             "database":"tenant_db", "username":"tenant_user", "password":"secret",
             "public_host":"db.example.test", "server_id":"server-a", "limits":{"disk_mib":1024}
         });
-        validate_create_request(&serde_json::from_value(valid.clone()).unwrap()).unwrap();
+        validate_create_request(&serde_json::from_value(valid.clone())?)?;
         for field in ["server_id", "pool_id", "limits"] {
             let mut missing = valid.clone();
-            missing.as_object_mut().unwrap().remove(field);
-            assert!(validate_create_request(&serde_json::from_value(missing).unwrap()).is_err());
+            missing
+                .as_object_mut()
+                .context("expected an object")?
+                .remove(field);
+            assert!(validate_create_request(&serde_json::from_value(missing)?).is_err());
         }
         let mut spoofed = valid.clone();
         spoofed["owner"] = serde_json::json!({"panel_id":"another-panel","server_id":"server-b"});
@@ -320,8 +325,10 @@ mod tests {
         ] {
             let mut bad = valid.clone();
             bad["limits"] = limits;
-            assert!(validate_create_request(&serde_json::from_value(bad).unwrap()).is_err());
+            assert!(validate_create_request(&serde_json::from_value(bad)?).is_err());
         }
+
+        Ok(())
     }
 
     use super::*;
@@ -335,24 +342,27 @@ mod tests {
     }
 
     #[test]
-    fn protocol_startup_resource_floors_are_enforced() {
+    fn protocol_startup_resource_floors_are_enforced() -> anyhow::Result<()> {
         for protocol in [Protocol::Mongodb, Protocol::Clickhouse] {
             for (name, requested, field) in [
                 ("low memory", limits(512, 1024), "memory_mib"),
                 ("low disk", limits(1024, 768), "disk_mib"),
             ] {
-                let error = validate_protocol_limits(protocol, &requested).unwrap_err();
+                let error = validate_protocol_limits(protocol, &requested)
+                    .expect_err("validate protocol limits should return an error");
                 assert!(
                     error.to_string().contains(field),
                     "{protocol:?} {name} reported the wrong field: {error}"
                 );
             }
-            validate_protocol_limits(protocol, &limits(1024, 1024)).unwrap();
+            validate_protocol_limits(protocol, &limits(1024, 1024))?;
         }
+
+        Ok(())
     }
 
     #[test]
-    fn database_and_username_identifier_policy_is_enforced() {
+    fn database_and_username_identifier_policy_is_enforced() -> anyhow::Result<()> {
         for database in ["bad.name", "postgres"] {
             assert!(
                 validate_database_name(database).is_err(),
@@ -373,9 +383,11 @@ mod tests {
                 "accepted username: {username}"
             );
         }
-        validate_database_name("app_db-1").unwrap();
-        validate_database_name("dbe_control").unwrap();
-        validate_username("app_user-1").unwrap();
+        validate_database_name("app_db-1")?;
+        validate_database_name("dbe_control")?;
+        validate_username("app_user-1")?;
+
+        Ok(())
     }
 
     #[test]
@@ -401,7 +413,7 @@ mod tests {
                 memory_mib: 1024,
                 disk_mib: 1024,
             })
-            .unwrap_err();
+            .expect_err("validate limits should return an error");
 
             assert!(error.to_string().contains("finite"));
         }
@@ -411,13 +423,13 @@ mod tests {
             memory_mib: 1_u64 << 44,
             disk_mib: 1024,
         })
-        .unwrap_err();
+        .expect_err("validate limits should return an error");
 
         assert!(error.to_string().contains("memory_mib"));
     }
 
     #[test]
-    fn stale_resource_purge_requires_central_confirmation() {
+    fn stale_resource_purge_requires_central_confirmation() -> anyhow::Result<()> {
         let request: CreateInstanceRequest = serde_json::from_value(serde_json::json!({
             "instance_id": "inst_test_pg",
             "protocol": "postgres",
@@ -426,14 +438,15 @@ mod tests {
             "password": "secret",
             "public_host": "127.0.0.1",
             "purge_stale_resources": true
-        }))
-        .unwrap();
+        }))?;
 
         assert!(validate_create_request(&request).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn omitted_deployment_mode_keeps_dedicated_behavior() {
+    fn omitted_deployment_mode_keeps_dedicated_behavior() -> anyhow::Result<()> {
         let request: CreateInstanceRequest = serde_json::from_value(serde_json::json!({
             "instance_id": "inst_test_pg",
             "protocol": "postgres",
@@ -441,15 +454,16 @@ mod tests {
             "username": "test_user",
             "password": "secret",
             "public_host": "127.0.0.1"
-        }))
-        .unwrap();
+        }))?;
 
         assert_eq!(request.deployment_mode, DeploymentMode::Dedicated);
-        validate_create_request(&request).unwrap();
+        validate_create_request(&request)?;
+
+        Ok(())
     }
 
     #[test]
-    fn shared_create_policy_matches_protocol_capabilities() {
+    fn shared_create_policy_matches_protocol_capabilities() -> anyhow::Result<()> {
         for protocol in Protocol::ALL {
             let request: CreateInstanceRequest = serde_json::from_value(serde_json::json!({
                 "instance_id": "inst_test_cache",
@@ -462,8 +476,7 @@ mod tests {
                 "username": "test_user",
                 "password": "secret",
                 "public_host": "127.0.0.1"
-            }))
-            .unwrap();
+            }))?;
 
             let result = validate_create_request(&request);
             assert_eq!(
@@ -476,10 +489,12 @@ mod tests {
                 assert!(error.to_string().contains("cannot use shared deployment"));
             }
         }
+
+        Ok(())
     }
 
     #[test]
-    fn disabled_protocol_rejects_dedicated_and_shared_create() {
+    fn disabled_protocol_rejects_dedicated_and_shared_create() -> anyhow::Result<()> {
         let mut config = Config::default();
         config.postgres.enabled = false;
         config.redis.enabled = false;
@@ -499,11 +514,11 @@ mod tests {
                 "username": "test_user",
                 "password": "secret",
                 "public_host": "127.0.0.1"
-            }))
-            .unwrap();
+            }))?;
 
-            validate_create_request(&request).unwrap();
-            let error = validate_create_config(&config, &request).unwrap_err();
+            validate_create_request(&request)?;
+            let error = validate_create_config(&config, &request)
+                .expect_err("validate create config should return an error");
             assert_eq!(error.status(), http::StatusCode::BAD_REQUEST);
             assert!(
                 error
@@ -521,7 +536,7 @@ mod tests {
                 Protocol::Clickhouse => config.clickhouse.enabled = true,
                 Protocol::Qdrant => config.qdrant.enabled = true,
             }
-            validate_create_config(&config, &request).unwrap();
+            validate_create_config(&config, &request)?;
             for other in Protocol::ALL {
                 assert_eq!(config.protocol_enabled(other), other == protocol);
             }
@@ -552,20 +567,21 @@ mod tests {
                 "username": "test_user",
                 "password": "secret",
                 "public_host": "127.0.0.1"
-            }))
-            .unwrap();
-            validate_create_request(&request).unwrap();
+            }))?;
+            validate_create_request(&request)?;
             assert_eq!(
                 validate_create_config(&config, &request)
-                    .unwrap_err()
+                    .expect_err("validate create config should return an error")
                     .status(),
                 http::StatusCode::BAD_REQUEST
             );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn shared_engines_reserve_system_databases_without_affecting_dedicated() {
+    fn shared_engines_reserve_system_databases_without_affecting_dedicated() -> anyhow::Result<()> {
         for (protocol, deployment_mode, accepted) in [
             (Protocol::Postgres, DeploymentMode::Dedicated, true),
             (Protocol::Clickhouse, DeploymentMode::Dedicated, true),
@@ -584,8 +600,7 @@ mod tests {
                 "username": "test_user",
                 "password": "secret",
                 "public_host": "127.0.0.1"
-            }))
-            .unwrap();
+            }))?;
 
             assert_eq!(validate_create_request(&request).is_ok(), accepted);
         }
@@ -608,8 +623,7 @@ mod tests {
                 "username": "test_user",
                 "password": "secret",
                 "public_host": "127.0.0.1"
-            }))
-            .unwrap();
+            }))?;
 
             assert!(
                 validate_create_request(&request).is_err(),
@@ -623,5 +637,7 @@ mod tests {
                 "{protocol}:{database}"
             );
         }
+
+        Ok(())
     }
 }

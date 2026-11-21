@@ -126,9 +126,10 @@ mod tests {
     }
 
     #[test]
-    fn source_database_resolution_handles_inferred_explicit_and_inconclusive_catalogs() {
+    fn source_database_resolution_handles_inferred_explicit_and_inconclusive_catalogs()
+    -> anyhow::Result<()> {
         assert_eq!(
-            resolve_source_database(Some(&catalog(&["tenant"], true)), None).unwrap(),
+            resolve_source_database(Some(&catalog(&["tenant"], true)), None)?,
             Some("tenant".to_string())
         );
         assert!(matches!(
@@ -149,7 +150,7 @@ mod tests {
 
         let authoritative_catalog = catalog(&["alpha", "beta"], true);
         assert_eq!(
-            resolve_source_database(Some(&authoritative_catalog), Some("alpha")).unwrap(),
+            resolve_source_database(Some(&authoritative_catalog), Some("alpha"))?,
             Some("alpha".to_string())
         );
         assert!(matches!(
@@ -163,9 +164,11 @@ mod tests {
             None,
         ] {
             assert_eq!(
-                resolve_source_database(catalog.as_ref(), Some("manual")).unwrap(),
+                resolve_source_database(catalog.as_ref(), Some("manual"))?,
                 Some("manual".to_string())
             );
         }
+
+        Ok(())
     }
 }

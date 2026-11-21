@@ -36,7 +36,7 @@ fn benchmark_arguments_enforce_mode_duration_and_selection_constraints() {
 
     let parse = |arguments: &[&str]| {
         BenchCli::try_parse_from(std::iter::once("dbev").chain(arguments.iter().copied()))
-            .unwrap()
+            .expect("copied should succeed")
             .bench
     };
     assert!(!parse(&[]).bench);

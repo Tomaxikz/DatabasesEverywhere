@@ -547,87 +547,88 @@ mod tests {
     }
 
     #[test]
-    fn enables_one_full_v2_quota_window() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn enables_one_full_v2_quota_window() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let mount = temporary.path().join("cgroup");
         let leaf = mount.join("system.slice/docker-test.scope");
-        std::fs::create_dir_all(&leaf).unwrap();
-        std::fs::write(leaf.join("cpu.max"), "200000 100000\n").unwrap();
-        std::fs::write(leaf.join("cpu.max.burst"), "0\n").unwrap();
+        std::fs::create_dir_all(&leaf)?;
+        std::fs::write(leaf.join("cpu.max"), "200000 100000\n")?;
+        std::fs::write(leaf.join("cpu.max.burst"), "0\n")?;
 
         let status = apply_cpu_burst_from_metadata(
             "0::/system.slice/docker-test.scope\n",
             &mountinfo_line(CgroupKind::Unified, &mount),
             CpuBurstMode::FullQuota,
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(status, CpuBurstPolicyStatus::Applied);
         assert_eq!(
-            std::fs::read_to_string(leaf.join("cpu.max.burst")).unwrap(),
+            std::fs::read_to_string(leaf.join("cpu.max.burst"))?,
             "200000"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn enables_and_clears_v1_burst_credit() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn enables_and_clears_v1_burst_credit() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let mount = temporary.path().join("cpu");
         let leaf = mount.join("docker/test");
-        std::fs::create_dir_all(&leaf).unwrap();
-        std::fs::write(leaf.join("cpu.cfs_quota_us"), "50000\n").unwrap();
-        std::fs::write(leaf.join("cpu.cfs_period_us"), "100000\n").unwrap();
-        std::fs::write(leaf.join("cpu.cfs_burst_us"), "0\n").unwrap();
+        std::fs::create_dir_all(&leaf)?;
+        std::fs::write(leaf.join("cpu.cfs_quota_us"), "50000\n")?;
+        std::fs::write(leaf.join("cpu.cfs_period_us"), "100000\n")?;
+        std::fs::write(leaf.join("cpu.cfs_burst_us"), "0\n")?;
         let metadata = "4:cpu,cpuacct:/docker/test\n";
         let mountinfo = mountinfo_line(CgroupKind::LegacyCpu, &mount);
 
         assert_eq!(
-            apply_cpu_burst_from_metadata(metadata, &mountinfo, CpuBurstMode::FullQuota).unwrap(),
+            apply_cpu_burst_from_metadata(metadata, &mountinfo, CpuBurstMode::FullQuota)?,
             CpuBurstPolicyStatus::Applied
         );
         assert_eq!(
-            std::fs::read_to_string(leaf.join("cpu.cfs_burst_us")).unwrap(),
+            std::fs::read_to_string(leaf.join("cpu.cfs_burst_us"))?,
             "50000"
         );
         assert_eq!(
-            apply_cpu_burst_from_metadata(metadata, &mountinfo, CpuBurstMode::Disabled).unwrap(),
+            apply_cpu_burst_from_metadata(metadata, &mountinfo, CpuBurstMode::Disabled)?,
             CpuBurstPolicyStatus::Applied
         );
-        assert_eq!(
-            std::fs::read_to_string(leaf.join("cpu.cfs_burst_us")).unwrap(),
-            "0"
-        );
+        assert_eq!(std::fs::read_to_string(leaf.join("cpu.cfs_burst_us"))?, "0");
+
+        Ok(())
     }
 
     #[test]
-    fn missing_kernel_burst_control_falls_back_without_creating_it() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn missing_kernel_burst_control_falls_back_without_creating_it() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let mount = temporary.path().join("cgroup");
         let leaf = mount.join("docker/test");
-        std::fs::create_dir_all(&leaf).unwrap();
-        std::fs::write(leaf.join("cpu.max"), "100000 100000\n").unwrap();
+        std::fs::create_dir_all(&leaf)?;
+        std::fs::write(leaf.join("cpu.max"), "100000 100000\n")?;
 
         assert_eq!(
             apply_cpu_burst_from_metadata(
                 "0::/docker/test\n",
                 &mountinfo_line(CgroupKind::Unified, &mount),
                 CpuBurstMode::FullQuota,
-            )
-            .unwrap(),
+            )?,
             CpuBurstPolicyStatus::Unsupported
         );
         assert!(!leaf.join("cpu.max.burst").exists());
+
+        Ok(())
     }
 
     #[test]
-    fn most_specific_cgroup_mount_root_is_used() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn most_specific_cgroup_mount_root_is_used() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let broad = temporary.path().join("broad");
         let scoped = temporary.path().join("scoped");
         let leaf = scoped.join("container");
-        std::fs::create_dir_all(&leaf).unwrap();
-        std::fs::write(leaf.join("cpu.max"), "75000 100000\n").unwrap();
-        std::fs::write(leaf.join("cpu.max.burst"), "0\n").unwrap();
+        std::fs::create_dir_all(&leaf)?;
+        std::fs::write(leaf.join("cpu.max"), "75000 100000\n")?;
+        std::fs::write(leaf.join("cpu.max.burst"), "0\n")?;
         let mountinfo = format!(
             "{}36 25 0:33 /tenant {} rw - cgroup2 cgroup rw\n",
             mountinfo_line(CgroupKind::Unified, &broad),
@@ -639,26 +640,29 @@ mod tests {
                 "0::/tenant/container\n",
                 &mountinfo,
                 CpuBurstMode::FullQuota,
-            )
-            .unwrap(),
+            )?,
             CpuBurstPolicyStatus::Applied
         );
         assert_eq!(
-            std::fs::read_to_string(leaf.join("cpu.max.burst")).unwrap(),
+            std::fs::read_to_string(leaf.join("cpu.max.burst"))?,
             "75000"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn traversal_in_kernel_metadata_is_rejected() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn traversal_in_kernel_metadata_is_rejected() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let error = apply_cpu_burst_from_metadata(
             "0::/docker/../victim\n",
             &mountinfo_line(CgroupKind::Unified, temporary.path()),
             CpuBurstMode::FullQuota,
         )
-        .unwrap_err();
+        .expect_err("path should return an error");
         assert!(matches!(error, CpuBurstError::InvalidMetadata(_)));
+
+        Ok(())
     }
 
     #[test]

@@ -60,7 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_bind_or_volume_sources_never_authorize_cleanup() {
+    fn missing_bind_or_volume_sources_never_authorize_cleanup() -> anyhow::Result<()> {
         for kind in [None, Some("bind"), Some("volume")] {
             assert!(
                 mount_source(MountPoint {
@@ -74,16 +74,14 @@ mod tests {
             mount_source(MountPoint {
                 typ: Some("tmpfs".into()),
                 ..Default::default()
-            })
-            .unwrap(),
+            })?,
             None
         );
         assert_eq!(
             mount_source(MountPoint {
                 source: Some("/host/mount".into()),
                 ..Default::default()
-            })
-            .unwrap(),
+            })?,
             Some(PathBuf::from("/host/mount"))
         );
         assert!(
@@ -93,5 +91,7 @@ mod tests {
             })
             .is_err()
         );
+
+        Ok(())
     }
 }

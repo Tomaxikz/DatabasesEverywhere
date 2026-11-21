@@ -160,18 +160,20 @@ mod tests {
     }
 
     #[test]
-    fn default_instances_are_captured() {
-        let inventory = parse_report(&report(&[])).unwrap();
+    fn default_instances_are_captured() -> anyhow::Result<()> {
+        let inventory = parse_report(&report(&[])).map_err(anyhow::Error::msg)?;
         assert_eq!(inventory.tool_version, "12.3.2-MariaDB");
-        inventory.decide(1 << 30).unwrap();
+        inventory.decide(1 << 30)?;
         assert!(matches!(
             inventory.decide(1024),
             Err(StrategyError::Failed(_))
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn unrestorable_or_freezing_layouts_are_unsupported() {
+    fn unrestorable_or_freezing_layouts_are_unsupported() -> anyhow::Result<()> {
         for overrides in [
             &[("non_innodb_tables", "1")][..],
             &[("innodb_undo_directory", "/undo")],
@@ -182,7 +184,7 @@ mod tests {
                 "mariadb-backup based on MariaDB server 12.2.1-MariaDB Linux (x86_64)",
             )],
         ] {
-            let inventory = parse_report(&report(overrides)).unwrap();
+            let inventory = parse_report(&report(overrides)).map_err(anyhow::Error::msg)?;
             assert!(
                 matches!(
                     inventory.decide(1 << 30),
@@ -191,6 +193,8 @@ mod tests {
                 "{overrides:?}"
             );
         }
+
+        Ok(())
     }
 
     #[test]

@@ -620,11 +620,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn listener_applies_configured_connection_capacity() {
+    async fn listener_applies_configured_connection_capacity() -> anyhow::Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut settings = crate::config::Config::default();
         settings.daemon.limits.gateway_connections_per_listener = 2;
-        let config = Arc::new(crate::config::RuntimeConfig::new(settings).unwrap());
+        let config = Arc::new(crate::config::RuntimeConfig::new(settings)?);
         let supervisor = crate::gateway::supervisor::GatewaySupervisor::with_config(config);
         supervisor.begin(1);
         supervisor.mark_ready();
@@ -634,8 +634,8 @@ mod tests {
             crate::gateway::protocols::qdrant::QdrantRouteKey::new(b"test"),
             supervisor.tenant_sessions(),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let task = tokio::spawn(run_listener(
             ListenerRuntime {
                 listener,
@@ -655,22 +655,18 @@ mod tests {
         ));
         let mut clients = Vec::new();
         for _ in 0..2 {
-            let mut client = TcpStream::connect(address).await.unwrap();
+            let mut client = TcpStream::connect(address).await?;
             assert_eq!(
-                timeout(Duration::from_secs(5), client.read_u8())
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                timeout(Duration::from_secs(5), client.read_u8()).await??,
                 b'x'
             );
             clients.push(client);
         }
-        let mut rejected = TcpStream::connect(address).await.unwrap();
+        let mut rejected = TcpStream::connect(address).await?;
         assert_eq!(
             timeout(Duration::from_secs(5), rejected.read_u8())
-                .await
-                .unwrap()
-                .unwrap_err()
+                .await?
+                .expect_err("read u8 should return an error")
                 .kind(),
             ErrorKind::UnexpectedEof
         );
@@ -681,21 +677,17 @@ mod tests {
             .await;
         assert_eq!(drained.remaining, 0);
         supervisor.shutdown();
-        timeout(Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        timeout(Duration::from_secs(5), task).await???;
+
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
-    async fn configured_handshake_budget_waits_times_out_and_releases() {
+    async fn configured_handshake_budget_waits_times_out_and_releases() -> anyhow::Result<()> {
         let mut settings = crate::config::Config::default();
         settings.daemon.limits.gateway_handshakes = 1;
-        let config = crate::config::RuntimeConfig::new(settings).unwrap();
-        let held = Arc::clone(&config.budgets.gateway_handshakes)
-            .try_acquire_owned()
-            .unwrap();
+        let config = crate::config::RuntimeConfig::new(settings)?;
+        let held = Arc::clone(&config.budgets.gateway_handshakes).try_acquire_owned()?;
         assert!(matches!(
             client_handshake(
                 "mysql",
@@ -716,6 +708,8 @@ mod tests {
             .is_ok()
         );
         assert_eq!(config.budgets.gateway_handshakes.available_permits(), 1);
+
+        Ok(())
     }
 
     #[test]

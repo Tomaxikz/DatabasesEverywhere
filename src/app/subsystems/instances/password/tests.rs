@@ -24,8 +24,8 @@ fn password_validation_rejects_empty_multiline_oversized_and_non_header_secrets(
 }
 
 #[test]
-fn resp_acl_path_follows_persisted_fuse_enforcement() {
-    let temporary = tempfile::tempdir().unwrap();
+fn resp_acl_path_follows_persisted_fuse_enforcement() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let raw_data = temporary.path().join("volumes").join("inst_resp");
     let fuse_root = temporary.path().join("fuse");
     let limiter = DiskLimiter::with_fuse_root(
@@ -37,14 +37,18 @@ fn resp_acl_path_follows_persisted_fuse_enforcement() {
     )
     .for_persisted_method("fuse_quota");
 
-    let credential_data_path = limiter.container_data_path(&raw_data).unwrap();
+    let credential_data_path = limiter.container_data_path(&raw_data)?;
 
     assert_ne!(credential_data_path, raw_data);
     assert!(credential_data_path.starts_with(fuse_root.join("instances")));
+
+    Ok(())
 }
 
 #[test]
-fn clickhouse_rotation_uses_recreated_startup_configuration() {
+fn clickhouse_rotation_uses_recreated_startup_configuration() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let current = PreviousCredential {
         environment: Some(SecretString::from("current-password")),
         ..PreviousCredential::default()
@@ -60,24 +64,25 @@ fn clickhouse_rotation_uses_recreated_startup_configuration() {
         &["CLICKHOUSE_PASSWORD"]
     );
     assert_eq!(
-        spec_password(Protocol::Clickhouse, &replacement, &current, false)
-            .unwrap()
-            .unwrap()
+        spec_password(Protocol::Clickhouse, &replacement, &current, false)?
+            .context("spec password should provide a value")?
             .expose_secret(),
         "replacement-password"
     );
     assert_eq!(
-        spec_password(Protocol::Clickhouse, &replacement, &current, true)
-            .unwrap()
-            .unwrap()
+        spec_password(Protocol::Clickhouse, &replacement, &current, true)?
+            .context("spec password should provide a value")?
             .expose_secret(),
         "current-password"
     );
+
+    Ok(())
 }
 
 #[test]
-fn mysql_rotation_bypasses_binlogging_without_reprovisioning_the_tenant() {
-    let script = crate::databases::mysql::credentials::rotation_script("app_user").unwrap();
+fn mysql_rotation_bypasses_binlogging_without_reprovisioning_the_tenant() -> anyhow::Result<()> {
+    let script = crate::databases::mysql::credentials::rotation_script("app_user")
+        .map_err(anyhow::Error::msg)?;
 
     assert!(script.contains("SET SESSION sql_log_bin = 0;"));
     assert!(script.contains("DBE_ROTATED_PASSWORD_B64"));
@@ -88,20 +93,24 @@ fn mysql_rotation_bypasses_binlogging_without_reprovisioning_the_tenant() {
     assert!(!script.contains("CREATE USER"));
     assert!(!script.contains("GRANT ALL PRIVILEGES"));
     assert!(!script.contains("$MYSQL_ROOT_PASSWORD"));
+
+    Ok(())
 }
 
 #[test]
-fn mysql_rollback_restores_the_captured_authentication_string() {
+fn mysql_rollback_restores_the_captured_authentication_string() -> anyhow::Result<()> {
     let script = crate::databases::mysql::credentials::auth_restore_script(
         "app_user",
         "caching_sha2_password",
     )
-    .unwrap();
+    .map_err(anyhow::Error::msg)?;
 
     assert!(script.contains("DBE_PREVIOUS_MYSQL_AUTH_B64"));
     assert!(script.contains("DBE_ROTATION_ADMIN_PASSWORD"));
     assert!(script.contains("IDENTIFIED WITH `caching_sha2_password` AS"));
     assert!(!script.contains("DBE_ROTATED_PASSWORD_B64"));
+
+    Ok(())
 }
 
 #[test]
@@ -302,7 +311,7 @@ fn uncertain_rotation_is_quarantined_and_stopped_for_boot() {
 }
 
 #[tokio::test]
-async fn panic_recovery_keeps_the_instance_lock_until_recovery_finishes() {
+async fn panic_recovery_keeps_the_instance_lock_until_recovery_finishes() -> anyhow::Result<()> {
     let locks = crate::server::locks::InstanceLocks::default();
     let (recovery_started_tx, recovery_started_rx) = tokio::sync::oneshot::channel();
     let (release_recovery_tx, release_recovery_rx) = tokio::sync::oneshot::channel();
@@ -314,8 +323,8 @@ async fn panic_recovery_keeps_the_instance_lock_until_recovery_finishes() {
                 "inst_password_panic",
                 async { panic!("injected password worker panic") },
                 move |_| async move {
-                    recovery_started_tx.send(()).unwrap();
-                    release_recovery_rx.await.unwrap();
+                    recovery_started_tx.send(()).expect("send should succeed");
+                    release_recovery_rx.await.expect("panic recovery keeps the instance lock until recovery finishes should succeed");
                     7_u8
                 },
             )
@@ -323,7 +332,7 @@ async fn panic_recovery_keeps_the_instance_lock_until_recovery_finishes() {
         }
     });
 
-    recovery_started_rx.await.unwrap();
+    recovery_started_rx.await?;
     let contender = tokio::spawn({
         let locks = locks.clone();
         async move { locks.lock("inst_password_panic").await }
@@ -331,12 +340,13 @@ async fn panic_recovery_keeps_the_instance_lock_until_recovery_finishes() {
     tokio::task::yield_now().await;
     assert!(!contender.is_finished());
 
-    release_recovery_tx.send(()).unwrap();
-    assert_eq!(supervisor.await.unwrap(), 7);
-    tokio::time::timeout(Duration::from_secs(1), contender)
-        .await
-        .unwrap()
-        .unwrap();
+    release_recovery_tx
+        .send(())
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    assert_eq!(supervisor.await?, 7);
+    tokio::time::timeout(Duration::from_secs(1), contender).await??;
+
+    Ok(())
 }
 
 #[test]
@@ -392,17 +402,18 @@ fn test_metadata(protocol: Protocol) -> InstanceMetadata {
 }
 
 #[tokio::test]
-async fn resp_password_rotation_and_rollback_use_rootless_podman_host_owner() {
+async fn resp_password_rotation_and_rollback_use_rootless_podman_host_owner() -> anyhow::Result<()>
+{
     use std::os::unix::fs::MetadataExt;
 
-    let temp = tempfile::tempdir().unwrap();
-    let host_meta = std::fs::metadata(temp.path()).unwrap();
+    let temp = tempfile::tempdir()?;
+    let host_meta = std::fs::metadata(temp.path())?;
     let mut config = crate::config::Config::default();
     config.paths.data = temp.path().join("data").display().to_string();
     config.paths.run = temp.path().join("run").display().to_string();
     config.paths.logs = temp.path().join("logs").display().to_string();
-    let paths = InstancePaths::new(&config.paths, "inst_resp_owner").unwrap();
-    paths.create_dirs().await.unwrap();
+    let paths = InstancePaths::new(&config.paths, "inst_resp_owner")?;
+    paths.create_dirs().await?;
 
     let (base_state, _db_dir) = crate::subsystems::test_support::database(config).await;
     let target_uid = host_meta.uid().saturating_add(100);
@@ -431,13 +442,13 @@ async fn resp_password_rotation_and_rollback_use_rootless_podman_host_owner() {
     )
     .await;
     if host_meta.uid() == 0 {
-        rotation.unwrap();
-        let acl_meta = std::fs::metadata(paths.data.join("users.acl")).unwrap();
+        rotation?;
+        let acl_meta = std::fs::metadata(paths.data.join("users.acl"))?;
         assert_eq!((acl_meta.uid(), acl_meta.gid()), (target_uid, target_uid));
     } else {
         // An unprivileged test caller cannot chown to target_uid, proving rotation attempted to
         // apply the rootless Podman host owner rather than keeping the directory's current owner.
-        let error = rotation.unwrap_err().to_string();
+        let error = rotation.expect_err("resp password rotation and rollback use rootless podman host owner should return an error").to_string();
         assert!(
             error.contains("failed to set container owner"),
             "unexpected rotation error: {error}"
@@ -453,14 +464,16 @@ async fn resp_password_rotation_and_rollback_use_rootless_podman_host_owner() {
     )
     .await;
     if host_meta.uid() == 0 {
-        rollback.unwrap();
-        let acl_meta = std::fs::metadata(paths.data.join("users.acl")).unwrap();
+        rollback?;
+        let acl_meta = std::fs::metadata(paths.data.join("users.acl"))?;
         assert_eq!((acl_meta.uid(), acl_meta.gid()), (target_uid, target_uid));
     } else {
-        let error = rollback.unwrap_err().to_string();
+        let error = rollback.expect_err("resp password rotation and rollback use rootless podman host owner should return an error").to_string();
         assert!(
             error.contains("failed to set container owner"),
             "unexpected rollback error: {error}"
         );
     }
+
+    Ok(())
 }

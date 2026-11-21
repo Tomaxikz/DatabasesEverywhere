@@ -244,15 +244,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recursive_owner_walk_never_follows_symlinks() {
-        let temp = tempfile::tempdir().unwrap();
+    fn recursive_owner_walk_never_follows_symlinks() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let managed = temp.path().join("managed");
         let outside = temp.path().join("outside");
-        std::fs::create_dir(&managed).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("must-not-be-traversed"), b"outside").unwrap();
-        symlink(&outside, managed.join("outside-link")).unwrap();
-        let metadata = std::fs::metadata(&managed).unwrap();
+        std::fs::create_dir(&managed)?;
+        std::fs::create_dir(&outside)?;
+        std::fs::write(outside.join("must-not-be-traversed"), b"outside")?;
+        symlink(&outside, managed.join("outside-link"))?;
+        let metadata = std::fs::metadata(&managed)?;
 
         chown_recursive(
             &managed,
@@ -260,35 +260,41 @@ mod tests {
                 uid: metadata.uid(),
                 gid: metadata.gid(),
             },
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(
-            std::fs::read(outside.join("must-not-be-traversed")).unwrap(),
+            std::fs::read(outside.join("must-not-be-traversed"))?,
             b"outside"
         );
         assert!(
-            std::fs::symlink_metadata(managed.join("outside-link"))
-                .unwrap()
+            std::fs::symlink_metadata(managed.join("outside-link"))?
                 .file_type()
                 .is_symlink()
         );
+
+        Ok(())
     }
 
     #[test]
-    fn traversal_below_a_root_stops_at_the_mounted_directory() {
-        let temp = tempfile::tempdir().unwrap();
+    fn traversal_below_a_root_stops_at_the_mounted_directory() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("backups");
         let capture = root.join(".staging/inst_one/.job.capture");
-        std::fs::create_dir_all(&capture).unwrap();
+        std::fs::create_dir_all(&capture)?;
         for directory in [&root, &root.join(".staging/inst_one"), &capture] {
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
         }
-        let metadata = std::fs::metadata(&root).unwrap();
+        let metadata = std::fs::metadata(&root)?;
 
-        allow_traversal_below(&root, &capture, metadata.uid(), metadata.gid()).unwrap();
+        allow_traversal_below(&root, &capture, metadata.uid(), metadata.gid())?;
 
-        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("metadata should succeed")
+                .permissions()
+                .mode()
+                & 0o777
+        };
         for ancestor in [
             root.clone(),
             root.join(".staging"),
@@ -298,46 +304,51 @@ mod tests {
         }
         assert_eq!(mode(&capture), 0o700);
         assert!(allow_traversal_below(&capture, &root, metadata.uid(), metadata.gid()).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn private_hardening_keeps_only_the_execute_only_traversal_grant() {
-        let temp = tempfile::tempdir().unwrap();
+    fn private_hardening_keeps_only_the_execute_only_traversal_grant() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         for (initial, expected) in [(0o710, 0o710), (0o755, 0o700), (0o750, 0o700)] {
-            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(initial))
-                .unwrap();
-            secure_private_dir_keeping_traversal(temp.path()).unwrap();
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(initial))?;
+            secure_private_dir_keeping_traversal(temp.path())?;
             assert_eq!(
-                std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(temp.path())?.permissions().mode() & 0o777,
                 expected,
                 "{initial:o}"
             );
         }
         let link = temp.path().join("link");
-        symlink(temp.path(), &link).unwrap();
+        symlink(temp.path(), &link)?;
         assert_eq!(
             secure_private_dir_keeping_traversal(&link)
-                .unwrap_err()
+                .expect_err("secure private dir keeping traversal should return an error")
                 .kind(),
             std::io::ErrorKind::InvalidInput
         );
+
+        Ok(())
     }
 
     #[test]
-    fn traversal_check_names_the_blocking_ancestor() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    fn traversal_check_names_the_blocking_ancestor() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))?;
         let managed = temp.path().join("managed");
-        std::fs::create_dir(&managed).unwrap();
-        let metadata = std::fs::metadata(temp.path()).unwrap();
+        std::fs::create_dir(&managed)?;
+        let metadata = std::fs::metadata(temp.path())?;
 
-        ensure_traversable(&managed, metadata.uid(), metadata.gid()).unwrap();
+        ensure_traversable(&managed, metadata.uid(), metadata.gid())?;
         let error = ensure_traversable(
             &managed,
             metadata.uid().saturating_add(1),
             metadata.gid().saturating_add(1),
         )
-        .unwrap_err();
+        .expect_err("saturating add should return an error");
         assert!(error.to_string().contains("cannot traverse"));
+
+        Ok(())
     }
 }

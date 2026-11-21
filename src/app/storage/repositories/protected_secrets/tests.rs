@@ -9,24 +9,31 @@ use crate::{
 };
 
 #[tokio::test]
-async fn daemon_load_quarantines_only_the_ambiguous_instance_and_preserves_raw_data() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn daemon_load_quarantines_only_the_ambiguous_instance_and_preserves_raw_data()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let plain = InstanceRepository::new(pool.clone());
     let ambiguous = "dbev1:user-selected-password'; --";
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some(ambiguous.to_string());
-    plain.upsert(&affected).await.unwrap();
+    plain.upsert(&affected).await?;
 
-    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path())?;
     let mut healthy = metadata("inst_healthy", "healthy_user");
     healthy.tenant_password = Some("healthy-password".to_string());
-    encrypted.upsert(&healthy).await.unwrap();
+    encrypted.upsert(&healthy).await?;
     let manager = InstanceManager::new(InstanceStore::default(), encrypted.clone());
 
-    manager.load_from_storage().await.unwrap();
+    manager.load_from_storage().await?;
 
-    let affected = manager.store().get("inst_affected").await.unwrap();
+    let affected = manager
+        .store()
+        .get("inst_affected")
+        .await
+        .context("missing inst_affected entry")?;
     assert_eq!(affected.status, InstanceStatus::Quarantined);
     assert_eq!(affected.desired_state, DesiredInstanceState::Stopped);
     assert!(affected.tenant_password.is_none());
@@ -35,7 +42,7 @@ async fn daemon_load_quarantines_only_the_ambiguous_instance_and_preserves_raw_d
             .store()
             .get("inst_healthy")
             .await
-            .unwrap()
+            .context("get should provide a value")?
             .tenant_password
             .as_deref(),
         Some("healthy-password")
@@ -43,21 +50,29 @@ async fn daemon_load_quarantines_only_the_ambiguous_instance_and_preserves_raw_d
     assert_eq!(raw_tenant_password(&pool, "inst_affected").await, ambiguous);
     assert!(recovery_required(&pool, "inst_affected").await);
 
-    manager.upsert(affected).await.unwrap();
+    manager.upsert(affected).await?;
     assert_eq!(raw_tenant_password(&pool, "inst_affected").await, ambiguous);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn live_verified_replacement_atomically_clears_the_recovery_marker() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn live_verified_replacement_atomically_clears_the_recovery_marker() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let plain = InstanceRepository::new(pool.clone());
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some("dbev1:ambiguous".to_string());
-    plain.upsert(&affected).await.unwrap();
-    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
-    let loaded = encrypted.load_for_daemon().await.unwrap();
-    let mut recovered = loaded.metadata.into_iter().next().unwrap();
+    plain.upsert(&affected).await?;
+    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path())?;
+    let loaded = encrypted.load_for_daemon().await?;
+    let mut recovered = loaded
+        .metadata
+        .into_iter()
+        .next()
+        .context("expected a value from next")?;
     recovered.status = InstanceStatus::Running;
     recovered.desired_state = DesiredInstanceState::Running;
     recovered.tenant_password = Some("verified-replacement".to_string());
@@ -65,7 +80,7 @@ async fn live_verified_replacement_atomically_clears_the_recovery_marker() {
     let error = encrypted
         .upsert_recovered_secrets(&recovered)
         .await
-        .unwrap_err();
+        .expect_err("upsert recovered secrets should return an error");
     assert!(matches!(
         error,
         RepositoryError::IncompleteProtectedSecretRecovery { .. }
@@ -77,34 +92,39 @@ async fn live_verified_replacement_atomically_clears_the_recovery_marker() {
     );
 
     recovered.postgres_admin_password = Some("verified-admin".to_string());
-    encrypted
-        .upsert_recovered_secrets(&recovered)
-        .await
-        .unwrap();
+    encrypted.upsert_recovered_secrets(&recovered).await?;
 
     assert!(!recovery_required(&pool, "inst_affected").await);
     assert!(is_encrypted(
         &raw_tenant_password(&pool, "inst_affected").await
     ));
-    let loaded = encrypted.get("inst_affected").await.unwrap().unwrap();
+    let loaded = encrypted
+        .get("inst_affected")
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(
         loaded.tenant_password.as_deref(),
         Some("verified-replacement")
     );
     assert_eq!(loaded.status, InstanceStatus::Running);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn exact_offline_repair_encrypts_the_legacy_plaintext_and_leaves_instance_stopped() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn exact_offline_repair_encrypts_the_legacy_plaintext_and_leaves_instance_stopped()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let plain = InstanceRepository::new(pool.clone());
     let ambiguous = "dbev1:user-selected-password";
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some(ambiguous.to_string());
-    plain.upsert(&affected).await.unwrap();
-    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
-    encrypted.load_for_daemon().await.unwrap();
+    plain.upsert(&affected).await?;
+    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path())?;
+    encrypted.load_for_daemon().await?;
 
     let repair = encrypted
         .repair_ambiguous_secret(
@@ -112,44 +132,47 @@ async fn exact_offline_repair_encrypts_the_legacy_plaintext_and_leaves_instance_
             ProtectedSecretField::TenantPassword,
             &SecretString::from(ambiguous),
         )
-        .await
-        .unwrap();
+        .await?;
 
     assert!(repair.remaining_fields.is_empty());
     let raw = raw_tenant_password(&pool, "inst_affected").await;
     assert!(is_encrypted(&raw));
     assert_ne!(raw, ambiguous);
     assert!(!recovery_required(&pool, "inst_affected").await);
-    let loaded = encrypted.get("inst_affected").await.unwrap().unwrap();
+    let loaded = encrypted
+        .get("inst_affected")
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(loaded.tenant_password.as_deref(), Some(ambiguous));
     assert_eq!(loaded.status, InstanceStatus::Stopped);
     assert_eq!(loaded.desired_state, DesiredInstanceState::Stopped);
     assert!(
         encrypted
             .load_for_daemon()
-            .await
-            .unwrap()
+            .await?
             .protected_secret_incidents
             .is_empty()
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn repair_mismatch_is_atomic_and_does_not_reinterpret_corruption() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
-    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+async fn repair_mismatch_is_atomic_and_does_not_reinterpret_corruption() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
+    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path())?;
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some("actual-password".to_string());
-    encrypted.upsert(&affected).await.unwrap();
+    encrypted.upsert(&affected).await?;
     let mut raw = raw_tenant_password(&pool, "inst_affected")
         .await
         .into_bytes();
     let last = raw.len() - 1;
     raw[last] = if raw[last] == b'A' { b'B' } else { b'A' };
-    let corrupted = String::from_utf8(raw).unwrap();
+    let corrupted = String::from_utf8(raw)?;
     set_raw_tenant_password(&pool, "inst_affected", &corrupted).await;
-    encrypted.load_for_daemon().await.unwrap();
+    encrypted.load_for_daemon().await?;
 
     let error = encrypted
         .repair_ambiguous_secret(
@@ -158,7 +181,7 @@ async fn repair_mismatch_is_atomic_and_does_not_reinterpret_corruption() {
             &SecretString::from("actual-password"),
         )
         .await
-        .unwrap_err();
+        .expect_err("repair ambiguous secret should return an error");
 
     assert!(matches!(
         error,
@@ -171,25 +194,29 @@ async fn repair_mismatch_is_atomic_and_does_not_reinterpret_corruption() {
     )
     .bind("inst_affected")
     .fetch_one(&pool)
-    .await
-    .unwrap();
+    .await?;
     assert_eq!(
         (status.as_str(), desired.as_str()),
         ("quarantined", "stopped")
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn multiple_ambiguous_fields_remain_quarantined_until_each_is_repaired() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn multiple_ambiguous_fields_remain_quarantined_until_each_is_repaired() -> anyhow::Result<()>
+{
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let plain = InstanceRepository::new(pool.clone());
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some("dbev1:tenant".to_string());
     affected.postgres_admin_password = Some("dbev1:admin".to_string());
-    plain.upsert(&affected).await.unwrap();
-    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
-    let loaded = encrypted.load_for_daemon().await.unwrap();
+    plain.upsert(&affected).await?;
+    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path())?;
+    let loaded = encrypted.load_for_daemon().await?;
     assert_eq!(
         loaded.protected_secret_incidents[0].fields,
         vec![
@@ -204,8 +231,7 @@ async fn multiple_ambiguous_fields_remain_quarantined_until_each_is_repaired() {
             ProtectedSecretField::TenantPassword,
             &SecretString::from("dbev1:tenant"),
         )
-        .await
-        .unwrap();
+        .await?;
     assert_eq!(
         first.remaining_fields,
         vec![ProtectedSecretField::PostgresAdminPassword]
@@ -218,58 +244,62 @@ async fn multiple_ambiguous_fields_remain_quarantined_until_each_is_repaired() {
             ProtectedSecretField::PostgresAdminPassword,
             &SecretString::from("dbev1:admin"),
         )
-        .await
-        .unwrap();
+        .await?;
     assert!(second.remaining_fields.is_empty());
-    let loaded = encrypted.get("inst_affected").await.unwrap().unwrap();
+    let loaded = encrypted
+        .get("inst_affected")
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(loaded.status, InstanceStatus::Stopped);
     assert_eq!(loaded.tenant_password.as_deref(), Some("dbev1:tenant"));
     assert_eq!(
         loaded.postgres_admin_password.as_deref(),
         Some("dbev1:admin")
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn malformed_public_metadata_still_fails_the_daemon_load() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
-    let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+async fn malformed_public_metadata_still_fails_the_daemon_load() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
+    let repository = InstanceRepository::encrypted(pool.clone(), dir.path())?;
     repository
         .upsert(&metadata("inst_affected", "affected_user"))
-        .await
-        .unwrap();
+        .await?;
     sqlx::query("UPDATE instance_metadata SET metadata_json = '{' WHERE instance_id = ?1")
         .bind("inst_affected")
         .execute(&pool)
-        .await
-        .unwrap();
+        .await?;
 
     assert!(matches!(
         repository.load_for_daemon().await,
         Err(RepositoryError::Json(_))
     ));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn restored_key_clears_recovery_quarantine_but_never_auto_starts() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
-    let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+async fn restored_key_clears_recovery_quarantine_but_never_auto_starts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
+    let repository = InstanceRepository::encrypted(pool.clone(), dir.path())?;
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some("valid-password".to_string());
-    repository.upsert(&affected).await.unwrap();
+    repository.upsert(&affected).await?;
     let key_path = dir.path().join("metadata.key");
-    let original_key = std::fs::read_to_string(&key_path).unwrap();
-    std::fs::write(&key_path, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8").unwrap();
-    let wrong_key_repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
-    let quarantined = wrong_key_repository.load_for_daemon().await.unwrap();
+    let original_key = std::fs::read_to_string(&key_path)?;
+    std::fs::write(&key_path, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")?;
+    let wrong_key_repository = InstanceRepository::encrypted(pool.clone(), dir.path())?;
+    let quarantined = wrong_key_repository.load_for_daemon().await?;
     assert_eq!(quarantined.protected_secret_incidents.len(), 1);
     assert_eq!(quarantined.metadata[0].status, InstanceStatus::Quarantined);
-    std::fs::write(&key_path, original_key).unwrap();
-    let restored_repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+    std::fs::write(&key_path, original_key)?;
+    let restored_repository = InstanceRepository::encrypted(pool.clone(), dir.path())?;
 
-    let loaded = restored_repository.load_for_daemon().await.unwrap();
+    let loaded = restored_repository.load_for_daemon().await?;
 
     assert!(loaded.protected_secret_incidents.is_empty());
     assert_eq!(loaded.metadata[0].status, InstanceStatus::Stopped);
@@ -278,16 +308,18 @@ async fn restored_key_clears_recovery_quarantine_but_never_auto_starts() {
         DesiredInstanceState::Stopped
     );
     assert!(!recovery_required(&pool, "inst_affected").await);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn repair_rejects_already_valid_ciphertext_without_changing_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
-    let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+async fn repair_rejects_already_valid_ciphertext_without_changing_state() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
+    let repository = InstanceRepository::encrypted(pool.clone(), dir.path())?;
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some("valid-password".to_string());
-    repository.upsert(&affected).await.unwrap();
+    repository.upsert(&affected).await?;
     let before = raw_tenant_password(&pool, "inst_affected").await;
 
     let error = repository
@@ -297,13 +329,15 @@ async fn repair_rejects_already_valid_ciphertext_without_changing_state() {
             &SecretString::from("valid-password"),
         )
         .await
-        .unwrap_err();
+        .expect_err("repair ambiguous secret should return an error");
 
     assert!(matches!(
         error,
         RepositoryError::ProtectedSecretAlreadyValid { .. }
     ));
     assert_eq!(raw_tenant_password(&pool, "inst_affected").await, before);
+
+    Ok(())
 }
 
 #[test]
@@ -329,7 +363,7 @@ async fn raw_tenant_password(pool: &sqlx::SqlitePool, instance_id: &str) -> Stri
         .bind(instance_id)
         .fetch_one(pool)
         .await
-        .unwrap()
+        .expect("fetch one should succeed")
 }
 
 async fn set_raw_tenant_password(pool: &sqlx::SqlitePool, instance_id: &str, value: &str) {
@@ -338,7 +372,7 @@ async fn set_raw_tenant_password(pool: &sqlx::SqlitePool, instance_id: &str, val
         .bind(instance_id)
         .execute(pool)
         .await
-        .unwrap();
+        .expect("execute should succeed");
 }
 
 async fn recovery_required(pool: &sqlx::SqlitePool, instance_id: &str) -> bool {
@@ -348,7 +382,7 @@ async fn recovery_required(pool: &sqlx::SqlitePool, instance_id: &str) -> bool {
     .bind(instance_id)
     .fetch_one(pool)
     .await
-    .unwrap()
+    .expect("fetch one should succeed")
 }
 
 fn metadata(instance_id: &str, username: &str) -> InstanceMetadata {

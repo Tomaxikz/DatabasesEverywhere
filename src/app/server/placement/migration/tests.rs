@@ -37,18 +37,19 @@ fn metadata_in_mode(instance_id: &str, mode: DeploymentMode) -> InstanceMetadata
 }
 
 async fn repository() -> (DeploymentMigrationRepository, tempfile::TempDir) {
-    let directory = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(directory.path()).await.unwrap();
+    let directory = tempfile::tempdir().expect("tempdir should succeed");
+    let pool = sqlite::connect(directory.path())
+        .await
+        .expect("path should succeed");
     (DeploymentMigrationRepository::new(pool), directory)
 }
 
 #[tokio::test]
-async fn active_workflow_is_unique_and_terminal_history_allows_retry() {
+async fn active_workflow_is_unique_and_terminal_history_allows_retry() -> anyhow::Result<()> {
     let (repository, _directory) = repository().await;
     let first = repository
         .start(&metadata("inst-a"), DeploymentMode::Shared, None, None)
-        .await
-        .unwrap();
+        .await?;
     assert!(matches!(
         repository
             .start(&metadata("inst-a"), DeploymentMode::Shared, None, None)
@@ -65,21 +66,20 @@ async fn active_workflow_is_unique_and_terminal_history_allows_retry() {
                 ..MigrationPatch::default()
             },
         )
-        .await
-        .unwrap();
+        .await?;
     repository
         .start(&metadata("inst-a"), DeploymentMode::Shared, None, None)
-        .await
-        .unwrap();
+        .await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn transition_compare_and_swap_rejects_stale_and_invalid_writers() {
+async fn transition_compare_and_swap_rejects_stale_and_invalid_writers() -> anyhow::Result<()> {
     let (repository, _directory) = repository().await;
     let migration = repository
         .start(&metadata("inst-a"), DeploymentMode::Shared, None, None)
-        .await
-        .unwrap();
+        .await?;
     let preflight = repository
         .transition(
             &migration.migration_id,
@@ -87,8 +87,7 @@ async fn transition_compare_and_swap_rejects_stale_and_invalid_writers() {
             MigrationStage::Preflight,
             MigrationPatch::default(),
         )
-        .await
-        .unwrap();
+        .await?;
     assert!(matches!(
         repository
             .transition(
@@ -111,10 +110,14 @@ async fn transition_compare_and_swap_rejects_stale_and_invalid_writers() {
             .await,
         Err(DeploymentMigrationError::InvalidTransition { .. })
     ));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn boot_recovery_classifies_every_crash_stage_in_both_directions() {
+async fn boot_recovery_classifies_every_crash_stage_in_both_directions() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (repository, _directory) = repository().await;
     let cases = [
         (MigrationStage::Requested, MigrationStage::Failed),
@@ -151,10 +154,7 @@ async fn boot_recovery_classifies_every_crash_stage_in_both_directions() {
         for (index, (crash_stage, recovery_stage)) in cases.iter().copied().enumerate() {
             let mode = source_mode.as_str();
             let source = metadata_in_mode(&format!("{mode}-{index}"), source_mode);
-            let mut migration = repository
-                .start(&source, target_mode, None, None)
-                .await
-                .unwrap();
+            let mut migration = repository.start(&source, target_mode, None, None).await?;
             if crash_stage != MigrationStage::Requested {
                 migration = advance_to(&repository, migration, crash_stage).await;
             }
@@ -162,35 +162,42 @@ async fn boot_recovery_classifies_every_crash_stage_in_both_directions() {
         }
     }
 
-    let summary = repository.recover_unfinished().await.unwrap();
+    let summary = repository.recover_unfinished().await?;
     assert_eq!(summary.failed_before_mutation, 4);
     assert_eq!(summary.rollback_pending, 20);
     assert_eq!(summary.cleanup_pending, 6);
     for (migration_id, stage) in expected {
-        let recovered = repository.get(&migration_id).await.unwrap().unwrap();
+        let recovered = repository
+            .get(&migration_id)
+            .await?
+            .context("get should provide a value")?;
         assert_eq!(recovered.stage, stage, "migration {migration_id}");
         assert_eq!(
             recovered.cutover_committed,
             stage == MigrationStage::CleanupPending
         );
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn dedicated_to_shared_cutover_is_one_atomic_metadata_and_reservation_commit() {
+async fn dedicated_to_shared_cutover_is_one_atomic_metadata_and_reservation_commit()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (repository, _directory) = repository().await;
     let instances = InstanceRepository::new(repository.pool.clone());
     let placements = PlacementRepository::new(repository.pool.clone());
     let source = metadata("inst-a");
-    instances.upsert(&source).await.unwrap();
+    instances.upsert(&source).await?;
     placements
         .save(&EngineRuntime::legacy_dedicated(
             &source,
             EngineRuntimeStatus::Running,
             "postgres:18".to_string(),
         ))
-        .await
-        .unwrap();
+        .await?;
     let shared_runtime = EngineRuntime {
         pending_image: None,
         desired_state: crate::server::metadata::DesiredInstanceState::Running,
@@ -222,25 +229,26 @@ async fn dedicated_to_shared_cutover_is_one_atomic_metadata_and_reservation_comm
         created_at: source.created_at.clone(),
         updated_at: source.updated_at.clone(),
     };
-    placements.save(&shared_runtime).await.unwrap();
+    placements.save(&shared_runtime).await?;
     placements
         .reserve(ReserveTenant {
-            owner: shared_runtime.owner.clone().unwrap(),
+            owner: shared_runtime
+                .owner
+                .clone()
+                .context("expected a value from clone")?,
             instance_id: "migration-temp",
             runtime_id: &shared_runtime.runtime_id,
             database: &source.database.name,
             username: &source.database.username,
             limits: &source.limits,
         })
-        .await
-        .unwrap();
-    placements.mark_provisioned("migration-temp").await.unwrap();
+        .await?;
+    placements.mark_provisioned("migration-temp").await?;
     let pending = advance_to(
         &repository,
         repository
             .start(&source, DeploymentMode::Shared, None, None)
-            .await
-            .unwrap(),
+            .await?,
         MigrationStage::CutoverPending,
     )
     .await;
@@ -253,10 +261,7 @@ async fn dedicated_to_shared_cutover_is_one_atomic_metadata_and_reservation_comm
     target.limits.disk_enforced = true;
     target.limits.disk_enforcement_method = "host_linux_project_quota".to_string();
     assert_eq!(
-        placements
-            .root_charged_disk_mib("runtime-target")
-            .await
-            .unwrap(),
+        placements.root_charged_disk_mib("runtime-target").await?,
         12_800
     );
 
@@ -267,31 +272,35 @@ async fn dedicated_to_shared_cutover_is_one_atomic_metadata_and_reservation_comm
             "migration-temp",
             &target,
         )
-        .await
-        .unwrap();
+        .await?;
 
     assert_eq!(committed.stage, MigrationStage::CutoverCommitted);
     assert!(committed.cutover_committed);
-    let stored = instances.get("inst-a").await.unwrap().unwrap();
+    let stored = instances
+        .get("inst-a")
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(stored.deployment_mode, DeploymentMode::Shared);
     assert_eq!(stored.runtime_id(), "runtime-target");
     assert!(stored.postgres_admin_password.is_none());
     assert_eq!(
-        placements.tenants("runtime-target").await.unwrap(),
+        placements.tenants("runtime-target").await?,
         vec!["inst-a".to_string()]
     );
     assert_eq!(
-        placements
-            .root_charged_disk_mib("runtime-target")
-            .await
-            .unwrap(),
+        placements.root_charged_disk_mib("runtime-target").await?,
         2_560
     );
-    assert!(placements.get("inst-a").await.unwrap().is_some());
+    assert!(placements.get("inst-a").await?.is_some());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn shared_to_dedicated_cutover_is_one_atomic_metadata_and_reservation_commit() {
+async fn shared_to_dedicated_cutover_is_one_atomic_metadata_and_reservation_commit()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (repository, _directory) = repository().await;
     let instances = InstanceRepository::new(repository.pool.clone());
     let placements = PlacementRepository::new(repository.pool.clone());
@@ -328,28 +337,24 @@ async fn shared_to_dedicated_cutover_is_one_atomic_metadata_and_reservation_comm
         created_at: source.created_at.clone(),
         updated_at: source.updated_at.clone(),
     };
-    placements.save(&source_runtime).await.unwrap();
+    placements.save(&source_runtime).await?;
     placements
         .reserve(ReserveTenant {
-            owner: source_runtime.owner.clone().unwrap(),
+            owner: source_runtime
+                .owner
+                .clone()
+                .context("expected a value from clone")?,
             instance_id: &source.instance_id,
             runtime_id: &source_runtime.runtime_id,
             database: &source.database.name,
             username: &source.database.username,
             limits: &source.limits,
         })
-        .await
-        .unwrap();
-    placements
-        .mark_provisioned(&source.instance_id)
-        .await
-        .unwrap();
-    instances.upsert(&source).await.unwrap();
+        .await?;
+    placements.mark_provisioned(&source.instance_id).await?;
+    instances.upsert(&source).await?;
     assert_eq!(
-        placements
-            .root_charged_disk_mib("pool-source")
-            .await
-            .unwrap(),
+        placements.root_charged_disk_mib("pool-source").await?,
         2_560
     );
 
@@ -361,24 +366,19 @@ async fn shared_to_dedicated_cutover_is_one_atomic_metadata_and_reservation_comm
     };
     target.runtime.container_name = "dedicated-postgres".to_string();
     target.postgres_admin_password = Some("target-admin".to_string());
-    instances
-        .stage_dedicated_admin_secrets(&target)
-        .await
-        .unwrap();
+    instances.stage_dedicated_admin_secrets(&target).await?;
     placements
         .save(&EngineRuntime::legacy_dedicated(
             &target,
             EngineRuntimeStatus::Running,
             "postgres:18".to_string(),
         ))
-        .await
-        .unwrap();
+        .await?;
     let pending = advance_to(
         &repository,
         repository
             .start(&source, DeploymentMode::Dedicated, None, None)
-            .await
-            .unwrap(),
+            .await?,
         MigrationStage::CutoverPending,
     )
     .await;
@@ -391,12 +391,14 @@ async fn shared_to_dedicated_cutover_is_one_atomic_metadata_and_reservation_comm
             &source_reservation_id,
             &target,
         )
-        .await
-        .unwrap();
+        .await?;
 
     assert_eq!(committed.stage, MigrationStage::CutoverCommitted);
     assert!(committed.cutover_committed);
-    let stored = instances.get("inst-b").await.unwrap().unwrap();
+    let stored = instances
+        .get("inst-b")
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(stored.deployment_mode, DeploymentMode::Dedicated);
     assert_eq!(stored.runtime_id(), "inst-b");
     assert_eq!(
@@ -405,27 +407,23 @@ async fn shared_to_dedicated_cutover_is_one_atomic_metadata_and_reservation_comm
     );
     assert_eq!(stored.tenant_password, source.tenant_password);
     assert_eq!(
-        placements.tenants("pool-source").await.unwrap(),
+        placements.tenants("pool-source").await?,
         vec![source_reservation_id.clone()]
     );
-    assert_eq!(placements.tenant_count("pool-source").await.unwrap(), 1);
+    assert_eq!(placements.tenant_count("pool-source").await?, 1);
     assert_eq!(
-        placements
-            .root_charged_disk_mib("pool-source")
-            .await
-            .unwrap(),
+        placements.root_charged_disk_mib("pool-source").await?,
         12_800
     );
-    placements.release(&source_reservation_id).await.unwrap();
-    assert_eq!(placements.tenant_count("pool-source").await.unwrap(), 0);
+    placements.release(&source_reservation_id).await?;
+    assert_eq!(placements.tenant_count("pool-source").await?, 0);
     assert_eq!(
-        placements
-            .root_charged_disk_mib("pool-source")
-            .await
-            .unwrap(),
+        placements.root_charged_disk_mib("pool-source").await?,
         2_048
     );
-    assert!(placements.get("inst-b").await.unwrap().is_some());
+    assert!(placements.get("inst-b").await?.is_some());
+
+    Ok(())
 }
 
 async fn advance_to(
@@ -467,7 +465,7 @@ async fn advance_to(
                 },
             )
             .await
-            .unwrap();
+            .expect("default should succeed");
         if stage == target {
             return migration;
         }

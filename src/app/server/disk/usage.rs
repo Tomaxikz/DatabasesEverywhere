@@ -222,49 +222,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reports_logical_and_allocated_bytes_without_following_symlinks() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn reports_logical_and_allocated_bytes_without_following_symlinks() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let data = temporary.path().join("data");
         let outside = temporary.path().join("outside");
-        fs::create_dir_all(data.join("nested")).unwrap();
-        fs::create_dir(&outside).unwrap();
-        fs::write(data.join("root.bin"), [0_u8; 7]).unwrap();
-        fs::write(data.join("nested/child.bin"), [0_u8; 11]).unwrap();
-        fs::write(outside.join("secret.bin"), [0_u8; 101]).unwrap();
-        symlink(&outside, data.join("outside-link")).unwrap();
+        fs::create_dir_all(data.join("nested"))?;
+        fs::create_dir(&outside)?;
+        fs::write(data.join("root.bin"), [0_u8; 7])?;
+        fs::write(data.join("nested/child.bin"), [0_u8; 11])?;
+        fs::write(outside.join("secret.bin"), [0_u8; 101])?;
+        symlink(&outside, data.join("outside-link"))?;
 
-        let usage = scan_directory_sync(&data, ScanLimits::default()).unwrap();
+        let usage = scan_directory_sync(&data, ScanLimits::default())?;
         assert_eq!(usage.logical_bytes, 18);
         assert!(usage.physical_bytes >= 18);
         assert_eq!(usage.entries, 4);
+
+        Ok(())
     }
 
     #[test]
-    fn identified_scan_binds_measurement_to_the_opened_root() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn identified_scan_binds_measurement_to_the_opened_root() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let root = temporary.path().join("root");
         let replacement = temporary.path().join("replacement");
-        fs::create_dir(&root).unwrap();
-        fs::create_dir(&replacement).unwrap();
-        fs::write(root.join("old"), b"old").unwrap();
-        fs::write(replacement.join("new"), b"replacement").unwrap();
+        fs::create_dir(&root)?;
+        fs::create_dir(&replacement)?;
+        fs::write(root.join("old"), b"old")?;
+        fs::write(replacement.join("new"), b"replacement")?;
 
-        let (_, old_identity) = scan_directory_with_id(&root, ScanLimits::default()).unwrap();
-        assert_eq!(old_identity, directory_identity(&root).unwrap());
+        let (_, old_identity) = scan_directory_with_id(&root, ScanLimits::default())?;
+        assert_eq!(old_identity, directory_identity(&root)?);
 
-        fs::rename(&root, temporary.path().join("retired")).unwrap();
-        fs::rename(&replacement, &root).unwrap();
-        let (usage, new_identity) = scan_directory_with_id(&root, ScanLimits::default()).unwrap();
+        fs::rename(&root, temporary.path().join("retired"))?;
+        fs::rename(&replacement, &root)?;
+        let (usage, new_identity) = scan_directory_with_id(&root, ScanLimits::default())?;
         assert_ne!(old_identity, new_identity);
-        assert_eq!(new_identity, directory_identity(&root).unwrap());
+        assert_eq!(new_identity, directory_identity(&root)?);
         assert_eq!(usage.logical_bytes, b"replacement".len() as u64);
+
+        Ok(())
     }
 
     #[test]
-    fn enforces_the_entry_bound() {
-        let temporary = tempfile::tempdir().unwrap();
-        fs::write(temporary.path().join("one"), b"1").unwrap();
-        fs::write(temporary.path().join("two"), b"2").unwrap();
+    fn enforces_the_entry_bound() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        fs::write(temporary.path().join("one"), b"1")?;
+        fs::write(temporary.path().join("two"), b"2")?;
 
         let error = scan_directory_sync(
             temporary.path(),
@@ -273,19 +277,23 @@ mod tests {
                 ..ScanLimits::default()
             },
         )
-        .unwrap_err();
+        .expect_err("default should return an error");
         assert!(error.to_string().contains("exceeded 1 entries"));
+
+        Ok(())
     }
 
     #[test]
-    fn scans_a_wide_tree_without_retaining_one_descriptor_per_directory() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn scans_a_wide_tree_without_retaining_one_descriptor_per_directory() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         for index in 0..1_024 {
-            fs::create_dir(temporary.path().join(format!("child-{index}"))).unwrap();
+            fs::create_dir(temporary.path().join(format!("child-{index}")))?;
         }
 
-        let usage = scan_directory_sync(temporary.path(), ScanLimits::default()).unwrap();
+        let usage = scan_directory_sync(temporary.path(), ScanLimits::default())?;
         assert_eq!(usage.entries, 1_024);
+
+        Ok(())
     }
 
     #[test]

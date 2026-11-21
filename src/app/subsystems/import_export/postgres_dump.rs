@@ -189,55 +189,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finds_matched_wrapper_across_a_large_dump() {
-        let directory = tempfile::tempdir().unwrap();
+    fn finds_matched_wrapper_across_a_large_dump() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("dump.sql");
         let mut dump = String::from("-- PostgreSQL database dump\n\\restrict officialKey123\n");
         for _ in 0..8_000 {
             dump.push_str("SELECT 1;\n");
         }
         dump.push_str("\\unrestrict officialKey123\n-- PostgreSQL database dump complete\n");
-        std::fs::write(&path, dump.as_bytes()).unwrap();
+        std::fs::write(&path, dump.as_bytes())?;
 
         assert_eq!(
-            wrapper_lines_blocking(&path, dump.len() as u64).unwrap(),
+            wrapper_lines_blocking(&path, dump.len() as u64)?,
             Some((2, 8_003))
         );
+
+        Ok(())
     }
 
     #[test]
-    fn accepts_older_plain_dumps_without_a_wrapper() {
-        let directory = tempfile::tempdir().unwrap();
+    fn accepts_older_plain_dumps_without_a_wrapper() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("dump.sql");
         let dump = b"-- PostgreSQL database dump\nSELECT 1;\n";
-        std::fs::write(&path, dump).unwrap();
+        std::fs::write(&path, dump)?;
 
-        assert_eq!(
-            wrapper_lines_blocking(&path, dump.len() as u64).unwrap(),
-            None
-        );
+        assert_eq!(wrapper_lines_blocking(&path, dump.len() as u64)?, None);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_mismatched_or_incomplete_wrappers() {
-        let directory = tempfile::tempdir().unwrap();
+    fn rejects_mismatched_or_incomplete_wrappers() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("dump.sql");
         let mismatch = b"\\restrict first\nSELECT 1;\n\\unrestrict second\n";
-        std::fs::write(&path, mismatch).unwrap();
+        std::fs::write(&path, mismatch)?;
         assert_eq!(
             wrapper_lines_blocking(&path, mismatch.len() as u64)
-                .unwrap_err()
+                .expect_err("len should return an error")
                 .kind(),
             ErrorKind::InvalidData
         );
 
         let incomplete = b"\\restrict first\nSELECT 1;\n";
-        std::fs::write(&path, incomplete).unwrap();
+        std::fs::write(&path, incomplete)?;
         assert_eq!(
             wrapper_lines_blocking(&path, incomplete.len() as u64)
-                .unwrap_err()
+                .expect_err("len should return an error")
                 .kind(),
             ErrorKind::InvalidData
         );
+
+        Ok(())
     }
 }

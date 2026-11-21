@@ -138,11 +138,13 @@ pub(super) fn scheduler_error(error: SchedulerAcquireError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::databases::protocol::Protocol;
 
     #[test]
-    fn dedicated_targets_bootstrap_with_the_durable_tenant_identity() {
+    fn dedicated_targets_bootstrap_with_the_durable_tenant_identity() -> anyhow::Result<()> {
         for protocol in [
             Protocol::Postgres,
             Protocol::Mysql,
@@ -158,20 +160,24 @@ mod tests {
                 EngineRuntimeStatus::Running,
                 "test:1".to_string(),
             );
-            let request = dedicated_target_request(&source, &runtime).unwrap();
+            let request = dedicated_target_request(&source, &runtime)?;
             assert_eq!(request.deployment_mode, DeploymentMode::Dedicated);
             assert_eq!(request.instance_id, source.instance_id);
             assert_eq!(request.database, source.database.name);
             assert_eq!(request.username, source.database.username);
-            assert_eq!(request.password, source.tenant_password.clone().unwrap());
+            assert_eq!(request.password, source.tenant_password.clone().context("dedicated targets bootstrap with the durable tenant identity should provide a value")?);
             source.tenant_password = None;
             assert!(dedicated_target_request(&source, &runtime).is_err());
         }
+
+        Ok(())
     }
 
     #[test]
-    fn migration_reserves_its_export_and_pinned_restore_copy() {
-        assert_eq!(migration_staging_bytes(17).unwrap(), 34);
+    fn migration_reserves_its_export_and_pinned_restore_copy() -> anyhow::Result<()> {
+        assert_eq!(migration_staging_bytes(17)?, 34);
         assert!(migration_staging_bytes(u64::MAX).is_err());
+
+        Ok(())
     }
 }

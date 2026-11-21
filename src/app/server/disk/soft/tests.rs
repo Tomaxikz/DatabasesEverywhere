@@ -101,11 +101,11 @@ fn test_config() -> SoftDiskScannerConfig {
 }
 
 #[tokio::test]
-async fn over_limit_write_is_blocked_and_a_hung_stop_is_force_killed() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn over_limit_write_is_blocked_and_a_hung_stop_is_force_killed() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let data = temporary.path().join("data");
-    std::fs::create_dir(&data).unwrap();
-    std::fs::write(data.join("growth.bin"), vec![7_u8; 2 * 1024 * 1024]).unwrap();
+    std::fs::create_dir(&data)?;
+    std::fs::write(data.join("growth.bin"), vec![7_u8; 2 * 1024 * 1024])?;
     let runtime = HangingRuntime::default();
     let limiter = SoftDiskLimiter::new(test_config());
     let target = SoftDiskTarget {
@@ -122,9 +122,8 @@ async fn over_limit_write_is_blocked_and_a_hung_stop_is_force_killed() {
         Duration::from_secs(2),
         limiter.scan_and_enforce(&runtime, &target),
     )
-    .await
-    .unwrap()
-    .unwrap();
+    .await?
+    .map_err(anyhow::Error::msg)?;
 
     assert!(matches!(
         outcome,
@@ -136,15 +135,17 @@ async fn over_limit_write_is_blocked_and_a_hung_stop_is_force_killed() {
     assert_eq!(runtime.blocked.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.graceful.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.killed.load(Ordering::SeqCst), 1);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn restart_block_clears_only_below_hysteresis() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn restart_block_clears_only_below_hysteresis() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let data = temporary.path().join("data");
-    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&data)?;
     let file = data.join("growth.bin");
-    std::fs::write(&file, vec![1_u8; 2 * 1024 * 1024]).unwrap();
+    std::fs::write(&file, vec![1_u8; 2 * 1024 * 1024])?;
     let runtime = HangingRuntime::default();
     let mut config = test_config();
     config.shutdown_grace_seconds = 1;
@@ -158,18 +159,23 @@ async fn restart_block_clears_only_below_hysteresis() {
         durable_blocked: false,
     };
 
-    limiter.scan_and_enforce(&runtime, &target).await.unwrap();
+    limiter
+        .scan_and_enforce(&runtime, &target)
+        .await
+        .map_err(anyhow::Error::msg)?;
     assert!(limiter.ensure_start_allowed(&target).await.is_err());
-    std::fs::remove_file(file).unwrap();
+    std::fs::remove_file(file)?;
     assert!(limiter.ensure_start_allowed(&target).await.is_ok());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn active_blocked_instance_retries_enforcement_after_a_failed_kill() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn active_blocked_instance_retries_enforcement_after_a_failed_kill() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let data = temporary.path().join("data");
-    std::fs::create_dir(&data).unwrap();
-    std::fs::write(data.join("growth.bin"), vec![9_u8; 2 * 1024 * 1024]).unwrap();
+    std::fs::create_dir(&data)?;
+    std::fs::write(data.join("growth.bin"), vec![9_u8; 2 * 1024 * 1024])?;
     let runtime = RetryRuntime::default();
     let limiter = SoftDiskLimiter::new(test_config());
     let target = SoftDiskTarget {
@@ -182,7 +188,10 @@ async fn active_blocked_instance_retries_enforcement_after_a_failed_kill() {
     };
 
     assert!(limiter.scan_and_enforce(&runtime, &target).await.is_err());
-    let retry = limiter.scan_and_enforce(&runtime, &target).await.unwrap();
+    let retry = limiter
+        .scan_and_enforce(&runtime, &target)
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     assert!(matches!(
         retry,
@@ -193,6 +202,8 @@ async fn active_blocked_instance_retries_enforcement_after_a_failed_kill() {
     ));
     assert_eq!(runtime.blocked.load(Ordering::SeqCst), 2);
     assert_eq!(runtime.killed.load(Ordering::SeqCst), 2);
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -217,7 +228,9 @@ async fn recovery_threshold_stays_below_predictive_stop_threshold() {
 }
 
 #[tokio::test]
-async fn recreated_target_does_not_inherit_blocked_hysteresis_or_growth() {
+async fn recreated_target_does_not_inherit_blocked_hysteresis_or_growth() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let limiter = SoftDiskLimiter::new(test_config());
     let old_target = SoftDiskTarget {
         instance_id: "inst_reused".to_string(),
@@ -267,15 +280,19 @@ async fn recreated_target_does_not_inherit_blocked_hysteresis_or_growth() {
         limiter
             .snapshot(&new_target)
             .await
-            .unwrap()
+            .context("snapshot should provide a value")?
             .usage
             .physical_bytes,
         1_700
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn monitoring_stops_reusing_a_measurement_at_its_full_scan_deadline() {
+async fn monitoring_stops_reusing_a_measurement_at_its_full_scan_deadline() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let limiter = SoftDiskLimiter::new(test_config());
     let target = SoftDiskTarget {
         instance_id: "inst_freshness".to_owned(),
@@ -294,19 +311,21 @@ async fn monitoring_stops_reusing_a_measurement_at_its_full_scan_deadline() {
         .lock()
         .await
         .get_mut(&target.instance_id)
-        .unwrap()
+        .context("expected a value from get_mut")?
         .snapshot
         .sampled_at = Instant::now() - limiter.scan_interval();
     assert!(!limiter.has_fresh_measurement(&target).await);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn durable_restart_block_survives_a_fresh_limiter_until_recovery() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn durable_restart_block_survives_a_fresh_limiter_until_recovery() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let data = temporary.path().join("data");
-    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&data)?;
     let file = data.join("between-thresholds.bin");
-    std::fs::write(&file, vec![3_u8; 3_600_000]).unwrap();
+    std::fs::write(&file, vec![3_u8; 3_600_000])?;
     let limiter = SoftDiskLimiter::new(test_config());
     let target = SoftDiskTarget {
         instance_id: "inst_durable_hysteresis".to_string(),
@@ -318,15 +337,17 @@ async fn durable_restart_block_survives_a_fresh_limiter_until_recovery() {
     };
 
     assert!(limiter.ensure_start_allowed(&target).await.is_err());
-    std::fs::remove_file(file).unwrap();
+    std::fs::remove_file(file)?;
     assert!(limiter.ensure_start_allowed(&target).await.is_ok());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn repeated_unmeasurable_scans_fail_closed() {
-    let temporary = tempfile::tempdir().unwrap();
-    std::fs::write(temporary.path().join("one"), b"1").unwrap();
-    std::fs::write(temporary.path().join("two"), b"2").unwrap();
+async fn repeated_unmeasurable_scans_fail_closed() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
+    std::fs::write(temporary.path().join("one"), b"1")?;
+    std::fs::write(temporary.path().join("two"), b"2")?;
     let runtime = HangingRuntime::default();
     let mut config = test_config();
     config.max_entries_per_scan = 1;
@@ -342,7 +363,10 @@ async fn repeated_unmeasurable_scans_fail_closed() {
     };
 
     assert!(limiter.scan_and_enforce(&runtime, &target).await.is_err());
-    let second = limiter.scan_and_enforce(&runtime, &target).await.unwrap();
+    let second = limiter
+        .scan_and_enforce(&runtime, &target)
+        .await
+        .map_err(anyhow::Error::msg)?;
     assert!(matches!(
         second,
         ScanOutcome::Stopped {
@@ -353,11 +377,14 @@ async fn repeated_unmeasurable_scans_fail_closed() {
     assert!(!limiter.has_fresh_measurement(&target).await);
     assert_eq!(runtime.blocked.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.killed.load(Ordering::SeqCst), 1);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn global_scanner_capacity_outage_stops_targets_after_bounded_failures() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn global_scanner_capacity_outage_stops_targets_after_bounded_failures() -> anyhow::Result<()>
+{
+    let temporary = tempfile::tempdir()?;
     let runtime = HangingRuntime::default();
     let mut config = test_config();
     config.max_consecutive_scan_failures = 2;
@@ -380,7 +407,7 @@ async fn global_scanner_capacity_outage_stops_targets_after_bounded_failures() {
     let second = limiter
         .enforce_capacity_outage(&runtime, &target, "all workers wedged".to_string())
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     assert!(matches!(
         second,
         ScanOutcome::Stopped {
@@ -390,6 +417,8 @@ async fn global_scanner_capacity_outage_stops_targets_after_bounded_failures() {
     ));
     assert_eq!(runtime.blocked.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.killed.load(Ordering::SeqCst), 1);
+
+    Ok(())
 }
 
 #[test]

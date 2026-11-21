@@ -322,86 +322,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn atomically_replaces_private_file() {
+    fn atomically_replaces_private_file() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let private = directory.path().join("private");
-        ensure_private_dir(&private).unwrap();
+        ensure_private_dir(&private)?;
         assert_eq!(
-            std::fs::metadata(private).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(private)?.permissions().mode() & 0o777,
             0o700
         );
         let path = directory.path().join("state");
-        std::fs::write(&path, b"old").unwrap();
+        std::fs::write(&path, b"old")?;
 
-        atomic_write_private(&path, b"new").unwrap();
+        atomic_write_private(&path, b"new")?;
 
-        assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(std::fs::read(&path)?, b"new");
+        assert_eq!(std::fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+
+        Ok(())
     }
 
     #[test]
-    fn replaces_destination_symlink_without_following_it() {
+    fn replaces_destination_symlink_without_following_it() -> anyhow::Result<()> {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let victim = directory.path().join("victim");
         let path = directory.path().join("state");
         let strict_path = directory.path().join("strict-state");
-        std::fs::write(&victim, b"untouched").unwrap();
-        symlink(&victim, &path).unwrap();
-        symlink(&victim, &strict_path).unwrap();
+        std::fs::write(&victim, b"untouched")?;
+        symlink(&victim, &path)?;
+        symlink(&victim, &strict_path)?;
 
-        atomic_write_private(&path, b"replacement").unwrap();
+        atomic_write_private(&path, b"replacement")?;
         assert!(atomic_replace_private(&strict_path, b"replacement").is_err());
 
-        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
-        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
-        assert!(
-            !std::fs::symlink_metadata(path)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert_eq!(std::fs::read(&victim)?, b"untouched");
+        assert_eq!(std::fs::read(&path)?, b"replacement");
+        assert!(!std::fs::symlink_metadata(path)?.file_type().is_symlink());
+
+        Ok(())
     }
 
     #[test]
-    fn bounded_private_read_rejects_symlinks_and_oversized_files() {
+    fn bounded_private_read_rejects_symlinks_and_oversized_files() -> anyhow::Result<()> {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let regular = directory.path().join("regular");
         let linked = directory.path().join("linked");
-        std::fs::write(&regular, b"contents").unwrap();
-        symlink(&regular, &linked).unwrap();
+        std::fs::write(&regular, b"contents")?;
+        symlink(&regular, &linked)?;
 
-        assert_eq!(read_bounded_private_file(&regular, 8).unwrap(), b"contents");
+        assert_eq!(read_bounded_private_file(&regular, 8)?, b"contents");
         assert!(read_bounded_private_file(&regular, 7).is_err());
         assert!(read_bounded_private_file(&linked, 8).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn private_snapshot_is_independent_and_digest_checked() {
+    fn private_snapshot_is_independent_and_digest_checked() -> anyhow::Result<()> {
         use sha2::{Digest, Sha256};
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let source = directory.path().join("source");
         let snapshot = directory.path().join("snapshot");
-        std::fs::write(&source, b"inspected").unwrap();
+        std::fs::write(&source, b"inspected")?;
         let digest: [u8; 32] = Sha256::digest(b"inspected").into();
 
-        copy_private_snapshot(&source, &snapshot, 9, &digest).unwrap();
-        std::fs::write(&source, b"mutated!!").unwrap();
+        copy_private_snapshot(&source, &snapshot, 9, &digest)?;
+        std::fs::write(&source, b"mutated!!")?;
 
-        assert_eq!(std::fs::read(snapshot).unwrap(), b"inspected");
+        assert_eq!(std::fs::read(snapshot)?, b"inspected");
         let wrong: [u8; 32] = Sha256::digest(b"different").into();
         assert!(
             copy_private_snapshot(&source, &directory.path().join("rejected"), 9, &wrong).is_err()
         );
         assert!(!directory.path().join("rejected").exists());
+
+        Ok(())
     }
 }

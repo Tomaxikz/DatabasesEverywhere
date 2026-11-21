@@ -26,7 +26,8 @@ fn minio_driver() -> S3BackupDriver {
         region: "us-east-1".to_string(),
         endpoint: env_or("DBEV_S3_E2E_ENDPOINT", "http://127.0.0.1:9000"),
         access_key_id: env_or("DBEV_S3_E2E_ACCESS_KEY", "dbevtest"),
-        secret_access_key: serde_json::from_value::<SensitiveString>(secret.into()).unwrap(),
+        secret_access_key: serde_json::from_value::<SensitiveString>(secret.into())
+            .expect("from value should succeed"),
         path_style: true,
         allow_http: true,
         ..BackupS3Config::default()
@@ -40,11 +41,11 @@ fn instance_id() -> String {
 
 #[tokio::test]
 #[ignore = "needs a running MinIO; see the module docs"]
-async fn small_backup_round_trips_through_minio() {
+async fn small_backup_round_trips_through_minio() -> anyhow::Result<()> {
     let driver = minio_driver();
     driver.preflight().await.expect("preflight");
     let instance = instance_id();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir()?;
     let (bundle, manifest) =
         bundle_with_archive(temp.path(), &instance, b"small archive body", true).await;
     let id = manifest.backup_id.clone();
@@ -59,9 +60,9 @@ async fn small_backup_round_trips_through_minio() {
     assert!(listed.unsupported.is_empty());
     assert_eq!(listed.backups[0].backup_id, id);
     assert_eq!(listed.backups[0].sha256, manifest.sha256);
-    assert_eq!(driver.find(&instance, &id).await.unwrap().size_bytes, 18);
+    assert_eq!(driver.find(&instance, &id).await?.size_bytes, 18);
     assert_eq!(
-        driver.read_catalog(&instance, &id, 1024).await.unwrap(),
+        driver.read_catalog(&instance, &id, 1024).await?,
         Some(br#"{"objects":[]}"#.to_vec())
     );
     let restored = temp.path().join("restored");
@@ -69,32 +70,24 @@ async fn small_backup_round_trips_through_minio() {
         .materialize(&instance, &id, &restored)
         .await
         .expect("download");
-    assert_eq!(
-        tokio::fs::read(&restored).await.unwrap(),
-        b"small archive body"
-    );
+    assert_eq!(tokio::fs::read(&restored).await?, b"small archive body");
 
     driver.delete(&instance, &id).await.expect("delete");
     assert!(matches!(
         driver.find(&instance, &id).await,
         Err(BackupStoreError::NotFound)
     ));
-    assert!(
-        driver
-            .inventory(&instance)
-            .await
-            .unwrap()
-            .backups
-            .is_empty()
-    );
+    assert!(driver.inventory(&instance).await?.backups.is_empty());
+
+    Ok(())
 }
 
 #[tokio::test]
 #[ignore = "needs a running MinIO; see the module docs"]
-async fn multipart_backup_round_trips_through_minio() {
+async fn multipart_backup_round_trips_through_minio() -> anyhow::Result<()> {
     let driver = minio_driver();
     let instance = instance_id();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir()?;
     // Two full parts plus a tail, so completion stitches several parts.
     let size = MULTIPART_THRESHOLD_BYTES * 2 + 12_345;
     let archive: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
@@ -107,7 +100,11 @@ async fn multipart_backup_round_trips_through_minio() {
         .await
         .expect("commit a multipart backup");
 
-    let recorded = journal.0.lock().unwrap().clone();
+    let recorded = journal
+        .0
+        .lock()
+        .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+        .clone();
     assert!(
         recorded
             .iter()
@@ -119,42 +116,41 @@ async fn multipart_backup_round_trips_through_minio() {
         .materialize(&instance, &id, &restored)
         .await
         .expect("download the multipart backup");
-    let downloaded = tokio::fs::read(&restored).await.unwrap();
+    let downloaded = tokio::fs::read(&restored).await?;
     assert_eq!(downloaded.len(), archive.len());
     assert!(downloaded == archive, "downloaded bytes differ");
 
     driver.delete(&instance, &id).await.expect("delete");
-    assert_eq!(driver.delete_instance(&instance).await.unwrap(), 0);
+    assert_eq!(driver.delete_instance(&instance).await?, 0);
+
+    Ok(())
 }
 
 #[tokio::test]
 #[ignore = "needs a running MinIO; see the module docs"]
-async fn purge_aborts_journaled_and_unjournaled_uploads_on_minio() {
+async fn purge_aborts_journaled_and_unjournaled_uploads_on_minio() -> anyhow::Result<()> {
     let driver = minio_driver();
     let instance = instance_id();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir()?;
     let (bundle, manifest) = bundle_with_archive(temp.path(), &instance, b"a", false).await;
     let id = manifest.backup_id.clone();
     driver
         .commit(&bundle, &manifest, &RecordingJournal::default())
-        .await
-        .unwrap();
-    let archive = driver.archive_key(&instance, &id).unwrap();
-    let catalog = driver.catalog_key(&instance, &id).unwrap();
+        .await?;
+    let archive = driver.archive_key(&instance, &id)?;
+    let catalog = driver.catalog_key(&instance, &id)?;
     // One upload the journal knows about, one it never recorded (a crash
     // between create and journal write), each with a part already sent.
-    let journaled = driver.client.create_multipart(&archive).await.unwrap();
+    let journaled = driver.client.create_multipart(&archive).await?;
     driver
         .client
         .put_part(&archive, &journaled, 1, vec![1_u8; 1024].into())
-        .await
-        .unwrap();
-    let unjournaled = driver.client.create_multipart(&catalog).await.unwrap();
+        .await?;
+    let unjournaled = driver.client.create_multipart(&catalog).await?;
     driver
         .client
         .put_part(&catalog, &unjournaled, 1, vec![2_u8; 1024].into())
-        .await
-        .unwrap();
+        .await?;
     let resources = [PublicationResource::S3MultipartUpload {
         key: archive.clone(),
         upload_id: journaled.clone(),
@@ -170,11 +166,13 @@ async fn purge_aborts_journaled_and_unjournaled_uploads_on_minio() {
         Err(BackupStoreError::NotFound)
     ));
     for (path, upload) in [(&archive, &journaled), (&catalog, &unjournaled)] {
-        assert!(driver.client.upload_gone(path, upload).await.unwrap());
+        assert!(driver.client.upload_gone(path, upload).await?);
     }
     driver
         .purge_unpublished(&instance, &id, &resources)
         .await
         .expect("repeat purge");
-    assert_eq!(driver.delete_instance(&instance).await.unwrap(), 0);
+    assert_eq!(driver.delete_instance(&instance).await?, 0);
+
+    Ok(())
 }

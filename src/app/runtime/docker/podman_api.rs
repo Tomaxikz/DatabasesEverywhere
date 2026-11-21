@@ -151,19 +151,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resource_update_uses_versioned_route_and_oci_cgroup_units() {
-        let body = update_limits_body(0.5, 96).unwrap();
-        let json = serde_json::to_value(body).unwrap();
+    fn resource_update_uses_versioned_route_and_oci_cgroup_units() -> anyhow::Result<()> {
+        let body = update_limits_body(0.5, 96)?;
+        let json = serde_json::to_value(body)?;
 
         assert_eq!(json["cpu"]["period"], 100_000);
         assert_eq!(json["cpu"]["quota"], 50_000);
         assert_eq!(json["memory"]["limit"], 96 * 1024 * 1024);
         assert_eq!(json["memory"]["swap"], json["memory"]["limit"]);
-        let url = update_limits_url("dbev_redis_instance-one").unwrap();
+        let url = update_limits_url("dbev_redis_instance-one")?;
 
         assert_eq!(
             url.as_str(),
             "http://podman.internal/v4.0.0/libpod/containers/dbev_redis_instance-one/update"
         );
+
+        Ok(())
     }
 }

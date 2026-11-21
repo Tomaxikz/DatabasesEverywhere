@@ -682,6 +682,8 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
+        use anyhow::Context as _;
+
         use std::{os::unix::fs::symlink, path::PathBuf};
 
         use super::*;
@@ -709,46 +711,51 @@ mod platform {
         }
 
         #[test]
-        fn directory_is_entered_before_children_are_enumerated() {
-            let temp = tempfile::tempdir().unwrap();
+        fn directory_is_entered_before_children_are_enumerated() -> anyhow::Result<()> {
+            let temp = tempfile::tempdir()?;
             let root = temp.path().join("tenant");
             let nested = root.join("nested");
-            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::create_dir_all(&nested)?;
             let mut recorder = Recorder {
                 create_in: Some(nested.clone()),
                 ..Recorder::default()
             };
 
-            assert!(walk_tree(&root, &mut recorder).unwrap());
+            assert!(walk_tree(&root, &mut recorder)?);
 
             let created = nested.join("created-after-enter");
             let nested_index = recorder
                 .entered
                 .iter()
                 .position(|path| path == &nested)
-                .unwrap();
+                .context("expected a value from position")?;
             let created_index = recorder
                 .entered
                 .iter()
                 .position(|path| path == &created)
-                .unwrap();
+                .context("expected a value from position")?;
             assert!(nested_index < created_index);
+
+            Ok(())
         }
 
         #[test]
-        fn fd_relative_walk_never_follows_symlinks() {
-            let temp = tempfile::tempdir().unwrap();
+        fn fd_relative_walk_never_follows_symlinks() -> anyhow::Result<()> {
+            let temp = tempfile::tempdir()?;
             let root = temp.path().join("tenant");
             let outside = temp.path().join("outside");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::create_dir(&outside).unwrap();
-            std::fs::write(outside.join("keep"), b"outside").unwrap();
-            symlink(&outside, root.join("escape")).unwrap();
+            std::fs::create_dir(&root)?;
+            std::fs::create_dir(&outside)?;
+            std::fs::write(outside.join("keep"), b"outside")?;
+            symlink(&outside, root.join("escape"))?;
 
-            let error = walk_tree(&root, &mut Recorder::default()).unwrap_err();
+            let error = walk_tree(&root, &mut Recorder::default())
+                .expect_err("default should return an error");
 
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-            assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
+            assert_eq!(std::fs::read(outside.join("keep"))?, b"outside");
+
+            Ok(())
         }
 
         struct SwapName {
@@ -776,17 +783,18 @@ mod platform {
         }
 
         #[test]
-        fn name_replacement_after_open_is_detected_without_following_replacement() {
+        fn name_replacement_after_open_is_detected_without_following_replacement()
+        -> anyhow::Result<()> {
             use std::os::unix::fs::MetadataExt;
 
-            let temp = tempfile::tempdir().unwrap();
+            let temp = tempfile::tempdir()?;
             let root = temp.path().join("tenant");
             let target = root.join("entry");
             let moved = root.join("opened-entry");
             let outside = temp.path().join("outside");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::write(&target, b"inside").unwrap();
-            std::fs::write(&outside, b"outside").unwrap();
+            std::fs::create_dir(&root)?;
+            std::fs::write(&target, b"inside")?;
+            std::fs::write(&outside, b"outside")?;
             let mut swap = SwapName {
                 target: target.clone(),
                 moved: moved.clone(),
@@ -794,12 +802,11 @@ mod platform {
                 opened_inode: None,
             };
 
-            assert!(!walk_tree(&root, &mut swap).unwrap());
-            assert_eq!(
-                swap.opened_inode,
-                Some(std::fs::metadata(moved).unwrap().ino())
-            );
-            assert_eq!(std::fs::read(outside).unwrap(), b"outside");
+            assert!(!walk_tree(&root, &mut swap)?);
+            assert_eq!(swap.opened_inode, Some(std::fs::metadata(moved)?.ino()));
+            assert_eq!(std::fs::read(outside)?, b"outside");
+
+            Ok(())
         }
 
         #[test]
@@ -837,7 +844,8 @@ mod platform {
 
             assert!(validate_assign(&attrs(7), 7, 42).is_ok());
             assert!(validate_assign(&attrs(42), 7, 42).is_ok());
-            let error = validate_assign(&attrs(99), 7, 42).unwrap_err();
+            let error =
+                validate_assign(&attrs(99), 7, 42).expect_err("attrs should return an error");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         }
 
@@ -911,13 +919,13 @@ mod platform {
             assert!(validate_clear(&attrs(42, false), 42, false).is_ok());
             assert_eq!(
                 validate_clear(&attrs(99, true), 42, true)
-                    .unwrap_err()
+                    .expect_err("attrs should return an error")
                     .kind(),
                 std::io::ErrorKind::InvalidData
             );
             assert_eq!(
                 validate_clear(&attrs(42, false), 42, true)
-                    .unwrap_err()
+                    .expect_err("attrs should return an error")
                     .kind(),
                 std::io::ErrorKind::InvalidData
             );

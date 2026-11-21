@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn parses_vendor_version_outputs_without_treating_suffixes_as_semantics() {
+fn parses_vendor_version_outputs_without_treating_suffixes_as_semantics() -> anyhow::Result<()> {
     for (raw, expected) in [
         ("8.4.6-commercial", (8, 4, 6)),
         ("Ver 9.7.0 for Linux", (9, 7, 0)),
@@ -9,9 +9,11 @@ fn parses_vendor_version_outputs_without_treating_suffixes_as_semantics() {
         ("v8.3.4", (8, 3, 4)),
         ("ClickHouse server version 26.4.4.38", (26, 4, 4)),
     ] {
-        let version = parse_engine_version(raw).unwrap();
+        let version = parse_engine_version(raw)?;
         assert_eq!((version.major, version.minor, version.patch), expected);
     }
+
+    Ok(())
 }
 
 #[test]
@@ -63,17 +65,19 @@ fn policy_covers_every_declared_version_family_and_rejects_neighbors() {
 }
 
 #[test]
-fn capabilities_are_derived_from_the_attested_engine_not_the_image_tag() {
-    let postgres_16 = compatibility_profile(Protocol::Postgres, "16.9").unwrap();
-    let postgres_17 = compatibility_profile(Protocol::Postgres, "17.5").unwrap();
+fn capabilities_are_derived_from_the_attested_engine_not_the_image_tag() -> anyhow::Result<()> {
+    let postgres_16 = compatibility_profile(Protocol::Postgres, "16.9")?;
+    let postgres_17 = compatibility_profile(Protocol::Postgres, "17.5")?;
     assert!(!postgres_16.capabilities.postgres_direct_tls);
     assert!(postgres_17.capabilities.postgres_direct_tls);
     assert!(postgres_17.capabilities.postgres_cancel_request);
 
-    let mysql = compatibility_profile(Protocol::Mysql, "26.7.1").unwrap();
+    let mysql = compatibility_profile(Protocol::Mysql, "26.7.1")?;
     assert!(mysql.capabilities.mysql_caching_sha2_backend);
-    let mariadb = compatibility_profile(Protocol::Mariadb, "12.3.2").unwrap();
+    let mariadb = compatibility_profile(Protocol::Mariadb, "12.3.2")?;
     assert!(!mariadb.capabilities.mysql_caching_sha2_backend);
+
+    Ok(())
 }
 
 #[test]

@@ -584,66 +584,62 @@ mod tests {
     }
 
     #[test]
-    fn registry_updates_are_idempotent() {
+    fn registry_updates_are_idempotent() -> anyhow::Result<()> {
         let project = project();
 
-        assert!(
-            updated_projects("200123:/srv/dbe/instances/one\n", &project)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            updated_projid("dbe_200123:200123\n", &project)
-                .unwrap()
-                .is_none()
-        );
+        assert!(updated_projects("200123:/srv/dbe/instances/one\n", &project)?.is_none());
+        assert!(updated_projid("dbe_200123:200123\n", &project)?.is_none());
         assert_eq!(
-            updated_projects("# managed projects\n", &project).unwrap(),
+            updated_projects("# managed projects\n", &project)?,
             Some("# managed projects\n200123:/srv/dbe/instances/one\n".to_string())
         );
         assert_eq!(
-            updated_projid("# managed projects", &project).unwrap(),
+            updated_projid("# managed projects", &project)?,
             Some("# managed projects\ndbe_200123:200123\n".to_string())
         );
+
+        Ok(())
     }
 
     #[test]
     fn project_registries_reject_id_path_and_name_conflicts() {
         let project = project();
 
-        let id_conflict = updated_projects("200123:/srv/external\n", &project).unwrap_err();
-        let path_conflict = updated_projects("42:/srv/dbe/instances/one\n", &project).unwrap_err();
+        let id_conflict = updated_projects("200123:/srv/external\n", &project)
+            .expect_err("updated projects should return an error");
+        let path_conflict = updated_projects("42:/srv/dbe/instances/one\n", &project)
+            .expect_err("updated projects should return an error");
 
         assert_eq!(id_conflict.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(path_conflict.kind(), std::io::ErrorKind::AlreadyExists);
 
-        let id_conflict = updated_projid("external:200123\n", &project).unwrap_err();
-        let name_conflict = updated_projid("dbe_200123:42\n", &project).unwrap_err();
+        let id_conflict = updated_projid("external:200123\n", &project)
+            .expect_err("updated projid should return an error");
+        let name_conflict = updated_projid("dbe_200123:42\n", &project)
+            .expect_err("updated projid should return an error");
 
         assert_eq!(id_conflict.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(name_conflict.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
-    fn registry_removal_is_exact_and_idempotent() {
+    fn registry_removal_is_exact_and_idempotent() -> anyhow::Result<()> {
         let project = project();
         let projects = "# keep this\n200123:/srv/dbe/instances/one\n42:/srv/dbe/instances/two\n";
         let projid = "# keep this\ndbe_200123:200123\nexternal:42\n";
 
         assert_eq!(
-            removed_projects(projects, &project).unwrap(),
+            removed_projects(projects, &project)?,
             Some("# keep this\n42:/srv/dbe/instances/two\n".to_string())
         );
         assert_eq!(
-            removed_projid(projid, &project).unwrap(),
+            removed_projid(projid, &project)?,
             Some("# keep this\nexternal:42\n".to_string())
         );
-        assert!(
-            removed_projects("42:/srv/dbe/instances/two\n", &project)
-                .unwrap()
-                .is_none()
-        );
-        assert!(removed_projid("external:42\n", &project).unwrap().is_none());
+        assert!(removed_projects("42:/srv/dbe/instances/two\n", &project)?.is_none());
+        assert!(removed_projid("external:42\n", &project)?.is_none());
+
+        Ok(())
     }
 
     #[test]
@@ -657,37 +653,35 @@ mod tests {
     }
 
     #[test]
-    fn project_file_updates_use_atomic_replacement_and_preserve_mode() {
+    fn project_file_updates_use_atomic_replacement_and_preserve_mode() -> anyhow::Result<()> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let path = temp.path().join("projects");
-        std::fs::write(&path, "before\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let original_inode = std::fs::metadata(&path).unwrap().ino();
+        std::fs::write(&path, "before\n")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+        let original_inode = std::fs::metadata(&path)?.ino();
 
-        replace_project_file(&path, "after\n").unwrap();
+        replace_project_file(&path, "after\n")?;
 
-        let metadata = std::fs::metadata(&path).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        let metadata = std::fs::metadata(&path)?;
+        assert_eq!(std::fs::read_to_string(&path)?, "after\n");
         assert_ne!(metadata.ino(), original_inode);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+
+        Ok(())
     }
 
     #[test]
-    fn advisory_lock_is_private_and_exclusive() {
+    fn advisory_lock_is_private_and_exclusive() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let path = temp.path().join("project-files.lock");
-        let lock = acquire_exclusive_lock(&path).unwrap();
-        let contender = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let lock = acquire_exclusive_lock(&path)?;
+        let contender = OpenOptions::new().read(true).write(true).open(&path)?;
 
-        assert_eq!(lock.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(lock.metadata()?.permissions().mode() & 0o777, 0o600);
         assert!(
             rustix::fs::flock(
                 &contender,
@@ -695,5 +689,7 @@ mod tests {
             )
             .is_err()
         );
+
+        Ok(())
     }
 }

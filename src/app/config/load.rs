@@ -43,8 +43,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_minimal_config_with_defaults() {
-        let dir = tempfile::tempdir().unwrap();
+    fn loads_minimal_config_with_defaults() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("config.yml");
         std::fs::write(
             &path,
@@ -63,11 +63,10 @@ paths:
   logs: /var/log/databases-everywhere
   artifacts: /var/lib/databases-everywhere/artifacts
 "#,
-        )
-        .unwrap();
+        )?;
 
-        let original = std::fs::read_to_string(&path).unwrap();
-        let config = load_config(&path).unwrap();
+        let original = std::fs::read_to_string(&path)?;
+        let config = load_config(&path)?;
 
         assert_eq!(config.daemon.engine, crate::config::DaemonEngine::Docker);
         assert_eq!(config.daemon.sql_buffer_global_mib, 1024);
@@ -87,20 +86,21 @@ paths:
                 .dynamic_memory_budget_mib,
             0
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+
+        Ok(())
     }
 
     #[test]
-    fn global_sql_buffer_setting_roundtrips_and_rejects_non_integer_values() {
-        let config: Config =
-            yaml_serde::from_str("daemon:\n  sql_buffer_global_mib: 2048\n").unwrap();
+    fn global_sql_buffer_setting_roundtrips_and_rejects_non_integer_values() -> anyhow::Result<()> {
+        let config: Config = yaml_serde::from_str("daemon:\n  sql_buffer_global_mib: 2048\n")?;
         assert_eq!(
-            config.daemon.sql_buffer_global_bytes().unwrap(),
+            config.daemon.sql_buffer_global_bytes()?,
             2 * 1024 * 1024 * 1024
         );
-        let yaml = yaml_serde::to_string(&config).unwrap();
+        let yaml = yaml_serde::to_string(&config)?;
         assert!(yaml.contains("sql_buffer_global_mib: 2048"));
-        let restored: Config = yaml_serde::from_str(&yaml).unwrap();
+        let restored: Config = yaml_serde::from_str(&yaml)?;
         assert_eq!(restored.daemon.sql_buffer_global_mib, 2048);
         for value in ["-1", "1.5", "true", "null"] {
             assert!(
@@ -110,22 +110,24 @@ paths:
                 .is_err()
             );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn yaml_roundtrip_preserves_strings_and_rejects_duplicate_settings() {
+    fn yaml_roundtrip_preserves_strings_and_rejects_duplicate_settings() -> anyhow::Result<()> {
         // These are strings, even when they resemble YAML booleans/numbers.
         for token in ["on", "false", "null", "001", "1e3", "test: # $ @ 'value'"] {
             let config = Config {
                 token: token.into(),
                 ..Config::default()
             };
-            let encoded = yaml_serde::to_string(&config).unwrap();
-            let decoded: Config = yaml_serde::from_str(&encoded).unwrap();
+            let encoded = yaml_serde::to_string(&config)?;
+            let decoded: Config = yaml_serde::from_str(&encoded)?;
             assert_eq!(decoded.token, token);
             assert_eq!(
-                serde_json::to_value(&decoded).unwrap(),
-                serde_json::to_value(&config).unwrap()
+                serde_json::to_value(&decoded)?,
+                serde_json::to_value(&config)?
             );
         }
         for document in [
@@ -134,11 +136,13 @@ paths:
         ] {
             assert!(yaml_serde::from_str::<Config>(document).is_err());
         }
+
+        Ok(())
     }
 
     #[test]
-    fn loads_partial_scheduler_without_replacing_identity_or_tls() {
-        let dir = tempfile::tempdir().unwrap();
+    fn loads_partial_scheduler_without_replacing_identity_or_tls() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("config.yml");
         let original = r#"
 remote: https://panel.example.com
@@ -165,9 +169,9 @@ paths:
   logs: /var/log/databases-everywhere
   artifacts: /var/lib/databases-everywhere/artifacts
 "#;
-        std::fs::write(&path, original).unwrap();
+        std::fs::write(&path, original)?;
 
-        let config = load_config(&path).unwrap();
+        let config = load_config(&path)?;
 
         assert_eq!(config.uuid, "preserved-node-uuid");
         assert_eq!(config.token_id, "preserved-token-id");
@@ -191,12 +195,14 @@ paths:
                 .dynamic_memory_budget_mib,
             0
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_legacy_removed_and_unknown_config_fields() {
-        let directory = tempfile::tempdir().unwrap();
+    fn rejects_legacy_removed_and_unknown_config_fields() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("config.yml");
         for (name, extra) in [
             ("legacy API bind", "api:\n  bind: 127.0.0.1:8090"),
@@ -211,17 +217,19 @@ paths:
             ),
             ("removed API URL", "api:\n  url: https://dbe.example.com"),
         ] {
-            std::fs::write(&path, config_document(extra)).unwrap();
+            std::fs::write(&path, config_document(extra))?;
             assert!(
                 matches!(load_config(&path), Err(ConfigLoadError::Parse { .. })),
                 "accepted config case: {name}"
             );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn loads_v06_api_fields_without_reexporting_retired_values() {
-        let dir = tempfile::tempdir().unwrap();
+    fn loads_v06_api_fields_without_reexporting_retired_values() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("config.yml");
         std::fs::write(
             &path,
@@ -246,20 +254,21 @@ paths:
   logs: /var/log/databases-everywhere
   artifacts: /var/lib/databases-everywhere/artifacts
 "#,
-        )
-        .unwrap();
+        )?;
 
-        let config = load_config(&path).unwrap();
+        let config = load_config(&path)?;
 
         assert_eq!(config.api.fqdn, "db.example.com");
         assert_eq!(config.api.trusted_hosts, ["panel.example.com"]);
-        let serialized = yaml_serde::to_string(&config).unwrap();
+        let serialized = yaml_serde::to_string(&config)?;
         assert!(!serialized.contains("fqdn:"));
         assert!(!serialized.contains("trusted_hosts:"));
         assert_eq!(
             config.cors_allowed_origins(),
             vec!["https://panel.example.com:443", "http://localhost:3000"]
         );
+
+        Ok(())
     }
 
     fn config_document(extra: &str) -> String {

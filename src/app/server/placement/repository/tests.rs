@@ -11,31 +11,29 @@ use crate::{
 };
 
 #[tokio::test]
-async fn stores_pool_admin_secret_encrypted() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
-    let repository = PlacementRepository::encrypted(pool.clone(), dir.path()).unwrap();
+async fn stores_pool_admin_secret_encrypted() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
+    let repository = PlacementRepository::encrypted(pool.clone(), dir.path())?;
     let mut runtime = shared_runtime("pool_secret", 4);
     runtime.admin_secret = Some("pool-admin-password".to_string());
 
-    repository.save(&runtime).await.unwrap();
+    repository.save(&runtime).await?;
 
     let raw: String =
         sqlx::query_scalar("SELECT admin_secret FROM engine_runtime_auth WHERE runtime_id = ?1")
             .bind(&runtime.runtime_id)
             .fetch_one(&pool)
-            .await
-            .unwrap();
+            .await?;
     assert!(is_encrypted(&raw));
     assert!(!raw.contains("pool-admin-password"));
-    let loaded = repository.get(&runtime.runtime_id).await.unwrap().unwrap();
-    assert!(
-        repository
-            .get("pool_secret' OR 1=1 --")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let loaded = repository
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
+    assert!(repository.get("pool_secret' OR 1=1 --").await?.is_none());
     assert_eq!(loaded.admin_secret.as_deref(), Some("pool-admin-password"));
     assert_eq!(loaded.database_version.as_deref(), Some("18.4"));
     assert_eq!(loaded.compatibility, runtime.compatibility);
@@ -48,65 +46,68 @@ async fn stores_pool_admin_secret_encrypted() {
         .await
         .is_err()
     );
-    assert!(
-        !serde_json::to_string(&loaded)
-            .unwrap()
-            .contains("pool-admin")
-    );
+    assert!(!serde_json::to_string(&loaded)?.contains("pool-admin"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn rejects_raw_database_version_output() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn rejects_raw_database_version_output() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let repository = PlacementRepository::new(pool);
     let mut runtime = shared_runtime("pool_raw_version", 4);
     runtime.database_version = Some("postgres (PostgreSQL) 18.4".to_string());
 
-    let error = repository.save(&runtime).await.unwrap_err();
+    let error = repository
+        .save(&runtime)
+        .await
+        .expect_err("save should return an error");
     assert!(matches!(
         error,
         PlacementRepositoryError::Placement(PlacementError::InvalidDatabaseVersion(version))
             if version == "postgres (PostgreSQL) 18.4"
     ));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn reserves_and_releases_pool_capacity_atomically() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn reserves_and_releases_pool_capacity_atomically() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let repository = PlacementRepository::new(pool);
     let runtime = shared_runtime("pool_capacity", 2);
-    repository.save(&runtime).await.unwrap();
+    repository.save(&runtime).await?;
     let mut request = tenant_limits();
     request.cpu_cores = 0.1;
 
     repository
         .reserve(reservation(&runtime.runtime_id, "tenant_a", &request))
-        .await
-        .unwrap();
+        .await?;
     repository
         .reserve(reservation(&runtime.runtime_id, "tenant_b", &request))
-        .await
-        .unwrap();
+        .await?;
     let full = repository
         .reserve(reservation(&runtime.runtime_id, "tenant_c", &request))
         .await
-        .unwrap_err();
+        .expect_err("reservation should return an error");
 
     assert!(matches!(
         full,
         PlacementRepositoryError::CapacityUnavailable(_)
     ));
+    assert_eq!(repository.tenant_count(&runtime.runtime_id).await?, 2);
     assert_eq!(
-        repository.tenant_count(&runtime.runtime_id).await.unwrap(),
-        2
-    );
-    assert_eq!(
-        repository.tenants(&runtime.runtime_id).await.unwrap(),
+        repository.tenants(&runtime.runtime_id).await?,
         ["tenant_a", "tenant_b"]
     );
-    let loaded = repository.get(&runtime.runtime_id).await.unwrap().unwrap();
+    let loaded = repository
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(loaded.reserved.tenants, 2);
 
     assert_eq!(loaded.reserved.disk_mib, 8192);
@@ -114,31 +115,41 @@ async fn reserves_and_releases_pool_capacity_atomically() {
     assert_eq!(loaded.limits.memory_mib, runtime.limits.memory_mib);
     assert_eq!(loaded.limits.disk_mib, runtime.limits.disk_mib);
 
-    assert!(repository.release("tenant_a").await.unwrap());
-    assert!(!repository.release("tenant_a").await.unwrap());
-    let one = repository.get(&runtime.runtime_id).await.unwrap().unwrap();
+    assert!(repository.release("tenant_a").await?);
+    assert!(!repository.release("tenant_a").await?);
+    let one = repository
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(one.reserved.tenants, 1);
 
     assert_eq!(one.limits.cpu_cores, runtime.limits.cpu_cores);
     assert_eq!(one.limits.memory_mib, runtime.limits.memory_mib);
     assert_eq!(one.limits.disk_mib, runtime.limits.disk_mib);
 
-    assert!(repository.release("tenant_b").await.unwrap());
-    let empty = repository.get(&runtime.runtime_id).await.unwrap().unwrap();
+    assert!(repository.release("tenant_b").await?);
+    let empty = repository
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(empty.reserved, RuntimeReservation::default());
     assert_eq!(empty.limits.cpu_cores, runtime.limits.cpu_cores);
     assert_eq!(empty.limits.memory_mib, runtime.limits.memory_mib);
     assert_eq!(empty.limits.disk_mib, runtime.limits.disk_mib);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn root_disk_capacity_counts_only_soft_and_unattached_tenants() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn root_disk_capacity_counts_only_soft_and_unattached_tenants() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let instances = InstanceRepository::new(pool);
     let runtime = shared_runtime("pool_root_disk", 4);
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
 
     let hard = shared_instance(
         "hard_tenant",
@@ -161,13 +172,9 @@ async fn root_disk_capacity_counts_only_soft_and_unattached_tenants() {
     for metadata in [&hard, &soft] {
         placements
             .reserve(metadata_reservation(&runtime.runtime_id, metadata))
-            .await
-            .unwrap();
-        placements
-            .mark_provisioned(&metadata.instance_id)
-            .await
-            .unwrap();
-        instances.upsert(metadata).await.unwrap();
+            .await?;
+        placements.mark_provisioned(&metadata.instance_id).await?;
+        instances.upsert(metadata).await?;
     }
     placements
         .reserve(reservation(
@@ -175,11 +182,13 @@ async fn root_disk_capacity_counts_only_soft_and_unattached_tenants() {
             "orphan_tenant",
             &orphan_limits,
         ))
-        .await
-        .unwrap();
+        .await?;
 
     // Tenant disk is reserved within the unchanged physical pool budget.
-    let aggregate = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+    let aggregate = placements
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(aggregate.reserved.disk_mib, 12_288);
     assert_eq!(aggregate.limits.disk_mib, runtime.limits.disk_mib);
     // The hard tenant is charged to its child project. The soft tenant and
@@ -187,49 +196,49 @@ async fn root_disk_capacity_counts_only_soft_and_unattached_tenants() {
     assert_eq!(
         placements
             .root_charged_disk_mib(&runtime.runtime_id)
-            .await
-            .unwrap(),
+            .await?,
         10_855
     );
 
     soft.limits.disk_enforced = true;
     soft.limits.disk_enforcement_method = "host_linux_project_quota".to_string();
-    instances.upsert(&soft).await.unwrap();
+    instances.upsert(&soft).await?;
     assert_eq!(
         placements
             .root_charged_disk_mib(&runtime.runtime_id)
-            .await
-            .unwrap(),
+            .await?,
         6_759
     );
 
-    assert!(instances.delete(&hard.instance_id).await.unwrap());
+    assert!(instances.delete(&hard.instance_id).await?);
     assert_eq!(
         placements
             .root_charged_disk_mib(&runtime.runtime_id)
-            .await
-            .unwrap(),
+            .await?,
         6_554
     );
-    assert!(placements.release("orphan_tenant").await.unwrap());
+    assert!(placements.release("orphan_tenant").await?);
     assert_eq!(
         placements
             .root_charged_disk_mib(&runtime.runtime_id)
-            .await
-            .unwrap(),
+            .await?,
         2_253
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn spill_cap_survives_provision_resize_recovery_and_delete() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn spill_cap_survives_provision_resize_recovery_and_delete() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let instances = InstanceRepository::new(pool.clone());
     let mut runtime = shared_runtime("pool_spill_cap", 2);
     runtime.limits.disk_mib = 262_144;
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
 
     let mut tenant = shared_instance(
         "large_tenant",
@@ -241,119 +250,133 @@ async fn spill_cap_survives_provision_resize_recovery_and_delete() {
     tenant.limits.disk_mib = 163_840;
     placements
         .reserve(metadata_reservation(&runtime.runtime_id, &tenant))
-        .await
-        .unwrap();
+        .await?;
 
     // A provisional reservation is fully root-charged and also gets the
     // capped engine-global spill reserve.
     assert_eq!(
         placements
             .root_charged_disk_mib(&runtime.runtime_id)
-            .await
-            .unwrap(),
+            .await?,
         174_080
     );
-    placements
-        .mark_provisioned(&tenant.instance_id)
-        .await
-        .unwrap();
-    instances.upsert(&tenant).await.unwrap();
+    placements.mark_provisioned(&tenant.instance_id).await?;
+    instances.upsert(&tenant).await?;
     assert_eq!(
         placements
             .root_charged_disk_mib(&runtime.runtime_id)
-            .await
-            .unwrap(),
+            .await?,
         10_240
     );
 
     let mut grown = tenant.limits.clone();
     grown.disk_mib = 200_000;
-    let resized = placements
-        .resize(&tenant.instance_id, &grown)
-        .await
-        .unwrap();
+    let resized = placements.resize(&tenant.instance_id, &grown).await?;
     assert_eq!(resized.limits.disk_mib, runtime.limits.disk_mib);
     assert_eq!(
         placements
             .root_charged_disk_mib(&runtime.runtime_id)
-            .await
-            .unwrap(),
+            .await?,
         10_240
     );
 
     // Reopening and saving preserves the operator's fixed capacity.
-    let recovered = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+    let recovered = placements
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(recovered.limits, runtime.limits);
-    placements.save(&recovered).await.unwrap();
+    placements.save(&recovered).await?;
 
-    assert!(instances.delete(&tenant.instance_id).await.unwrap());
-    let empty = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+    assert!(instances.delete(&tenant.instance_id).await?);
+    let empty = placements
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(empty.reserved, RuntimeReservation::default());
     assert_eq!(empty.limits.disk_mib, runtime.limits.disk_mib);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn stale_state_save_cannot_undo_new_pool_capacity() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn stale_state_save_cannot_undo_new_pool_capacity() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let repository = PlacementRepository::new(pool);
     let mut stale = shared_runtime("pool_state_race", 4);
-    repository.save(&stale).await.unwrap();
+    repository.save(&stale).await?;
 
     let requested = tenant_limits();
     let reserved = repository
         .reserve(reservation(&stale.runtime_id, "tenant_a", &requested))
-        .await
-        .unwrap();
+        .await?;
     stale.status = EngineRuntimeStatus::Failed;
-    repository.save(&stale).await.unwrap();
+    repository.save(&stale).await?;
 
-    let loaded = repository.get(&stale.runtime_id).await.unwrap().unwrap();
+    let loaded = repository
+        .get(&stale.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(loaded.status, EngineRuntimeStatus::Failed);
     assert_eq!(loaded.reserved, reserved.reserved);
     assert_eq!(loaded.limits, reserved.limits);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn failed_resize_rolls_back_runtime_and_reservation() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn failed_resize_rolls_back_runtime_and_reservation() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let repository = PlacementRepository::new(pool.clone());
     let runtime = shared_runtime("pool_resize_rollback", 2);
-    repository.save(&runtime).await.unwrap();
+    repository.save(&runtime).await?;
     let original = tenant_limits();
     repository
         .reserve(reservation(&runtime.runtime_id, "unattached", &original))
-        .await
-        .unwrap();
+        .await?;
     let mut larger = original.clone();
     larger.memory_mib = 3072;
 
-    let error = repository.resize("unattached", &larger).await.unwrap_err();
+    let error = repository
+        .resize("unattached", &larger)
+        .await
+        .expect_err("resize should return an error");
     assert!(matches!(
         error,
         PlacementRepositoryError::ReservationNotAttached(instance)
             if instance == "unattached"
     ));
-    let loaded = repository.get(&runtime.runtime_id).await.unwrap().unwrap();
+    let loaded = repository
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
 
     assert_eq!(loaded.limits.memory_mib, runtime.limits.memory_mib);
     let stored: i64 = sqlx::query_scalar(
         "SELECT memory_mib FROM engine_runtime_reservations WHERE instance_id = 'unattached'",
     )
     .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(stored, i64::try_from(original.memory_mib).unwrap());
+    .await?;
+    assert_eq!(stored, i64::try_from(original.memory_mib)?);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn concurrent_last_slot_has_one_winner() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn concurrent_last_slot_has_one_winner() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let repository = PlacementRepository::new(pool);
     let runtime = shared_runtime("pool_race", 1);
-    repository.save(&runtime).await.unwrap();
+    repository.save(&runtime).await?;
     let request = tenant_limits();
 
     let left = repository.clone();
@@ -366,35 +389,39 @@ async fn concurrent_last_slot_has_one_winner() {
 
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
     // The loser must observe the committed capacity, not a SQLite lock error.
-    let loser = first.err().or_else(|| second.err()).unwrap();
+    let loser = first
+        .err()
+        .or_else(|| second.err())
+        .context("expected a value from or_else")?;
     assert!(matches!(
         loser,
         PlacementRepositoryError::CapacityUnavailable(_)
     ));
-    assert_eq!(
-        repository.tenant_count(&runtime.runtime_id).await.unwrap(),
-        1
-    );
+    assert_eq!(repository.tenant_count(&runtime.runtime_id).await?, 1);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn parallel_pool_recovery_preserves_tenant_state() {
+async fn parallel_pool_recovery_preserves_tenant_state() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     use crate::server::{
         manager::InstanceManager,
         metadata::{DesiredInstanceState, InstanceStatus},
         state::InstanceStore,
     };
     use futures::StreamExt;
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
-    let placements = PlacementRepository::encrypted(pool.clone(), dir.path()).unwrap();
-    let instances = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
+    let placements = PlacementRepository::encrypted(pool.clone(), dir.path())?;
+    let instances = InstanceRepository::encrypted(pool.clone(), dir.path())?;
     let manager = InstanceManager::new(InstanceStore::default(), instances.clone());
     let mut runtimes = Vec::new();
     for index in 0..8 {
         let mut runtime = shared_runtime(&format!("recovery_{index}"), 2);
         runtime.admin_secret = Some(format!("admin-{index}"));
-        placements.save(&runtime).await.unwrap();
+        placements.save(&runtime).await?;
         for child in 0..2 {
             let id = format!("tenant_{index}_{child}");
             let mut tenant = shared_instance(&id, &runtime.runtime_id, &id, &id, 15432);
@@ -405,12 +432,16 @@ async fn parallel_pool_recovery_preserves_tenant_state() {
             }
             placements
                 .reserve(metadata_reservation(&runtime.runtime_id, &tenant))
-                .await
-                .unwrap();
-            placements.mark_provisioned(&id).await.unwrap();
-            manager.upsert_preserving_fence(tenant).await.unwrap();
+                .await?;
+            placements.mark_provisioned(&id).await?;
+            manager.upsert_preserving_fence(tenant).await?;
         }
-        runtimes.push(placements.get(&runtime.runtime_id).await.unwrap().unwrap());
+        runtimes.push(
+            placements
+                .get(&runtime.runtime_id)
+                .await?
+                .context("get should provide a value")?,
+        );
     }
 
     // Exercise the same persistence fan-out as restore_shared_limits, with
@@ -435,23 +466,26 @@ async fn parallel_pool_recovery_preserves_tenant_state() {
         })
         .buffer_unordered(8)
         .collect::<Vec<_>>();
-    for result in tokio::time::timeout(std::time::Duration::from_secs(15), recovery)
-        .await
-        .unwrap()
-    {
-        result.unwrap();
+    for result in tokio::time::timeout(std::time::Duration::from_secs(15), recovery).await? {
+        result?;
     }
     pool.close().await;
-    let reopened = sqlite::connect(dir.path()).await.unwrap();
-    let placements = PlacementRepository::encrypted(reopened.clone(), dir.path()).unwrap();
-    let instances = InstanceRepository::encrypted(reopened.clone(), dir.path()).unwrap();
+    let reopened = sqlite::connect(dir.path()).await?;
+    let placements = PlacementRepository::encrypted(reopened.clone(), dir.path())?;
+    let instances = InstanceRepository::encrypted(reopened.clone(), dir.path())?;
     for runtime in runtimes {
-        let stored = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+        let stored = placements
+            .get(&runtime.runtime_id)
+            .await?
+            .context("get should provide a value")?;
         assert_eq!(stored.status, EngineRuntimeStatus::Running);
         assert_eq!(stored.reserved, runtime.reserved);
         assert_eq!(stored.admin_secret, runtime.admin_secret);
-        for id in placements.tenants(&runtime.runtime_id).await.unwrap() {
-            let tenant = instances.get(&id).await.unwrap().unwrap();
+        for id in placements.tenants(&runtime.runtime_id).await? {
+            let tenant = instances
+                .get(&id)
+                .await?
+                .context("get should provide a value")?;
             assert_eq!(tenant.owner, runtime.owner);
             assert_eq!(tenant.runtime_id, runtime.runtime_id);
             assert_eq!(tenant.tenant_password, Some(format!("secret-{id}")));
@@ -466,13 +500,17 @@ async fn parallel_pool_recovery_preserves_tenant_state() {
         }
     }
     reopened.close().await;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn empty_pool_survives_and_only_accepts_databases_when_running() {
+async fn empty_pool_survives_and_only_accepts_databases_when_running() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     use crate::server::metadata::DesiredInstanceState;
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let repository = PlacementRepository::new(pool);
     let mut runtime = shared_runtime("pool_starting", 4);
     let limits = tenant_limits();
@@ -483,8 +521,11 @@ async fn empty_pool_survives_and_only_accepts_databases_when_running() {
     ] {
         runtime.status = status;
         runtime.desired_state = desired;
-        repository.save(&runtime).await.unwrap();
-        let stored = repository.get(&runtime.runtime_id).await.unwrap().unwrap();
+        repository.save(&runtime).await?;
+        let stored = repository
+            .get(&runtime.runtime_id)
+            .await?
+            .context("get should provide a value")?;
         assert_eq!(stored.desired_state, desired);
         assert_eq!(stored.reserved.tenants, 0);
         assert!(
@@ -495,45 +536,47 @@ async fn empty_pool_survives_and_only_accepts_databases_when_running() {
         );
         assert!(
             repository
-                .server_pool(runtime.protocol, runtime.owner.as_ref().unwrap())
+                .server_pool(runtime.protocol, runtime.owner.as_ref().context("empty pool survives and only accepts databases when running should provide a value")?)
                 .await
-                .unwrap()
+                ?
                 .is_some()
         );
     }
     runtime.status = EngineRuntimeStatus::Running;
     runtime.desired_state = DesiredInstanceState::Running;
-    repository.save(&runtime).await.unwrap();
+    repository.save(&runtime).await?;
     repository
         .reserve(reservation(&runtime.runtime_id, "first", &limits))
-        .await
-        .unwrap();
-    repository.release("first").await.unwrap();
-    let stored = repository.get(&runtime.runtime_id).await.unwrap().unwrap();
+        .await?;
+    repository.release("first").await?;
+    let stored = repository
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(stored.reserved.tenants, 0);
     assert_eq!(stored.limits, runtime.limits);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn concurrent_resizes_recompute_exact_pool_totals() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn concurrent_resizes_recompute_exact_pool_totals() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let instances = InstanceRepository::new(pool);
     let runtime = shared_runtime("pool_resize_race", 4);
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
     let first = shared_instance("resize_a", &runtime.runtime_id, "db_a", "user_a", 15432);
     let second = shared_instance("resize_b", &runtime.runtime_id, "db_b", "user_b", 15433);
     for metadata in [&first, &second] {
         placements
             .reserve(metadata_reservation(&runtime.runtime_id, metadata))
-            .await
-            .unwrap();
-        placements
-            .mark_provisioned(&metadata.instance_id)
-            .await
-            .unwrap();
-        instances.upsert(metadata).await.unwrap();
+            .await?;
+        placements.mark_provisioned(&metadata.instance_id).await?;
+        instances.upsert(metadata).await?;
     }
 
     let mut first_limits = first.limits.clone();
@@ -550,10 +593,13 @@ async fn concurrent_resizes_recompute_exact_pool_totals() {
         left.resize(&first.instance_id, &first_limits),
         right.resize(&second.instance_id, &second_limits),
     );
-    left_result.unwrap();
-    right_result.unwrap();
+    left_result?;
+    right_result?;
 
-    let loaded = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+    let loaded = placements
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(loaded.reserved.tenants, 2);
 
     assert_eq!(loaded.reserved.disk_mib, 11264);
@@ -563,16 +609,20 @@ async fn concurrent_resizes_recompute_exact_pool_totals() {
     );
     assert_eq!(loaded.limits.memory_mib, runtime.limits.memory_mib);
     assert_eq!(loaded.limits.disk_mib, runtime.limits.disk_mib);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn resize_rejects_a_non_running_pool_without_mutating_capacity() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn resize_rejects_a_non_running_pool_without_mutating_capacity() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let instances = InstanceRepository::new(pool);
     let runtime = shared_runtime("pool_stopped_resize", 2);
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
     let metadata = shared_instance(
         "stopped_resize",
         &runtime.runtime_id,
@@ -582,17 +632,19 @@ async fn resize_rejects_a_non_running_pool_without_mutating_capacity() {
     );
     placements
         .reserve(metadata_reservation(&runtime.runtime_id, &metadata))
-        .await
-        .unwrap();
-    placements
-        .mark_provisioned(&metadata.instance_id)
-        .await
-        .unwrap();
-    instances.upsert(&metadata).await.unwrap();
-    let mut stopped = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+        .await?;
+    placements.mark_provisioned(&metadata.instance_id).await?;
+    instances.upsert(&metadata).await?;
+    let mut stopped = placements
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     stopped.status = EngineRuntimeStatus::Stopped;
-    placements.save(&stopped).await.unwrap();
-    let before = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+    placements.save(&stopped).await?;
+    let before = placements
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     let mut requested = metadata.limits.clone();
     requested.memory_mib += 1024;
 
@@ -600,34 +652,37 @@ async fn resize_rejects_a_non_running_pool_without_mutating_capacity() {
         placements
             .resize(&metadata.instance_id, &requested)
             .await
-            .unwrap_err(),
+            .expect_err("resize should return an error"),
         PlacementRepositoryError::CapacityUnavailable(_)
     ));
-    let after = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+    let after = placements
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(after.reserved, before.reserved);
     assert_eq!(after.limits, before.limits);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn instance_placement_matches_runtime_and_restricts_pool_delete() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn instance_placement_matches_runtime_and_restricts_pool_delete() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let instances = InstanceRepository::new(pool.clone());
     let runtime = shared_runtime("pool_attached", 2);
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
 
     let mut metadata = dedicated_instance("tenant_attached");
     metadata.owner = runtime.owner.clone();
-    instances.upsert(&metadata).await.unwrap();
+    instances.upsert(&metadata).await?;
     placements
         .reserve(metadata_reservation(&runtime.runtime_id, &metadata))
-        .await
-        .unwrap();
-    placements
-        .mark_provisioned(&metadata.instance_id)
-        .await
-        .unwrap();
+        .await?;
+    placements.mark_provisioned(&metadata.instance_id).await?;
     sqlx::query(
         r#"
         UPDATE instance_metadata
@@ -638,8 +693,7 @@ async fn instance_placement_matches_runtime_and_restricts_pool_delete() {
     .bind(&runtime.runtime_id)
     .bind(&metadata.instance_id)
     .execute(&pool)
-    .await
-    .unwrap();
+    .await?;
 
     let mismatch = sqlx::query(
         "UPDATE instance_metadata SET deployment_mode = 'dedicated' WHERE instance_id = ?1",
@@ -653,7 +707,7 @@ async fn instance_placement_matches_runtime_and_restricts_pool_delete() {
     metadata.deployment_mode = DeploymentMode::Shared;
     metadata.owner = runtime.owner.clone();
     metadata.runtime_id = runtime.runtime_id.clone();
-    instances.upsert(&metadata).await.unwrap();
+    instances.upsert(&metadata).await?;
 
     let rename_metadata = sqlx::query(
         "UPDATE instance_metadata SET database_name = 'other_db' WHERE instance_id = ?1",
@@ -678,31 +732,39 @@ async fn instance_placement_matches_runtime_and_restricts_pool_delete() {
 
     let mut larger = metadata.limits.clone();
     larger.memory_mib = 2048;
-    placements
-        .resize(&metadata.instance_id, &larger)
-        .await
-        .unwrap();
-    let resized = instances.get(&metadata.instance_id).await.unwrap().unwrap();
+    placements.resize(&metadata.instance_id, &larger).await?;
+    let resized = instances
+        .get(&metadata.instance_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(resized.limits.memory_mib, 2048);
-    let resized_runtime = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+    let resized_runtime = placements
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(resized_runtime.limits.memory_mib, runtime.limits.memory_mib);
-    assert!(instances.delete(&metadata.instance_id).await.unwrap());
-    let empty_runtime = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+    assert!(instances.delete(&metadata.instance_id).await?);
+    let empty_runtime = placements
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(empty_runtime.reserved, RuntimeReservation::default());
     assert_eq!(empty_runtime.limits.cpu_cores, runtime.limits.cpu_cores);
     assert_eq!(empty_runtime.limits.memory_mib, runtime.limits.memory_mib);
     assert_eq!(empty_runtime.limits.disk_mib, runtime.limits.disk_mib);
-    assert!(placements.delete(&runtime.runtime_id).await.unwrap());
+    assert!(placements.delete(&runtime.runtime_id).await?);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn shared_tenant_database_and_username_are_pool_unique() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn shared_tenant_database_and_username_are_pool_unique() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let instances = InstanceRepository::new(pool);
     let runtime = shared_runtime("pool_identity", 4);
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
 
     let first = shared_instance(
         "identity_a",
@@ -713,36 +775,30 @@ async fn shared_tenant_database_and_username_are_pool_unique() {
     );
     placements
         .check_tenant_identity(&runtime.runtime_id, "tenant_db", "tenant_user")
-        .await
-        .unwrap();
+        .await?;
     placements
         .reserve(metadata_reservation(&runtime.runtime_id, &first))
-        .await
-        .unwrap();
-    placements
-        .mark_provisioned(&first.instance_id)
-        .await
-        .unwrap();
-    instances.upsert(&first).await.unwrap();
+        .await?;
+    placements.mark_provisioned(&first.instance_id).await?;
+    instances.upsert(&first).await?;
 
     assert!(matches!(
         placements
             .check_tenant_identity(&runtime.runtime_id, "tenant_db", "other_user")
             .await
-            .unwrap_err(),
+            .expect_err("check tenant identity should return an error"),
         PlacementRepositoryError::DatabaseInUse { .. }
     ));
     assert!(matches!(
         placements
             .check_tenant_identity(&runtime.runtime_id, "other_db", "tenant_user")
             .await
-            .unwrap_err(),
+            .expect_err("check tenant identity should return an error"),
         PlacementRepositoryError::UsernameInUse { .. }
     ));
     placements
         .check_tenant_identity(&runtime.runtime_id, "other_db", "other_user")
-        .await
-        .unwrap();
+        .await?;
 
     let duplicate_database = shared_instance(
         "identity_b",
@@ -757,7 +813,7 @@ async fn shared_tenant_database_and_username_are_pool_unique() {
             &duplicate_database,
         ))
         .await
-        .unwrap_err();
+        .expect_err("metadata reservation should return an error");
     assert!(matches!(
         error,
         PlacementRepositoryError::DatabaseInUse { .. }
@@ -776,23 +832,25 @@ async fn shared_tenant_database_and_username_are_pool_unique() {
             &duplicate_username,
         ))
         .await
-        .unwrap_err();
+        .expect_err("metadata reservation should return an error");
     assert!(matches!(
         error,
         PlacementRepositoryError::UsernameInUse { .. }
     ));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn shared_route_identity_is_global_across_pools() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn shared_route_identity_is_global_across_pools() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let instances = InstanceRepository::new(pool);
     let first_runtime = shared_runtime("pool_route_a", 1);
     let second_runtime = shared_runtime("pool_route_b", 1);
-    placements.save(&first_runtime).await.unwrap();
-    placements.save(&second_runtime).await.unwrap();
+    placements.save(&first_runtime).await?;
+    placements.save(&second_runtime).await?;
 
     let first = shared_instance(
         "route_owner_a",
@@ -814,68 +872,73 @@ async fn shared_route_identity_is_global_across_pools() {
     for (runtime, metadata) in [(&first_runtime, &first), (&second_runtime, &second)] {
         placements
             .reserve(metadata_reservation(&runtime.runtime_id, metadata))
-            .await
-            .unwrap();
-        placements
-            .mark_provisioned(&metadata.instance_id)
-            .await
-            .unwrap();
+            .await?;
+        placements.mark_provisioned(&metadata.instance_id).await?;
     }
 
-    instances.upsert(&first).await.unwrap();
-    let error = instances.upsert(&second).await.unwrap_err();
+    instances.upsert(&first).await?;
+    let error = instances
+        .upsert(&second)
+        .await
+        .expect_err("upsert should return an error");
     assert!(matches!(
         error,
         crate::storage::repositories::RepositoryError::Sqlx(sqlx::Error::Database(source))
             if source.is_unique_violation()
     ));
-    assert!(instances.get(&first.instance_id).await.unwrap().is_some());
-    assert!(instances.get(&second.instance_id).await.unwrap().is_none());
+    assert!(instances.get(&first.instance_id).await?.is_some());
+    assert!(instances.get(&second.instance_id).await?.is_none());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn provisional_identity_is_durable_and_blocks_takeover() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn provisional_identity_is_durable_and_blocks_takeover() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool);
     let runtime = shared_runtime("pool_provisional", 4);
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
     let limits = tenant_limits();
     placements
         .reserve(ReserveTenant {
-            owner: runtime.owner.clone().unwrap(),
+            owner: runtime.owner.clone().context(
+                "provisional identity is durable and blocks takeover should provide a value",
+            )?,
             instance_id: "owner-a",
             runtime_id: &runtime.runtime_id,
             database: "durable_db",
             username: "durable_user",
             limits: &limits,
         })
-        .await
-        .unwrap();
+        .await?;
 
     let stored = placements
         .get_reservation("owner-a")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .context("get reservation should provide a value")?;
     assert_eq!(stored.database, "durable_db");
     assert_eq!(stored.username, "durable_user");
     assert_eq!(stored.state, TenantReservationState::Reserved);
     assert_eq!(
-        placements.reservations(&runtime.runtime_id).await.unwrap(),
+        placements.reservations(&runtime.runtime_id).await?,
         vec![stored]
     );
     assert!(matches!(
         placements
             .check_tenant_identity(&runtime.runtime_id, "durable_db", "other_user")
             .await
-            .unwrap_err(),
+            .expect_err("check tenant identity should return an error"),
         PlacementRepositoryError::DatabaseInUse { .. }
     ));
     assert!(matches!(
         placements
             .reserve(ReserveTenant {
-                owner: runtime.owner.clone().unwrap(),
+                owner: runtime.owner.clone().context(
+                    "provisional identity is durable and blocks takeover should provide a value"
+                )?,
                 instance_id: "owner-b",
                 runtime_id: &runtime.runtime_id,
                 database: "durable_db",
@@ -883,27 +946,29 @@ async fn provisional_identity_is_durable_and_blocks_takeover() {
                 limits: &limits,
             })
             .await
-            .unwrap_err(),
+            .expect_err("reserve should return an error"),
         PlacementRepositoryError::DatabaseInUse { .. }
     ));
 
-    placements.mark_provisioned("owner-a").await.unwrap();
-    let provisioned = placements.mark_provisioned("owner-a").await.unwrap();
+    placements.mark_provisioned("owner-a").await?;
+    let provisioned = placements.mark_provisioned("owner-a").await?;
     assert_eq!(provisioned.state, TenantReservationState::Provisioned);
     assert_eq!(
-        placements.reservations(&runtime.runtime_id).await.unwrap(),
+        placements.reservations(&runtime.runtime_id).await?,
         vec![provisioned]
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn shared_metadata_cannot_attach_until_provisioning_is_durable() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn shared_metadata_cannot_attach_until_provisioning_is_durable() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let instances = InstanceRepository::new(pool);
     let runtime = shared_runtime("pool_attach_stage", 2);
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
     let metadata = shared_instance(
         "staged-owner",
         &runtime.runtime_id,
@@ -913,40 +978,45 @@ async fn shared_metadata_cannot_attach_until_provisioning_is_durable() {
     );
     placements
         .reserve(metadata_reservation(&runtime.runtime_id, &metadata))
-        .await
-        .unwrap();
+        .await?;
 
-    let error = instances.upsert(&metadata).await.unwrap_err();
+    let error = instances
+        .upsert(&metadata)
+        .await
+        .expect_err("upsert should return an error");
     assert!(error.to_string().contains("exact runtime reservation"));
 
-    placements
-        .mark_provisioned(&metadata.instance_id)
-        .await
-        .unwrap();
-    instances.upsert(&metadata).await.unwrap();
+    placements.mark_provisioned(&metadata.instance_id).await?;
+    instances.upsert(&metadata).await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn orphan_scan_excludes_attached_tenants_and_active_migrations() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn orphan_scan_excludes_attached_tenants_and_active_migrations() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let instances = InstanceRepository::new(pool.clone());
     let runtime = shared_runtime("pool_orphans", 5);
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
     let limits = tenant_limits();
 
     placements
         .reserve(ReserveTenant {
-            owner: runtime.owner.clone().unwrap(),
+            owner: runtime
+                .owner
+                .clone()
+                .context("expected a value from clone")?,
             instance_id: "plain-orphan",
             runtime_id: &runtime.runtime_id,
             database: "plain_db",
             username: "plain_user",
             limits: &limits,
         })
-        .await
-        .unwrap();
+        .await?;
 
     let attached = shared_instance(
         "attached-owner",
@@ -957,27 +1027,25 @@ async fn orphan_scan_excludes_attached_tenants_and_active_migrations() {
     );
     placements
         .reserve(metadata_reservation(&runtime.runtime_id, &attached))
-        .await
-        .unwrap();
-    placements
-        .mark_provisioned(&attached.instance_id)
-        .await
-        .unwrap();
-    instances.upsert(&attached).await.unwrap();
+        .await?;
+    placements.mark_provisioned(&attached.instance_id).await?;
+    instances.upsert(&attached).await?;
 
     let migration_id = "11111111-2222-4333-8444-555555555555";
     let temp_id = "migration_11111111222243338444555555555555";
     placements
         .reserve(ReserveTenant {
-            owner: runtime.owner.clone().unwrap(),
+            owner: runtime
+                .owner
+                .clone()
+                .context("expected a value from clone")?,
             instance_id: temp_id,
             runtime_id: &runtime.runtime_id,
             database: "migration_db",
             username: "migration_user",
             limits: &limits,
         })
-        .await
-        .unwrap();
+        .await?;
     sqlx::query(
         r#"
         INSERT INTO deployment_migrations (
@@ -992,33 +1060,28 @@ async fn orphan_scan_excludes_attached_tenants_and_active_migrations() {
     .bind(migration_id)
     .bind("2026-08-27T00:00:00Z")
     .execute(&pool)
-    .await
-    .unwrap();
+    .await?;
 
-    let orphans = placements.list_orphans().await.unwrap();
+    let orphans = placements.list_orphans().await?;
     assert_eq!(orphans.len(), 1);
     assert_eq!(orphans[0].instance_id, "plain-orphan");
-    assert!(
-        placements
-            .get_orphan("attached-owner")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(placements.get_orphan(temp_id).await.unwrap().is_none());
+    assert!(placements.get_orphan("attached-owner").await?.is_none());
+    assert!(placements.get_orphan(temp_id).await?.is_none());
     assert!(
         placements
             .get_orphan("plain-orphan' OR 1=1 --")
-            .await
-            .unwrap()
+            .await?
             .is_none()
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn database_rejects_unsupported_shared_protocol_even_without_model_validation() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn database_rejects_unsupported_shared_protocol_even_without_model_validation()
+-> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let error = sqlx::query(
         r#"
         INSERT INTO engine_runtimes (
@@ -1038,17 +1101,18 @@ async fn database_rejects_unsupported_shared_protocol_even_without_model_validat
     .execute(&pool)
     .await;
     assert!(error.is_err());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn database_rejects_reservations_on_dedicated_runtimes() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn database_rejects_reservations_on_dedicated_runtimes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let instances = InstanceRepository::new(pool.clone());
     instances
         .upsert(&dedicated_instance("dedicated_reservation"))
-        .await
-        .unwrap();
+        .await?;
 
     let error = sqlx::query(
         r#"
@@ -1065,27 +1129,30 @@ async fn database_rejects_reservations_on_dedicated_runtimes() {
     )
     .execute(&pool)
     .await
-    .unwrap_err();
+    .expect_err("execute should return an error");
     assert!(
         error.to_string().contains("reservation") || error.to_string().contains("shared runtime")
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn orphan_reservation_keeps_its_pool_identity_immutable() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn orphan_reservation_keeps_its_pool_identity_immutable() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let runtime = shared_runtime("pool_orphan_identity", 1);
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
     placements
         .reserve(reservation(
             &runtime.runtime_id,
             "orphan-owner",
             &tenant_limits(),
         ))
-        .await
-        .unwrap();
+        .await?;
 
     // Reservations intentionally exist before instance metadata while a
     // tenant is being provisioned. That crash-safe window must not permit the
@@ -1099,60 +1166,65 @@ async fn orphan_reservation_keeps_its_pool_identity_immutable() {
             .bind(&runtime.runtime_id)
             .execute(&pool)
             .await
-            .unwrap_err();
+            .expect_err("execute should return an error");
         assert!(error.to_string().contains("immutable"));
     }
 
     let stored = placements
         .get_reservation("orphan-owner")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .context("get reservation should provide a value")?;
     assert_eq!(stored.runtime_id, runtime.runtime_id);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn server_pool_identity_survives_full_and_failed_states() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn server_pool_identity_survives_full_and_failed_states() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     let repository = PlacementRepository::new(pool);
     let mut runtime = shared_runtime("server-a", 1);
-    let owner = runtime.owner.clone().unwrap();
-    repository.save(&runtime).await.unwrap();
+    let owner = runtime
+        .owner
+        .clone()
+        .context("expected a value from clone")?;
+    repository.save(&runtime).await?;
     repository
         .reserve(reservation(
             &runtime.runtime_id,
             "tenant_a",
             &tenant_limits(),
         ))
-        .await
-        .unwrap();
+        .await?;
     assert_eq!(
         repository
             .server_pool(Protocol::Postgres, &owner)
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("server pool should provide a value")?
             .runtime_id,
         runtime.runtime_id
     );
-    runtime = repository.get(&runtime.runtime_id).await.unwrap().unwrap();
+    runtime = repository
+        .get(&runtime.runtime_id)
+        .await?
+        .context("get should provide a value")?;
     runtime.status = EngineRuntimeStatus::Failed;
-    repository.save(&runtime).await.unwrap();
+    repository.save(&runtime).await?;
     assert_eq!(
         repository
             .server_pool(Protocol::Postgres, &owner)
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("server pool should provide a value")?
             .status,
         EngineRuntimeStatus::Failed
     );
     assert!(
         repository
             .server_pool(Protocol::Mysql, &owner)
-            .await
-            .unwrap()
+            .await?
             .is_none()
     );
     assert!(
@@ -1161,13 +1233,14 @@ async fn server_pool_identity_survives_full_and_failed_states() {
                 Protocol::Postgres,
                 &crate::server::placement::test_support::owner("server-b")
             )
-            .await
-            .unwrap()
+            .await?
             .is_none()
     );
     let mut duplicate = shared_runtime("different-id", 1);
     duplicate.owner = Some(owner);
     assert!(repository.save(&duplicate).await.is_err());
+
+    Ok(())
 }
 
 fn shared_runtime(runtime_id: &str, max_tenants: u32) -> EngineRuntime {

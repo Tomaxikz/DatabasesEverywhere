@@ -38,7 +38,10 @@ fn only_an_intentional_observed_stop_is_an_expected_backup_skip() {
 }
 
 #[test]
-fn backup_pass_separates_expected_skips_from_errors_and_reports_partial_failure() {
+fn backup_pass_separates_expected_skips_from_errors_and_reports_partial_failure()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let mut metadata = crate::server::test_support::metadata("tenant", Protocol::Postgres);
     metadata.status = InstanceStatus::Stopped;
     metadata.desired_state = DesiredInstanceState::Stopped;
@@ -47,7 +50,8 @@ fn backup_pass_separates_expected_skips_from_errors_and_reports_partial_failure(
     response.record(
         &metadata,
         Ok(BackupAttempt::Skipped(
-            intentionally_stopped_backup(&metadata).unwrap(),
+            intentionally_stopped_backup(&metadata)
+                .context("expected a value from intentionally_stopped_backup")?,
         )),
     );
     assert_eq!(response.status(), "completed_with_skips");
@@ -82,7 +86,7 @@ fn backup_pass_separates_expected_skips_from_errors_and_reports_partial_failure(
     assert_eq!(response.backups.len(), 1);
     assert_eq!(response.skipped.len(), 1);
     assert_eq!(response.failed.len(), 5);
-    let value = serde_json::to_value(&response).unwrap();
+    let value = serde_json::to_value(&response)?;
     assert_eq!(
         value["skipped"][0]["reason"]["code"],
         "intentionally_stopped"
@@ -91,10 +95,14 @@ fn backup_pass_separates_expected_skips_from_errors_and_reports_partial_failure(
     assert_eq!(value["failed"][4]["reason"]["code"], "internal_error");
     assert!(value["failed"][4]["reason"]["error_id"].is_string());
     assert!(!value.to_string().contains("private-storage-detail"));
+
+    Ok(())
 }
 
 #[test]
-fn catalog_selection_is_bounded_and_object_scoped() {
+fn catalog_selection_is_bounded_and_object_scoped() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let catalog = BackupCatalog {
         schema_version: crate::server::backup::catalog::BACKUP_CATALOG_SCHEMA_VERSION,
         backup_id: "one.physical.tar.gz".to_string(),
@@ -122,19 +130,20 @@ fn catalog_selection_is_bounded_and_object_scoped() {
         }],
     };
 
-    let selection = select_catalog_object(&catalog, Some("public.users"), 1, 1)
-        .unwrap()
-        .unwrap();
+    let selection = select_catalog_object(&catalog, Some("public.users"), 1, 1)?
+        .context("select catalog object should provide a value")?;
     assert_eq!(selection.returned, 1);
     assert_eq!(selection.rows[0]["id"], 2);
     assert!(selection.truncated);
     assert_eq!(selection.columns[0].name, "id");
-    let objects = backup_objects(&catalog, true).unwrap();
-    let json = serde_json::to_value(&objects).unwrap();
+    let objects = backup_objects(&catalog, true).context("expected a value from backup_objects")?;
+    let json = serde_json::to_value(&objects)?;
     assert_eq!(json[0]["column_count"], 1);
     assert!(json[0].get("columns").is_none());
     assert!(backup_objects(&catalog, false).is_none());
     assert!(select_catalog_object(&catalog, Some("foreign.table"), 0, 1).is_err());
+
+    Ok(())
 }
 
 #[test]
@@ -158,15 +167,17 @@ fn logical_restore_cost_does_not_expand_to_the_tenant_disk_limit() {
 }
 
 #[test]
-fn logical_restore_reserves_the_source_pin_and_both_rollback_copies() {
+fn logical_restore_reserves_the_source_pin_and_both_rollback_copies() -> anyhow::Result<()> {
     assert_eq!(
-        crate::subsystems::import_export::logical::shared_restore_staging_bytes(7, 11).unwrap(),
+        crate::subsystems::import_export::logical::shared_restore_staging_bytes(7, 11)?,
         29
     );
     assert!(
         crate::subsystems::import_export::logical::shared_restore_staging_bytes(1, u64::MAX)
             .is_err()
     );
+
+    Ok(())
 }
 
 #[test]
@@ -184,7 +195,8 @@ fn backup_layout_is_bound_to_the_current_deployment_mode() {
         ),
     ] {
         assert!(check_backup_layout("current", compatible, mode).is_ok());
-        let error = check_backup_layout("stale", stale, mode).unwrap_err();
+        let error = check_backup_layout("stale", stale, mode)
+            .expect_err("check backup layout should return an error");
         assert_eq!(error.status(), http::StatusCode::CONFLICT);
     }
 }

@@ -128,14 +128,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn innodb_only_instances_pass_and_others_are_unsupported() {
-        let inventory = parse_report("version=8.4.6\nnon_innodb_tables=0\n").unwrap();
+    fn innodb_only_instances_pass_and_others_are_unsupported() -> anyhow::Result<()> {
+        let inventory =
+            parse_report("version=8.4.6\nnon_innodb_tables=0\n").map_err(anyhow::Error::msg)?;
         assert_eq!(inventory.version, "8.4.6");
-        inventory.decide().unwrap();
-        let mixed = parse_report("version=8.4.6\nnon_innodb_tables=2\n").unwrap();
+        inventory.decide()?;
+        let mixed =
+            parse_report("version=8.4.6\nnon_innodb_tables=2\n").map_err(anyhow::Error::msg)?;
         assert!(matches!(mixed.decide(), Err(StrategyError::Unsupported(_))));
         assert!(parse_report("version=8.4.6\n").is_err());
         assert!(parse_report("version=8.4.6\nnon_innodb_tables=x\n").is_err());
+
+        Ok(())
     }
 
     #[test]

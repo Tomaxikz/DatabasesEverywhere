@@ -37,7 +37,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn same_instance_operations_are_serialized() {
+    async fn same_instance_operations_are_serialized() -> anyhow::Result<()> {
         let locks = InstanceLocks::default();
         let first = locks.lock("inst_one").await;
         let contender = tokio::spawn({
@@ -48,16 +48,18 @@ mod tests {
         assert!(!contender.is_finished());
 
         drop(first);
-        contender.await.unwrap();
+        contender.await?;
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn different_instances_can_run_concurrently() {
+    async fn different_instances_can_run_concurrently() -> anyhow::Result<()> {
         let locks = InstanceLocks::default();
         let _first = locks.lock("inst_one").await;
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), locks.lock("inst_two"))
-            .await
-            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), locks.lock("inst_two")).await?;
+
+        Ok(())
     }
 }

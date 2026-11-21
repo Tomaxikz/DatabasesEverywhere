@@ -40,12 +40,16 @@ fn artifact_names_reject_path_traversal_and_controls() {
 }
 
 #[test]
-fn download_admission_normalizes_peers_and_releases_capacity() {
+fn download_admission_normalizes_peers_and_releases_capacity() -> anyhow::Result<()> {
     let tickets = ArtifactDownloadTickets::default();
-    let peer = Some("192.0.2.10:5000".parse().unwrap());
-    let mapped = Some("[::ffff:192.0.2.10]:5000".parse().unwrap());
+    let peer = Some("192.0.2.10:5000".parse()?);
+    let mapped = Some("[::ffff:192.0.2.10]:5000".parse()?);
     let permits = (0..MAX_ACTIVE_DOWNLOADS_PER_PEER)
-        .map(|_| tickets.admit_download(peer).unwrap())
+        .map(|_| {
+            tickets
+                .admit_download(peer)
+                .expect("admit download should succeed")
+        })
         .collect::<Vec<_>>();
 
     assert!(matches!(
@@ -54,47 +58,51 @@ fn download_admission_normalizes_peers_and_releases_capacity() {
     ));
     assert!(
         tickets
-            .admit_download(Some("192.0.2.11:5000".parse().unwrap()))
+            .admit_download(Some("192.0.2.11:5000".parse()?))
             .is_ok()
     );
     drop(permits);
     assert!(tickets.admit_download(mapped).is_ok());
+
+    Ok(())
 }
 
 #[test]
-fn download_streams_are_bounded_node_wide() {
+fn download_streams_are_bounded_node_wide() -> anyhow::Result<()> {
     let tickets = ArtifactDownloadTickets::default();
     let permits = (0..MAX_ACTIVE_DOWNLOADS)
         .map(|index| {
-            let third = u8::try_from(index / 256).unwrap();
-            let fourth = u8::try_from(index % 256).unwrap();
+            let third = u8::try_from(index / 256).expect("try from should succeed");
+            let fourth = u8::try_from(index % 256).expect("try from should succeed");
             tickets
                 .admit_download(Some(SocketAddr::from(([198, 18, third, fourth], 5000))))
-                .unwrap()
+                .expect("admit download should succeed")
         })
         .collect::<Vec<_>>();
 
     assert!(matches!(
-        tickets.admit_download(Some("203.0.113.10:5000".parse().unwrap())),
+        tickets.admit_download(Some("203.0.113.10:5000".parse()?)),
         Err(ApiError::RateLimited)
     ));
     drop(permits);
     assert!(
         tickets
-            .admit_download(Some("203.0.113.10:5000".parse().unwrap()))
+            .admit_download(Some("203.0.113.10:5000".parse()?))
             .is_ok()
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn temporary_download_url_is_single_use_and_path_scoped() {
+async fn temporary_download_url_is_single_use_and_path_scoped() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let state = test_state().await;
     let artifact_name = "inst_abc.postgres.sql.gz";
     let artifact = instance_export_root(&state, "inst_abc").join(artifact_name);
-    tokio::fs::create_dir_all(artifact.parent().unwrap())
-        .await
-        .unwrap();
-    tokio::fs::write(&artifact, b"dump").await.unwrap();
+    tokio::fs::create_dir_all(artifact.parent().context("expected a value from parent")?).await?;
+    tokio::fs::write(&artifact, b"dump").await?;
     state.instances.upsert(sample_metadata("inst_abc")).await;
 
     let ticket = create_download_url(
@@ -107,11 +115,10 @@ async fn temporary_download_url_is_single_use_and_path_scoped() {
         },
         DownloadKind::Artifact,
     )
-    .await
-    .unwrap()
+    .await?
     .into_body();
-    let public_ticket = serde_json::to_value(&ticket).unwrap();
-    let fields = public_ticket.as_object().unwrap();
+    let public_ticket = serde_json::to_value(&ticket)?;
+    let fields = public_ticket.as_object().context("expected an object")?;
     assert_eq!(fields.len(), 3);
     assert!(fields.contains_key("url"));
     assert!(fields.contains_key("expires_at_unix"));
@@ -136,7 +143,7 @@ async fn temporary_download_url_is_single_use_and_path_scoped() {
         None,
     )
     .await
-    .unwrap_err();
+    .expect_err("download should return an error");
     assert!(matches!(mismatch, ApiError::Unauthorized));
 
     download(
@@ -147,8 +154,7 @@ async fn temporary_download_url_is_single_use_and_path_scoped() {
         DownloadKind::Artifact,
         None,
     )
-    .await
-    .unwrap();
+    .await?;
     let error = download(
         &state,
         &token,
@@ -158,12 +164,14 @@ async fn temporary_download_url_is_single_use_and_path_scoped() {
         None,
     )
     .await
-    .unwrap_err();
+    .expect_err("download should return an error");
     assert!(matches!(error, ApiError::Unauthorized));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn temporary_download_url_rejects_expired_token_without_leeway() {
+async fn temporary_download_url_rejects_expired_token_without_leeway() -> anyhow::Result<()> {
     let state = test_state().await;
     let now = now_unix();
     let claims = DownloadClaims {
@@ -183,24 +191,26 @@ async fn temporary_download_url_rejects_expired_token_without_leeway() {
     let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(state.config.websocket_jwt_secret()).unwrap(),
-    )
-    .unwrap();
+        &EncodingKey::from_secret(state.config.websocket_jwt_secret())?,
+    )?;
 
-    let error = validate_download_token(&state, &token).unwrap_err();
+    let error = validate_download_token(&state, &token)
+        .expect_err("validate download token should return an error");
 
     assert!(matches!(error, ApiError::Unauthorized));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn artifact_must_belong_to_requested_instance() {
+async fn artifact_must_belong_to_requested_instance() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let state = test_state().await;
     let artifact_name = "inst_abc.postgres.sql.gz";
     let artifact = instance_export_root(&state, "inst_other").join(artifact_name);
-    tokio::fs::create_dir_all(artifact.parent().unwrap())
-        .await
-        .unwrap();
-    tokio::fs::write(&artifact, b"dump").await.unwrap();
+    tokio::fs::create_dir_all(artifact.parent().context("expected a value from parent")?).await?;
+    tokio::fs::write(&artifact, b"dump").await?;
     state.instances.upsert(sample_metadata("inst_abc")).await;
     state.instances.upsert(sample_metadata("inst_other")).await;
 
@@ -215,26 +225,28 @@ async fn artifact_must_belong_to_requested_instance() {
         DownloadKind::Artifact,
     )
     .await
-    .unwrap_err();
+    .expect_err("create download url should return an error");
 
     assert!(matches!(error, ApiError::NotFound));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn one_use_export_is_hidden_forced_single_use_and_deleted_with_stream() {
+async fn one_use_export_is_hidden_forced_single_use_and_deleted_with_stream() -> anyhow::Result<()>
+{
+    use anyhow::Context as _;
+
     let state = test_state_with_policy(true, 20).await;
     let artifact_name = "one-use.mongodb.archive.gz";
     let artifact = instance_spool_root(&state, "inst_abc").join(artifact_name);
-    tokio::fs::create_dir_all(artifact.parent().unwrap())
-        .await
-        .unwrap();
-    tokio::fs::write(&artifact, b"dump").await.unwrap();
+    tokio::fs::create_dir_all(artifact.parent().context("expected a value from parent")?).await?;
+    tokio::fs::write(&artifact, b"dump").await?;
     state.instances.upsert(sample_metadata("inst_abc")).await;
 
     assert!(
         read_instance_artifacts(&state, "inst_abc")
-            .await
-            .unwrap()
+            .await?
             .is_empty()
     );
     let ticket = create_download_url(
@@ -247,11 +259,14 @@ async fn one_use_export_is_hidden_forced_single_use_and_deleted_with_stream() {
         },
         DownloadKind::Artifact,
     )
-    .await
-    .unwrap()
+    .await?
     .into_body();
     assert!(ticket.single_use);
-    let token = ticket.url.split_once("token=").unwrap().1;
+    let token = ticket
+        .url
+        .split_once("token=")
+        .context("expected a value from split_once")?
+        .1;
     let response = download(
         &state,
         token,
@@ -260,45 +275,49 @@ async fn one_use_export_is_hidden_forced_single_use_and_deleted_with_stream() {
         DownloadKind::Artifact,
         None,
     )
-    .await
-    .unwrap();
+    .await?;
     assert!(artifact.exists());
     drop(response);
     assert!(!artifact.exists());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn per_instance_artifact_limit_counts_retained_and_one_use_outputs() {
+async fn per_instance_artifact_limit_counts_retained_and_one_use_outputs() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let state = test_state_with_policy(false, 2).await;
     for path in [
         instance_export_root(&state, "inst_abc").join("retained.sql"),
         instance_spool_root(&state, "inst_abc").join("pending.sql"),
     ] {
-        tokio::fs::create_dir_all(path.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(path, b"dump").await.unwrap();
+        tokio::fs::create_dir_all(path.parent().context("expected a value from parent")?).await?;
+        tokio::fs::write(path, b"dump").await?;
     }
 
-    let error = check_export_slot(&state, "inst_abc").await.unwrap_err();
+    let error = check_export_slot(&state, "inst_abc")
+        .await
+        .expect_err("check export slot should return an error");
     assert!(matches!(error, ApiError::Conflict(_)));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn one_use_sweeper_removes_expired_output_but_preserves_active_export() {
+async fn one_use_sweeper_removes_expired_output_but_preserves_active_export() -> anyhow::Result<()>
+{
     let state = test_state_with_policy(true, 20).await;
     let root = instance_spool_root(&state, "inst_abc");
-    tokio::fs::create_dir_all(&root).await.unwrap();
+    tokio::fs::create_dir_all(&root).await?;
     let stale = root.join("stale.sql");
     let active = root.join("active.sql");
     for path in [&stale, &active] {
-        std::fs::write(path, b"dump").unwrap();
+        std::fs::write(path, b"dump")?;
         std::fs::OpenOptions::new()
             .write(true)
-            .open(path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
-            .unwrap();
+            .open(path)?
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))?;
     }
     state
         .import_export_jobs
@@ -313,27 +332,30 @@ async fn one_use_sweeper_removes_expired_output_but_preserves_active_export() {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         })
-        .await
-        .unwrap();
+        .await?;
 
-    assert_eq!(sweep_one_use_exports(&state).await.unwrap(), 1);
+    assert_eq!(sweep_one_use_exports(&state).await?, 1);
     assert!(!stale.exists());
     assert!(active.exists());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn verified_artifact_path_rejects_symlinks() {
+async fn verified_artifact_path_rejects_symlinks() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let state = test_state().await;
     let artifact = instance_export_root(&state, "inst_abc").join("link.sql");
-    tokio::fs::create_dir_all(artifact.parent().unwrap())
-        .await
-        .unwrap();
-    std::os::unix::fs::symlink("/etc/passwd", &artifact).unwrap();
+    tokio::fs::create_dir_all(artifact.parent().context("expected a value from parent")?).await?;
+    std::os::unix::fs::symlink("/etc/passwd", &artifact)?;
 
     let error = verified_artifact_path(&state, "link.sql", "inst_abc")
         .await
-        .unwrap_err();
+        .expect_err("verified artifact path should return an error");
     assert!(matches!(error, ApiError::BadRequest(_)));
+
+    Ok(())
 }
 
 async fn test_state() -> AppState {
@@ -344,8 +366,8 @@ async fn test_state_with_policy(
     stream_exports_only: bool,
     max_artifacts_per_instance: usize,
 ) -> AppState {
-    let dir = tempfile::tempdir().unwrap().keep();
-    let pool = sqlite::connect(&dir).await.unwrap();
+    let dir = tempfile::tempdir().expect("tempdir should succeed").keep();
+    let pool = sqlite::connect(&dir).await.expect("connect should succeed");
     let store = InstanceStore::default();
     let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool.clone()));
     let config = Config {

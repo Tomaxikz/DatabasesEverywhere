@@ -49,11 +49,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instance_id_policy_rejects_paths_and_sanitizes_safe_suffixes() {
-        let error = validate_instance_id("../root").unwrap_err();
+    fn instance_id_policy_rejects_paths_and_sanitizes_safe_suffixes() -> anyhow::Result<()> {
+        let error = validate_instance_id("../root")
+            .expect_err("validate instance id should return an error");
 
         assert!(matches!(error, IdError::Unsafe { .. }));
-        assert_eq!(sanitize_docker_suffix("inst_abc").unwrap(), "inst-abc");
+        assert_eq!(sanitize_docker_suffix("inst_abc")?, "inst-abc");
+
+        Ok(())
     }
 
     #[test]

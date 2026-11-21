@@ -430,17 +430,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn postgres_schema_parser_groups_columns_by_object() {
+    fn postgres_schema_parser_groups_columns_by_object() -> anyhow::Result<()> {
         let output = "7075626c6963|7573657273|r|12|1|6964|626967696e74|NO\n7075626c6963|7573657273|r|12|2|6e616d65|74657874|YES\n";
-        let objects = parse_postgres_schema(output).unwrap();
+        let objects = parse_postgres_schema(output).map_err(anyhow::Error::msg)?;
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].id, "public.users");
         assert_eq!(objects[0].columns.len(), 2);
         assert_eq!(objects[0].estimated_rows, Some(12));
+
+        Ok(())
     }
 
     #[test]
-    fn bounded_catalog_drops_previews_before_schema() {
+    fn bounded_catalog_drops_previews_before_schema() -> anyhow::Result<()> {
         let mut catalog = BackupCatalog {
             schema_version: BACKUP_CATALOG_SCHEMA_VERSION,
             backup_id: "one.physical.tar.gz".to_string(),
@@ -467,11 +469,13 @@ mod tests {
                 preview_truncated: false,
             }],
         };
-        let bytes = catalog.clone().encode_bounded(700).unwrap();
-        catalog = serde_json::from_slice(&bytes).unwrap();
+        let bytes = catalog.clone().encode_bounded(700)?;
+        catalog = serde_json::from_slice(&bytes)?;
         assert_eq!(catalog.objects.len(), 1);
         assert!(catalog.objects[0].preview_rows.is_empty());
         assert!(catalog.truncated);
+
+        Ok(())
     }
 
     #[test]

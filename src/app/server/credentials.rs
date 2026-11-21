@@ -166,8 +166,8 @@ mod tests {
     }
 
     #[test]
-    fn postgres_export_uses_the_current_protected_tenant_credential() {
-        let environment = logical_export_env(&metadata(Protocol::Postgres)).unwrap();
+    fn postgres_export_uses_the_current_protected_tenant_credential() -> anyhow::Result<()> {
+        let environment = logical_export_env(&metadata(Protocol::Postgres))?;
         let values = environment.references();
 
         assert_eq!(values[0].0, "DBE_POSTGRES_USER");
@@ -176,17 +176,21 @@ mod tests {
         assert_eq!(values[1].1.expose_secret(), "latest-tenant");
         assert_eq!(values[2].0, "POSTGRES_DB");
         assert_eq!(values[2].1.expose_secret(), "database");
+
+        Ok(())
     }
 
     #[test]
-    fn mysql_root_and_tenant_paths_use_different_current_credentials() {
-        let export = logical_export_env(&metadata(Protocol::Mysql)).unwrap();
+    fn mysql_root_and_tenant_paths_use_different_current_credentials() -> anyhow::Result<()> {
+        let export = logical_export_env(&metadata(Protocol::Mysql))?;
         assert_eq!(export.references()[0].0, "MYSQL_ROOT_PASSWORD");
         assert_eq!(export.references()[0].1.expose_secret(), "mysql-root");
 
-        let import = logical_import_env(&metadata(Protocol::Mysql), false).unwrap();
+        let import = logical_import_env(&metadata(Protocol::Mysql), false)?;
         assert_eq!(import.references()[1].0, "DBE_IMPORT_PASSWORD");
         assert_eq!(import.references()[1].1.expose_secret(), "latest-tenant");
+
+        Ok(())
     }
 
     #[test]
@@ -194,16 +198,18 @@ mod tests {
         let mut metadata = metadata(Protocol::Postgres);
         metadata.tenant_password = None;
 
-        let error = logical_export_env(&metadata).unwrap_err().to_string();
+        let error = logical_export_env(&metadata)
+            .expect_err("logical export env should return an error")
+            .to_string();
         assert!(error.contains("current encrypted tenant password is missing"));
     }
 
     #[test]
-    fn shared_mysql_and_mongodb_maintenance_uses_only_tenant_secrets() {
+    fn shared_mysql_and_mongodb_maintenance_uses_only_tenant_secrets() -> anyhow::Result<()> {
         let mut mysql = metadata(Protocol::Mysql);
         mysql.deployment_mode = DeploymentMode::Shared;
         mysql.runtime_id = "pool_mysql".to_string();
-        let mysql_export = logical_export_env(&mysql).unwrap();
+        let mysql_export = logical_export_env(&mysql)?;
         assert_eq!(mysql_export.references()[0].0, "MYSQL_USER");
         assert_eq!(mysql_export.references()[1].0, "DBE_MYSQL_PASSWORD");
         assert_eq!(mysql_export.references()[2].0, "MYSQL_DATABASE");
@@ -219,7 +225,7 @@ mod tests {
         let mut mongo = metadata(Protocol::Mongodb);
         mongo.deployment_mode = DeploymentMode::Shared;
         mongo.runtime_id = "pool_mongodb".to_string();
-        let mongo_import = logical_import_env(&mongo, false).unwrap();
+        let mongo_import = logical_import_env(&mongo, false)?;
         assert_eq!(mongo_import.references()[0].0, "DBE_MONGO_USER");
         assert_eq!(mongo_import.references()[1].0, "DBE_MONGO_PASSWORD");
         assert_eq!(mongo_import.references()[2].0, "DBE_MONGO_DATABASE");
@@ -230,10 +236,12 @@ mod tests {
                 .iter()
                 .all(|(name, _)| !name.contains("ROOT"))
         );
+
+        Ok(())
     }
 
     #[test]
-    fn every_shared_logical_environment_targets_the_tenant_database() {
+    fn every_shared_logical_environment_targets_the_tenant_database() -> anyhow::Result<()> {
         for (protocol, key) in [
             (Protocol::Postgres, "POSTGRES_DB"),
             (Protocol::Mariadb, "MARIADB_DATABASE"),
@@ -246,8 +254,8 @@ mod tests {
             metadata.runtime_id = format!("pool_{}", protocol.as_str());
 
             for environment in [
-                logical_export_env(&metadata).unwrap(),
-                logical_import_env(&metadata, false).unwrap(),
+                logical_export_env(&metadata)?,
+                logical_import_env(&metadata, false)?,
             ] {
                 let databases = environment
                     .references()
@@ -258,5 +266,7 @@ mod tests {
                 assert_eq!(databases[0].1.expose_secret(), "database");
             }
         }
+
+        Ok(())
     }
 }

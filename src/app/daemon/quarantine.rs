@@ -130,22 +130,23 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn inspection_cannot_write_metadata_or_create_a_missing_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let writer = crate::storage::sqlite::connect(dir.path()).await.unwrap();
+    async fn inspection_cannot_write_metadata_or_create_a_missing_database() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let writer = crate::storage::sqlite::connect(dir.path()).await?;
         let path = crate::storage::sqlite::database_path(dir.path());
-        let reader = open_history(&path).await.unwrap();
+        let reader = open_history(&path).await?;
         assert!(sqlx::query("INSERT INTO quarantine_events(entity_kind,entity_id,generation,code,recovery_class,source)
             VALUES ('pool','not-written','generation','unknown','manual_review','test')")
             .execute(&reader).await.is_err());
         assert!(
             crate::storage::quarantine::list(&writer, None, true, None, 100)
-                .await
-                .unwrap()
+                .await?
                 .is_empty()
         );
         let absent = dir.path().join("absent.sqlite");
         assert!(open_history(&absent).await.is_err());
         assert!(!absent.exists());
+
+        Ok(())
     }
 }

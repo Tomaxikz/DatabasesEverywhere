@@ -258,6 +258,7 @@ impl Write for RollingLog {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -290,7 +291,8 @@ mod tests {
     }
 
     #[test]
-    fn limiter_filters_both_outputs_after_env_filter_without_counting_probes() {
+    fn limiter_filters_both_outputs_after_env_filter_without_counting_probes() -> anyhow::Result<()>
+    {
         #[derive(Clone)]
         struct Capture(std::sync::Arc<Mutex<Vec<u8>>>);
 
@@ -342,17 +344,19 @@ mod tests {
         });
         let first = first.0.lock();
         assert_eq!(*first, *second.0.lock());
-        let output = std::str::from_utf8(&first).unwrap();
+        let output = std::str::from_utf8(&first)?;
         assert_eq!(output.lines().count(), 3);
         assert!(output.contains("allowed"));
         assert!(output.contains("warning"));
         assert!(output.contains("error"));
         assert!(!output.contains("suppressed"));
         assert!(!output.contains("filtered"));
+
+        Ok(())
     }
 
     #[test]
-    fn file_queue_stays_bounded_when_disk_writes_stall() {
+    fn file_queue_stays_bounded_when_disk_writes_stall() -> anyhow::Result<()> {
         use std::sync::{Arc, mpsc};
         struct StalledWriter {
             started: Option<mpsc::SyncSender<()>>,
@@ -380,22 +384,24 @@ mod tests {
             resume: paused,
             output: output.clone(),
         });
-        writer.write_all(b"first\n").unwrap();
+        writer.write_all(b"first\n")?;
         let ready = waiting.recv_timeout(std::time::Duration::from_secs(3));
         if ready.is_ok() {
             for _ in 0..=LOG_QUEUE_LINES {
-                writer.write_all(b"line\n").unwrap();
+                writer.write_all(b"line\n")?;
             }
         }
         let dropped = writer.error_counter().dropped_lines();
-        resume.send(()).unwrap();
+        resume.send(())?;
         drop(guard);
-        ready.unwrap();
+        ready?;
         assert_eq!(dropped, 1);
         assert_eq!(
             output.lock().len(),
             b"first\n".len() + LOG_QUEUE_LINES * b"line\n".len()
         );
+
+        Ok(())
     }
 
     fn contents(directory: &Path, max_bytes: u64) -> String {
@@ -411,24 +417,21 @@ mod tests {
                 let metadata = fs::metadata(&path).ok()?;
                 assert!(metadata.len() <= max_bytes);
                 assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-                Some(fs::read_to_string(path).unwrap())
+                Some(fs::read_to_string(path).expect("read to string should succeed"))
             })
             .collect()
     }
 
     #[test]
-    fn rotation_retains_latest_records_across_restarts() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("dbev.log.2026-09-04"), "old log").unwrap();
-        fs::write(directory.path().join("dbev.log.notes"), "notes").unwrap();
-        fs::create_dir(directory.path().join("instances")).unwrap();
+    fn rotation_retains_latest_records_across_restarts() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("dbev.log.2026-09-04"), "old log")?;
+        fs::write(directory.path().join("dbev.log.notes"), "notes")?;
+        fs::create_dir(directory.path().join("instances"))?;
         for batch in 0..3 {
-            let (mut writer, guard) =
-                log_queue().finish(RollingLog::new(directory.path(), 10).unwrap());
+            let (mut writer, guard) = log_queue().finish(RollingLog::new(directory.path(), 10)?);
             for record in batch * 4..batch * 4 + 4 {
-                writer
-                    .write_all(format!("line-{record:02}\n").as_bytes())
-                    .unwrap();
+                writer.write_all(format!("line-{record:02}\n").as_bytes())?;
             }
             drop(guard);
         }
@@ -437,124 +440,137 @@ mod tests {
             "line-07\nline-08\nline-09\nline-10\nline-11\n"
         );
         assert_eq!(
-            fs::read_to_string(directory.path().join("dbev.log.2026-09-04")).unwrap(),
+            fs::read_to_string(directory.path().join("dbev.log.2026-09-04"))?,
             "old log"
         );
         assert_eq!(
-            fs::read_to_string(directory.path().join("dbev.log.notes")).unwrap(),
+            fs::read_to_string(directory.path().join("dbev.log.notes"))?,
             "notes"
         );
         assert!(directory.path().join("instances").is_dir());
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 8);
+        assert_eq!(fs::read_dir(directory.path())?.count(), 8);
+
+        Ok(())
     }
 
     #[test]
-    fn oversized_records_and_full_files_stay_bounded() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut writer = RollingLog::new(directory.path(), 10).unwrap();
+    fn oversized_records_and_full_files_stay_bounded() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut writer = RollingLog::new(directory.path(), 10)?;
         let record = "1234567890".repeat(8) + "end";
-        writer.write_all(record.as_bytes()).unwrap();
-        writer.flush().unwrap();
+        writer.write_all(record.as_bytes())?;
+        writer.flush()?;
         assert_eq!(contents(directory.path(), 10), record[40..]);
-        writer.write_all(b"1234567").unwrap();
-        writer.flush().unwrap();
-        assert_eq!(fs::metadata(writer.path(0)).unwrap().len(), 10);
-        writer.write_all(b"").unwrap();
-        writer.write_all(b"next").unwrap();
-        writer.flush().unwrap();
-        assert_eq!(fs::read(writer.path(0)).unwrap(), b"next");
+        writer.write_all(b"1234567")?;
+        writer.flush()?;
+        assert_eq!(fs::metadata(writer.path(0))?.len(), 10);
+        writer.write_all(b"")?;
+        writer.write_all(b"next")?;
+        writer.flush()?;
+        assert_eq!(fs::read(writer.path(0))?, b"next");
+
+        Ok(())
     }
 
     #[test]
-    fn small_records_are_batched_and_the_write_buffer_stays_bounded() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut writer = RollingLog::new(directory.path(), LOG_BYTES).unwrap();
+    fn small_records_are_batched_and_the_write_buffer_stays_bounded() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut writer = RollingLog::new(directory.path(), LOG_BYTES)?;
         let record = b"one small log record\n";
         for _ in 0..1000 {
-            writer.write_all(record).unwrap();
+            writer.write_all(record)?;
         }
-        let file = writer.file.as_ref().unwrap();
-        assert_eq!(file.get_ref().metadata().unwrap().len(), 0);
+        let file = writer.file.as_ref().context(
+            "small records are batched and the write buffer stays bounded should provide a value",
+        )?;
+        assert_eq!(file.get_ref().metadata()?.len(), 0);
         assert_eq!(file.buffer().len(), record.len() * 1000);
 
         for _ in 1000..10_000 {
-            writer.write_all(record).unwrap();
-            assert!(writer.file.as_ref().unwrap().buffer().len() <= LOG_WRITE_BUFFER_BYTES);
+            writer.write_all(record)?;
+            assert!(writer.file.as_ref().context("small records are batched and the write buffer stays bounded should provide a value")?.buffer().len() <= LOG_WRITE_BUFFER_BYTES);
         }
         assert!(
             writer
                 .file
                 .as_ref()
-                .unwrap()
+                .context("small records are batched and the write buffer stays bounded should provide a value")?
                 .get_ref()
                 .metadata()
-                .unwrap()
+                ?
                 .len()
                 > 0
         );
-        writer.flush().unwrap();
-        assert_eq!(fs::read(writer.path(0)).unwrap(), record.repeat(10_000));
-        assert!(writer.file.as_ref().unwrap().buffer().is_empty());
+        writer.flush()?;
+        assert_eq!(fs::read(writer.path(0))?, record.repeat(10_000));
+        assert!(writer.file.as_ref().context("small records are batched and the write buffer stays bounded should provide a value")?.buffer().is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn idle_worker_flushes_without_waiting_for_guard_drop() {
-        let directory = tempfile::tempdir().unwrap();
+    fn idle_worker_flushes_without_waiting_for_guard_drop() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("dbev.log");
-        let (mut writer, guard) =
-            log_queue().finish(RollingLog::new(directory.path(), LOG_BYTES).unwrap());
-        writer.write_all(b"visible while idle\n").unwrap();
+        let (mut writer, guard) = log_queue().finish(RollingLog::new(directory.path(), LOG_BYTES)?);
+        writer.write_all(b"visible while idle\n")?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while fs::metadata(&path).unwrap().len() == 0 && std::time::Instant::now() < deadline {
+        while fs::metadata(&path)?.len() == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(fs::read(&path).unwrap(), b"visible while idle\n");
-        writer.write_all(b"last record before shutdown\n").unwrap();
+        assert_eq!(fs::read(&path)?, b"visible while idle\n");
+        writer.write_all(b"last record before shutdown\n")?;
         drop(guard);
         assert_eq!(
-            fs::read(path).unwrap(),
+            fs::read(path)?,
             b"visible while idle\nlast record before shutdown\n"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn flush_failure_does_not_rotate_or_discard_buffered_records() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut writer = RollingLog::new(directory.path(), 4).unwrap();
+    fn flush_failure_does_not_rotate_or_discard_buffered_records() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut writer = RollingLog::new(directory.path(), 4)?;
         // A read-only descriptor deterministically rejects the eventual flush.
         writer.file = Some(BufWriter::with_capacity(
             LOG_WRITE_BUFFER_BYTES,
-            File::open(writer.path(0)).unwrap(),
+            File::open(writer.path(0))?,
         ));
-        writer.write_all(b"full").unwrap();
+        writer.write_all(b"full")?;
         assert!(writer.write_all(b"next").is_err());
         assert_eq!(writer.bytes, 4);
-        assert_eq!(writer.file.as_ref().unwrap().buffer(), b"full");
+        assert_eq!(writer.file.as_ref().context("flush failure does not rotate or discard buffered records should provide a value")?.buffer(), b"full");
         assert!(!writer.path(1).exists());
+
+        Ok(())
     }
 
     #[test]
-    fn rotation_refuses_non_regular_or_linked_paths() {
+    fn rotation_refuses_non_regular_or_linked_paths() -> anyhow::Result<()> {
         for index in [0, LOG_ARCHIVES] {
             for kind in ["symlink", "hardlink", "directory"] {
-                let directory = tempfile::tempdir().unwrap();
-                let mut writer = RollingLog::new(directory.path(), 4).unwrap();
-                writer.write_all(b"full").unwrap();
+                let directory = tempfile::tempdir()?;
+                let mut writer = RollingLog::new(directory.path(), 4)?;
+                writer.write_all(b"full")?;
                 let target = directory.path().join("keep");
-                fs::write(&target, "unchanged").unwrap();
+                fs::write(&target, "unchanged")?;
                 let path = writer.path(index);
                 if path.exists() {
-                    fs::remove_file(&path).unwrap();
+                    fs::remove_file(&path)?;
                 }
                 match kind {
-                    "symlink" => std::os::unix::fs::symlink(&target, &path).unwrap(),
-                    "hardlink" => fs::hard_link(&target, &path).unwrap(),
-                    _ => fs::create_dir(&path).unwrap(),
+                    "symlink" => std::os::unix::fs::symlink(&target, &path)?,
+                    "hardlink" => fs::hard_link(&target, &path)?,
+                    _ => fs::create_dir(&path)?,
                 }
                 assert!(writer.write_all(b"next").is_err(), "{kind} at {index}");
                 assert!(RollingLog::new(directory.path(), 4).is_err());
-                assert_eq!(fs::read_to_string(target).unwrap(), "unchanged");
+                assert_eq!(fs::read_to_string(target)?, "unchanged");
             }
         }
+
+        Ok(())
     }
 }

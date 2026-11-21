@@ -279,6 +279,8 @@ impl Drop for TenantSession {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
     use super::*;
@@ -309,7 +311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_wait_observes_session_drop() {
+    async fn cancel_wait_observes_session_drop() -> anyhow::Result<()> {
         let registry = TenantSessions::default();
         let session = registry.open("tenant");
         let waiting = tokio::spawn({
@@ -322,28 +324,32 @@ mod tests {
         });
         tokio::task::yield_now().await;
         drop(session);
-        assert!(waiting.await.unwrap());
+        assert!(waiting.await?);
+
+        Ok(())
     }
 
     #[test]
-    fn connection_limit_is_atomic_and_tenant_scoped() {
+    fn connection_limit_is_atomic_and_tenant_scoped() -> anyhow::Result<()> {
         let registry = TenantSessions::default();
-        let first = registry.try_open("tenant-a", Some(1)).unwrap();
+        let first = registry.try_open("tenant-a", Some(1))?;
 
         assert!(registry.try_open("tenant-a", Some(1)).is_err());
         assert!(registry.try_open("tenant-b", Some(1)).is_ok());
         drop(first);
         assert!(registry.try_open("tenant-a", Some(1)).is_ok());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn pending_sessions_do_not_spend_quota_but_remain_cancellable() {
+    async fn pending_sessions_do_not_spend_quota_but_remain_cancellable() -> anyhow::Result<()> {
         let registry = TenantSessions::default();
         let pending = registry.open_pending("tenant");
-        let active = registry.try_open("tenant", Some(1)).unwrap();
+        let active = registry.try_open("tenant", Some(1))?;
         assert!(pending.authenticate(Some(1)).is_err());
         drop(active);
-        pending.authenticate(Some(1)).unwrap();
+        pending.authenticate(Some(1))?;
         assert!(registry.try_open("tenant", Some(1)).is_err());
         drop(pending);
 
@@ -360,20 +366,25 @@ mod tests {
                 .cancel_and_wait("tenant", Duration::from_millis(1))
                 .await
         );
+
+        Ok(())
     }
 
     #[test]
-    fn quota_counts_each_authenticated_session_until_its_drop() {
+    fn quota_counts_each_authenticated_session_until_its_drop() -> anyhow::Result<()> {
         let registry = TenantSessions::default();
         assert!(registry.try_open("tenant", Some(0)).is_err());
         assert!(registry.state.lock().tenants.is_empty());
 
         let pending = registry.open_pending("tenant");
         let rejected = registry.open_pending("tenant");
-        pending.authenticate(Some(1)).unwrap();
-        pending.authenticate(Some(1)).unwrap();
+        pending.authenticate(Some(1))?;
+        pending.authenticate(Some(1))?;
         assert_eq!(
-            rejected.authenticate(Some(1)).unwrap_err().kind(),
+            rejected
+                .authenticate(Some(1))
+                .expect_err("authenticate should return an error")
+                .kind(),
             std::io::ErrorKind::ConnectionRefused
         );
         assert_eq!(registry.active("tenant"), 2);
@@ -382,32 +393,39 @@ mod tests {
 
         assert_eq!(registry.cancel("tenant"), 1);
         assert_eq!(
-            pending.authenticate(Some(1)).unwrap_err().kind(),
+            pending
+                .authenticate(Some(1))
+                .expect_err("authenticate should return an error")
+                .kind(),
             std::io::ErrorKind::ConnectionAborted
         );
         assert!(registry.try_open("tenant", Some(1)).is_err());
         let waiting = registry.open_pending("tenant");
         drop(pending);
-        waiting.authenticate(Some(1)).unwrap();
+        waiting.authenticate(Some(1))?;
         drop(waiting);
         assert!(registry.state.lock().tenants.is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn sessions_share_only_their_own_tenant_buffer_budget() {
+    fn sessions_share_only_their_own_tenant_buffer_budget() -> anyhow::Result<()> {
         let registry = TenantSessions::default();
         let first = registry.open("tenant-a");
         let second = registry.open("tenant-a");
         let other = registry.open("tenant-b");
-        let reserved = first.query_budget().reserve(32 * 1024 * 1024).unwrap();
+        let reserved = first.query_budget().reserve(32 * 1024 * 1024)?;
         assert!(second.query_budget().reserve(1).is_err());
         assert!(other.query_budget().reserve(1).is_ok());
         drop(reserved);
         assert!(second.query_budget().reserve(1).is_ok());
+
+        Ok(())
     }
 
     #[test]
-    fn session_registries_share_the_same_daemon_budget() {
+    fn session_registries_share_the_same_daemon_budget() -> anyhow::Result<()> {
         let settings = crate::config::Config {
             daemon: crate::config::DaemonConfig {
                 sql_buffer_global_mib: 1,
@@ -415,22 +433,24 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = Arc::new(crate::config::RuntimeConfig::new(settings).unwrap());
+        let config = Arc::new(crate::config::RuntimeConfig::new(settings)?);
         let first = TenantSessions::with_config(Arc::clone(&config));
         let second = TenantSessions::with_config(config);
         let first_session = first.open("tenant-a");
         let second_session = second.open("tenant-b");
-        let reservation = first_session.query_budget().reserve(1024 * 1024).unwrap();
+        let reservation = first_session.query_budget().reserve(1024 * 1024)?;
         assert_eq!(
             second_session
                 .query_budget()
                 .reserve(1)
                 .err()
-                .unwrap()
+                .context("err should provide a value")?
                 .kind(),
             std::io::ErrorKind::WouldBlock
         );
         drop(reservation);
         assert!(second_session.query_budget().reserve(1024 * 1024).is_ok());
+
+        Ok(())
     }
 }

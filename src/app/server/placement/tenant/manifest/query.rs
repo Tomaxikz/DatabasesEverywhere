@@ -187,11 +187,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scan_byte_count_is_strict_and_bounded_to_one_row() {
-        assert_eq!(parse_scan_bytes("42\n").unwrap(), 42);
+    fn scan_byte_count_is_strict_and_bounded_to_one_row() -> anyhow::Result<()> {
+        assert_eq!(parse_scan_bytes("42\n")?, 42);
         assert!(parse_scan_bytes("").is_err());
         assert!(parse_scan_bytes("42\n43\n").is_err());
         assert!(parse_scan_bytes("-1\n").is_err());
         assert!(parse_scan_bytes("18446744073709551616\n").is_err());
+
+        Ok(())
     }
 }

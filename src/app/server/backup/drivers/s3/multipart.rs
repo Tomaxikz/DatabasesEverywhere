@@ -337,7 +337,7 @@ mod tests {
     const KEY: &str = "dbev/instances/inst_one/backups/a b.physical.tar.gz";
 
     #[test]
-    fn upload_pages_keep_only_the_exact_owned_key() {
+    fn upload_pages_keep_only_the_exact_owned_key() -> anyhow::Result<()> {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Bucket>bucket</Bucket>
@@ -364,7 +364,7 @@ mod tests {
   </Upload>
   <EncodingType>url</EncodingType>
 </ListMultipartUploadsResult>"#;
-        let page = parse_upload_page(xml.as_bytes(), UploadScope::Exact(KEY)).unwrap();
+        let page = parse_upload_page(xml.as_bytes(), UploadScope::Exact(KEY))?;
         assert_eq!(page.uploads, vec![(KEY.into(), "VXBsb2FkIElE&1".into())]);
         assert_eq!(
             page.next,
@@ -376,12 +376,14 @@ mod tests {
 
         let last = "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>";
         assert_eq!(
-            parse_upload_page(last.as_bytes(), UploadScope::Exact(KEY)).unwrap(),
+            parse_upload_page(last.as_bytes(), UploadScope::Exact(KEY))?,
             UploadPage {
                 uploads: Vec::new(),
                 next: None
             }
         );
+
+        Ok(())
     }
 
     #[test]
@@ -398,9 +400,11 @@ mod tests {
     }
 
     #[test]
-    fn encoded_keys_keep_plus_literal() {
-        assert_eq!(url_decode("dbev/a%20b%2Bc+d").unwrap(), "dbev/a b+c+d");
+    fn encoded_keys_keep_plus_literal() -> anyhow::Result<()> {
+        assert_eq!(url_decode("dbev/a%20b%2Bc+d")?, "dbev/a b+c+d");
         assert!(url_decode("dbev/a%2").is_err());
+
+        Ok(())
     }
 
     #[test]

@@ -304,15 +304,20 @@ fn helper_matches(args: &[&[u8]], root: &Path, mount: &Path, socket: &Path) -> b
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn preserves_exact_parent_and_child_mount_references() {
+    fn preserves_exact_parent_and_child_mount_references() -> anyhow::Result<()> {
         let mount = Path::new("/var/lib/dbev/fuse/instances/tenant-hash");
         for source in [
             mount.to_path_buf(),
             mount.join("db"),
-            mount.parent().unwrap().to_path_buf(),
+            mount
+                .parent()
+                .context("expected a value from parent")?
+                .to_path_buf(),
         ] {
             assert!(referenced(mount, &[source]));
         }
@@ -320,6 +325,8 @@ mod tests {
             mount,
             &[PathBuf::from("/var/lib/dbev/fuse/instances/other")]
         ));
+
+        Ok(())
     }
 
     #[test]
@@ -337,11 +344,11 @@ mod tests {
     }
 
     #[test]
-    fn helper_identity_requires_all_paths_and_generated_hash_to_match() {
+    fn helper_identity_requires_all_paths_and_generated_hash_to_match() -> anyhow::Result<()> {
         use std::os::unix::ffi::OsStrExt;
         let root = Path::new("/var/lib/dbev/fuse");
         let data = Path::new("/var/lib/dbev/volumes/tenant");
-        let paths = fuse_paths_with_root(data, Some(root)).unwrap();
+        let paths = fuse_paths_with_root(data, Some(root))?;
         let args: Vec<&[u8]> = vec![
             b"fusequota",
             b"--communication-socket-path",
@@ -367,48 +374,56 @@ mod tests {
             &paths.mount_path,
             &root.join("other.sock")
         ));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cleanup_preserves_nonempty_unmounted_directories() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn cleanup_preserves_nonempty_unmounted_directories() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let mount = temp.path().join("mount");
-        fs::create_dir(&mount).unwrap();
-        fs::write(mount.join("data"), b"retained").unwrap();
+        fs::create_dir(&mount)?;
+        fs::write(mount.join("data"), b"retained")?;
         assert!(
             cleanup_one(temp.path(), &mount, &temp.path().join("socket"))
                 .await
                 .is_err()
         );
-        assert_eq!(fs::read(mount.join("data")).unwrap(), b"retained");
+        assert_eq!(fs::read(mount.join("data"))?, b"retained");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cleanup_removes_only_empty_abandoned_runtime_paths() {
+    async fn cleanup_removes_only_empty_abandoned_runtime_paths() -> anyhow::Result<()> {
         use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let mount = temp.path().join("mount");
         let socket = temp.path().join("control.sock");
-        fs::create_dir(&mount).unwrap();
-        let listener = UnixListener::bind(&socket).unwrap();
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::create_dir(&mount)?;
+        let listener = UnixListener::bind(&socket)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         drop(listener);
-        cleanup_one(temp.path(), &mount, &socket).await.unwrap();
+        cleanup_one(temp.path(), &mount, &socket).await?;
         assert!(!mount.exists());
         assert!(!socket.exists());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cleanup_rejects_symlinked_mount_and_non_socket_control_path() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn cleanup_rejects_symlinked_mount_and_non_socket_control_path() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let mount = temp.path().join("mount");
         let socket = temp.path().join("control.sock");
-        std::os::unix::fs::symlink(temp.path(), &mount).unwrap();
+        std::os::unix::fs::symlink(temp.path(), &mount)?;
         assert!(cleanup_one(temp.path(), &mount, &socket).await.is_err());
-        fs::remove_file(&mount).unwrap();
-        fs::create_dir(&mount).unwrap();
-        fs::write(&socket, b"keep").unwrap();
+        fs::remove_file(&mount)?;
+        fs::create_dir(&mount)?;
+        fs::write(&socket, b"keep")?;
         assert!(cleanup_one(temp.path(), &mount, &socket).await.is_err());
-        assert_eq!(fs::read(&socket).unwrap(), b"keep");
+        assert_eq!(fs::read(&socket)?, b"keep");
+
+        Ok(())
     }
 }

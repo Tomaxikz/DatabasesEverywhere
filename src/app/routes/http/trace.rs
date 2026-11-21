@@ -117,7 +117,10 @@ mod tests {
 
     impl io::Write for Logs {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
+            self.0
+                .lock()
+                .expect("lock should succeed")
+                .extend_from_slice(bytes);
             Ok(bytes.len())
         }
 
@@ -127,7 +130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_logs_are_quiet_by_default_but_keep_failures() {
+    async fn request_logs_are_quiet_by_default_but_keep_failures() -> anyhow::Result<()> {
         for level in [tracing::Level::INFO, tracing::Level::DEBUG] {
             let logs = Logs::default();
             let writer = logs.clone();
@@ -139,7 +142,7 @@ mod tests {
                 .finish();
             async {
                 for status in [200, 101, 401, 403, 404, 429, 500] {
-                    let status = StatusCode::from_u16(status).unwrap();
+                    let status = StatusCode::from_u16(status).expect("from u16 should succeed");
                     let app = Router::new()
                         .route("/api/system", get(move || async move { status }))
                         .layer(middleware::from_fn(trace_request));
@@ -148,16 +151,21 @@ mod tests {
                             Request::builder()
                                 .uri("/api/system?token=do-not-log-this")
                                 .body(Body::empty())
-                                .unwrap(),
+                                .expect("empty should succeed"),
                         )
                         .await
-                        .unwrap();
+                        .expect("expected a value from oneshot");
                     assert_eq!(response.status(), status);
                 }
             }
             .with_subscriber(subscriber)
             .await;
-            let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            let text = String::from_utf8(
+                logs.0
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+                    .clone(),
+            )?;
             assert!(!text.contains("do-not-log-this"));
             assert_eq!(text.matches("api request rejected").count(), 3, "{text}");
             assert_eq!(text.matches("api request failed").count(), 1, "{text}");
@@ -174,5 +182,7 @@ mod tests {
                 assert_eq!(text.matches("api request throttled").count(), 1, "{text}");
             }
         }
+
+        Ok(())
     }
 }

@@ -106,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_capable_volumes_prefer_the_volume_snapshot() {
+    fn snapshot_capable_volumes_prefer_the_volume_snapshot() -> anyhow::Result<()> {
         let mut metadata = crate::server::test_support::metadata("inst_one", Protocol::Mysql);
         for (method, expected) in [
             ("host_btrfs_qgroup", FILESYSTEM_SNAPSHOT),
@@ -115,8 +115,10 @@ mod tests {
             ("fuse_quota", MYSQL_CONSISTENT_DUMP),
         ] {
             metadata.limits.disk_enforcement_method = method.to_string();
-            assert_eq!(strategy_for(&metadata).unwrap().id(), expected, "{method}");
+            assert_eq!(strategy_for(&metadata)?.id(), expected, "{method}");
         }
+
+        Ok(())
     }
 
     #[test]

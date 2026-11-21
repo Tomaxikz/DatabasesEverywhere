@@ -258,6 +258,8 @@ pub enum ImportExportJobStorageError {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::{
         server::jobs::import_export::{ImportExportAction, ImportExportStatus},
@@ -265,128 +267,148 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn upserts_and_reads_import_export_job() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
+    async fn upserts_and_reads_import_export_job() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = sqlite::connect(dir.path()).await?;
         let repository = ImportExportJobRepository::new(pool);
         let mut job = sample_job();
 
-        repository.insert(&job).await.unwrap();
+        repository.insert(&job).await?;
         job.status = ImportExportStatus::Succeeded;
         job.updated_at = "2026-01-01T12:01:00Z".to_string();
-        repository.update_status(&job).await.unwrap();
+        repository.update_status(&job).await?;
 
-        let stored = repository.get("job_1").await.unwrap().unwrap();
+        let stored = repository
+            .get("job_1")
+            .await?
+            .context("get should provide a value")?;
         assert_eq!(stored.status, ImportExportStatus::Succeeded);
         assert_eq!(stored.instance_id, "inst_abc");
         assert_eq!(
             stored.replay_options.as_deref(),
             Some(r#"{"kind":"export"}"#)
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn marks_unfinished_jobs_failed() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
+    async fn marks_unfinished_jobs_failed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = sqlite::connect(dir.path()).await?;
         let repository = ImportExportJobRepository::new(pool);
-        repository.insert(&sample_job()).await.unwrap();
+        repository.insert(&sample_job()).await?;
 
         let changed = repository
             .fail_unfinished(
                 "daemon restarted before job completed",
                 "2026-01-01T12:02:00Z",
             )
-            .await
-            .unwrap();
+            .await?;
 
-        let stored = repository.get("job_1").await.unwrap().unwrap();
+        let stored = repository
+            .get("job_1")
+            .await?
+            .context("get should provide a value")?;
         assert_eq!(changed, 1);
         assert_eq!(stored.status, ImportExportStatus::Failed);
         assert_eq!(
             stored.error.as_deref(),
             Some("daemon restarted before job completed")
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn reports_missing_job_status_updates() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
+    async fn reports_missing_job_status_updates() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = sqlite::connect(dir.path()).await?;
         let repository = ImportExportJobRepository::new(pool);
 
-        let error = repository.update_status(&sample_job()).await.unwrap_err();
+        let error = repository
+            .update_status(&sample_job())
+            .await
+            .expect_err("sample job should return an error");
 
         assert!(matches!(
             error,
             ImportExportJobStorageError::NotFound { job_id } if job_id == "job_1"
         ));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn lists_only_instances_with_running_imports_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
+    async fn lists_only_instances_with_running_imports_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = sqlite::connect(dir.path()).await?;
         let repository = ImportExportJobRepository::new(pool);
         let mut job = sample_job();
-        repository.insert(&job).await.unwrap();
+        repository.insert(&job).await?;
         job.job_id = "job_2".to_string();
         job.action = ImportExportAction::Import;
         job.status = ImportExportStatus::Running;
-        repository.insert(&job).await.unwrap();
+        repository.insert(&job).await?;
         job.job_id = "job_3".to_string();
         job.instance_id = "inst_other".to_string();
         job.status = ImportExportStatus::Running;
-        repository.insert(&job).await.unwrap();
+        repository.insert(&job).await?;
         job.job_id = "job_4".to_string();
         job.instance_id = "inst_export_only".to_string();
         job.action = ImportExportAction::Export;
-        repository.insert(&job).await.unwrap();
+        repository.insert(&job).await?;
 
         assert_eq!(
-            repository.running_import_ids().await.unwrap(),
+            repository.running_import_ids().await?,
             vec!["inst_abc".to_string(), "inst_other".to_string()]
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn counts_jobs_by_status() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
+    async fn counts_jobs_by_status() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = sqlite::connect(dir.path()).await?;
         let repository = ImportExportJobRepository::new(pool);
         let mut job = sample_job();
 
-        repository.insert(&job).await.unwrap();
+        repository.insert(&job).await?;
         job.job_id = "job_2".to_string();
         job.status = ImportExportStatus::Failed;
-        repository.insert(&job).await.unwrap();
+        repository.insert(&job).await?;
 
-        let counts = repository.count_by_status().await.unwrap();
+        let counts = repository.count_by_status().await?;
         assert!(counts.contains(&(ImportExportStatus::Queued, 1)));
         assert!(counts.contains(&(ImportExportStatus::Failed, 1)));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn deletes_only_jobs_owned_by_one_instance() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
+    async fn deletes_only_jobs_owned_by_one_instance() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = sqlite::connect(dir.path()).await?;
         let repository = ImportExportJobRepository::new(pool);
         let owned = sample_job();
         let mut foreign = sample_job();
         foreign.job_id = "job_other".to_string();
         foreign.instance_id = "inst_other".to_string();
-        repository.insert(&owned).await.unwrap();
-        repository.insert(&foreign).await.unwrap();
+        repository.insert(&owned).await?;
+        repository.insert(&foreign).await?;
 
-        assert_eq!(repository.delete_for_instance("inst_abc").await.unwrap(), 1);
-        assert!(repository.get("job_1").await.unwrap().is_none());
-        assert!(repository.get("job_other").await.unwrap().is_some());
+        assert_eq!(repository.delete_for_instance("inst_abc").await?, 1);
+        assert!(repository.get("job_1").await?.is_none());
+        assert!(repository.get("job_other").await?.is_some());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn prunes_only_old_completed_jobs() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
+    async fn prunes_only_old_completed_jobs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = sqlite::connect(dir.path()).await?;
         let repository = ImportExportJobRepository::new(pool);
         for (id, status, updated_at) in [
             ("old", ImportExportStatus::Succeeded, "2026-01-01T00:00:00Z"),
@@ -397,13 +419,15 @@ mod tests {
             job.job_id = id.to_string();
             job.status = status;
             job.updated_at = updated_at.to_string();
-            repository.insert(&job).await.unwrap();
+            repository.insert(&job).await?;
         }
 
-        assert_eq!(repository.prune_completed(1).await.unwrap(), 1);
-        assert!(repository.get("old").await.unwrap().is_none());
-        assert!(repository.get("new").await.unwrap().is_some());
-        assert!(repository.get("queued").await.unwrap().is_some());
+        assert_eq!(repository.prune_completed(1).await?, 1);
+        assert!(repository.get("old").await?.is_none());
+        assert!(repository.get("new").await?.is_some());
+        assert!(repository.get("queued").await?.is_some());
+
+        Ok(())
     }
 
     fn sample_job() -> ImportExportJob {

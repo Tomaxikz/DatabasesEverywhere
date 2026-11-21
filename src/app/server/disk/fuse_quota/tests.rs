@@ -40,9 +40,9 @@ fn external_helper_metadata_must_be_root_owned_and_immutable_to_unprivileged_use
 
 #[tokio::test]
 #[ignore = "requires root, /dev/fuse and fusermount3 on a disposable Linux host"]
-async fn mounted_helper_enforces_quota_and_reuses_process() {
+async fn mounted_helper_enforces_quota_and_reuses_process() -> anyhow::Result<()> {
     assert!(rustix::process::geteuid().is_root(), "run as root");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir()?;
     let data = temp.path().join("data");
     let root = temp.path().join("fuse");
     let result = timeout(Duration::from_secs(30), async {
@@ -227,25 +227,29 @@ async fn mounted_helper_enforces_quota_and_reuses_process() {
             temp.keep().display()
         );
     }
-    result.unwrap().unwrap();
+    result??;
     assert_eq!(
-        tokio::fs::read(data.join("after-delete")).await.unwrap(),
+        tokio::fs::read(data.join("after-delete")).await?,
         b"quota capacity recovered"
     );
+
+    Ok(())
 }
 
 #[test]
-fn parses_quota_used_response() {
+fn parses_quota_used_response() -> anyhow::Result<()> {
     let lines = vec!["quota_used = 12345".to_string(), "OK".to_string()];
-    assert_eq!(parse_quota_usage(&lines).unwrap(), 12345);
+    assert_eq!(parse_quota_usage(&lines)?, 12345);
+
+    Ok(())
 }
 
 #[test]
-fn parses_numeric_and_unlimited_open_file_limits() {
+fn parses_numeric_and_unlimited_open_file_limits() -> anyhow::Result<()> {
     let numeric = "Limit                     Soft Limit           Hard Limit           Units\n\
                        Max open files            1024                 524288               files\n";
     assert_eq!(
-        parse_nofile_limits(numeric).unwrap(),
+        parse_nofile_limits(numeric).map_err(anyhow::Error::msg)?,
         NofileLimits {
             current: Some(1024),
             maximum: Some(524_288),
@@ -254,62 +258,67 @@ fn parses_numeric_and_unlimited_open_file_limits() {
 
     let unlimited = "Max open files            unlimited            unlimited            files\n";
     assert_eq!(
-        parse_nofile_limits(unlimited).unwrap(),
+        parse_nofile_limits(unlimited).map_err(anyhow::Error::msg)?,
         NofileLimits {
             current: None,
             maximum: None,
         }
     );
+
+    Ok(())
 }
 
 #[test]
-fn helper_open_file_target_uses_the_safe_available_ceiling() {
-    assert_eq!(desired_nofile_current(Some(524_288)).unwrap(), 524_288);
+fn helper_open_file_target_uses_the_safe_available_ceiling() -> anyhow::Result<()> {
+    assert_eq!(desired_nofile_current(Some(524_288))?, 524_288);
     assert_eq!(
-        desired_nofile_current(Some(2_000_000)).unwrap(),
+        desired_nofile_current(Some(2_000_000))?,
         TARGET_FUSEQUOTA_NOFILE
     );
-    assert_eq!(
-        desired_nofile_current(None).unwrap(),
-        TARGET_FUSEQUOTA_NOFILE
-    );
+    assert_eq!(desired_nofile_current(None)?, TARGET_FUSEQUOTA_NOFILE);
     assert!(desired_nofile_current(Some(1024)).is_err());
+
+    Ok(())
 }
 
 #[test]
-fn fuse_paths_keep_socket_path_short_for_long_instance_ids() {
+fn fuse_paths_keep_socket_path_short_for_long_instance_ids() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let data_path = Path::new(
         "/var/lib/dbev/volumes/dbe_upgrade_tmp_9689dc77d5ce499c80e4ae5beaec4217_inst_node_db_agent_1_1_mongodb_s1_testt",
     );
     let fuse_root = Path::new("/var/lib/dbev/fuse");
 
-    let paths = fuse_paths_with_root(data_path, Some(fuse_root)).unwrap();
+    let paths = fuse_paths_with_root(data_path, Some(fuse_root))?;
 
     assert!(paths.socket_path.to_string_lossy().len() < 100);
     assert!(
         paths
             .socket_path
             .file_name()
-            .unwrap()
+            .context("file name should provide a value")?
             .to_string_lossy()
             .starts_with("dbe_upgrade_tmp_9689dc77")
     );
+
+    Ok(())
 }
 
 #[test]
-fn fuse_runtime_directories_enforce_private_traversal() {
+fn fuse_runtime_directories_enforce_private_traversal() -> anyhow::Result<()> {
     for (initial_mode, expected_mode) in [(0o755, 0o700), (0o710, 0o710)] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("fuse");
         for path in [root.clone(), root.join("instances"), root.join("mounts")] {
-            fs::create_dir_all(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(initial_mode)).unwrap();
+            fs::create_dir_all(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(initial_mode))?;
         }
 
-        prepare_fuse_dirs(&root).unwrap();
+        prepare_fuse_dirs(&root)?;
 
         for path in [root.clone(), root.join("instances"), root.join("mounts")] {
-            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
             assert_eq!(
                 mode,
                 expected_mode,
@@ -318,91 +327,122 @@ fn fuse_runtime_directories_enforce_private_traversal() {
             );
         }
     }
+
+    Ok(())
 }
 
 #[test]
-fn control_socket_must_not_be_group_writable() {
-    let temp = tempfile::tempdir().unwrap();
+fn control_socket_must_not_be_group_writable() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let socket = temp.path().join("control.sock");
-    let _listener = UnixListener::bind(&socket).unwrap();
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o620)).unwrap();
+    let _listener = UnixListener::bind(&socket)?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o620))?;
 
-    let error = validate_control_socket(&socket).unwrap_err();
+    let error = validate_control_socket(&socket)
+        .expect_err("validate control socket should return an error");
 
     assert!(
         error
             .to_string()
             .contains("not writable by group or others")
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn control_response_is_size_bounded() {
-    let temp = tempfile::tempdir().unwrap();
+async fn control_response_is_size_bounded() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let socket = temp.path().join("control.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) = listener.accept().await.expect("accept should succeed");
         let mut command = Vec::new();
-        stream.read_to_end(&mut command).await.unwrap();
+        stream
+            .read_to_end(&mut command)
+            .await
+            .expect("read to end should succeed");
         stream
             .write_all(&vec![b'x'; MAX_CONTROL_RESPONSE_BYTES + 1])
             .await
-            .unwrap();
+            .expect("write all should succeed");
     });
 
-    let error = send_command(&socket, "get quota_used").await.unwrap_err();
-    server.await.unwrap();
+    let error = send_command(&socket, "get quota_used")
+        .await
+        .expect_err("send command should return an error");
+    server.await?;
 
     assert!(error.to_string().contains("response exceeded"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn quota_mutation_rejects_a_replacement_peer_before_sending_data() {
-    let temp = tempfile::tempdir().unwrap();
+async fn quota_mutation_rejects_a_replacement_peer_before_sending_data() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let socket = temp.path().join("control.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) = listener.accept().await.expect("accept should succeed");
         let mut command = Vec::new();
-        stream.read_to_end(&mut command).await.unwrap();
+        stream
+            .read_to_end(&mut command)
+            .await
+            .expect("read to end should succeed");
         command
     });
     let error = send_command_detailed(&socket, "set quota = 123", Some(-1))
         .await
-        .unwrap_err();
+        .expect_err("send command detailed should return an error");
     assert!(matches!(error, DiskLimitError::FuseRequiresRestart(_)));
-    assert!(server.await.unwrap().is_empty());
+    assert!(server.await?.is_empty());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn teardown_removes_only_confirmed_unmounted_runtime_paths() {
-    let temp = tempfile::tempdir().unwrap();
+async fn teardown_removes_only_confirmed_unmounted_runtime_paths() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let temp = tempfile::tempdir()?;
     let fuse_root = temp.path().join("fuse");
     let data_path = temp.path().join("volumes").join("instance-one");
-    let paths = fuse_paths_with_root(&data_path, Some(&fuse_root)).unwrap();
-    fs::create_dir_all(&paths.mount_path).unwrap();
-    fs::create_dir_all(paths.socket_path.parent().unwrap()).unwrap();
+    let paths = fuse_paths_with_root(&data_path, Some(&fuse_root))?;
+    fs::create_dir_all(&paths.mount_path)?;
+    fs::create_dir_all(
+        paths
+            .socket_path
+            .parent()
+            .context("expected a value from parent")?,
+    )?;
 
-    destroy_with_root(&data_path, Some(&fuse_root))
-        .await
-        .unwrap();
+    destroy_with_root(&data_path, Some(&fuse_root)).await?;
 
     assert!(!paths.mount_path.exists());
     assert!(!paths.socket_path.exists());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn teardown_preserves_invalid_control_path() {
-    let temp = tempfile::tempdir().unwrap();
+async fn teardown_preserves_invalid_control_path() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let temp = tempfile::tempdir()?;
     let fuse_root = temp.path().join("fuse");
     let data_path = temp.path().join("volumes").join("instance-one");
-    let paths = fuse_paths_with_root(&data_path, Some(&fuse_root)).unwrap();
-    fs::create_dir_all(&paths.mount_path).unwrap();
-    fs::create_dir_all(paths.socket_path.parent().unwrap()).unwrap();
-    fs::write(&paths.socket_path, b"not a socket").unwrap();
+    let paths = fuse_paths_with_root(&data_path, Some(&fuse_root))?;
+    fs::create_dir_all(&paths.mount_path)?;
+    fs::create_dir_all(
+        paths
+            .socket_path
+            .parent()
+            .context("expected a value from parent")?,
+    )?;
+    fs::write(&paths.socket_path, b"not a socket")?;
 
     assert!(
         destroy_with_root(&data_path, Some(&fuse_root))
@@ -411,4 +451,6 @@ async fn teardown_preserves_invalid_control_path() {
     );
     assert!(paths.mount_path.exists());
     assert!(paths.socket_path.exists());
+
+    Ok(())
 }

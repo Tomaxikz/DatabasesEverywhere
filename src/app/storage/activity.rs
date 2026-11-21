@@ -204,31 +204,31 @@ mod tests {
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
-            .unwrap();
+            .expect("connect should succeed");
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(&pool)
             .await
-            .unwrap();
+            .expect("execute should succeed");
         sqlx::raw_sql(
             "CREATE TABLE instance_metadata (instance_id TEXT PRIMARY KEY NOT NULL, created_at TEXT NOT NULL);",
         )
             .execute(&pool)
             .await
-            .unwrap();
+            .expect("execute should succeed");
         sqlx::raw_sql(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/migrations/20260901120000_create_tenant_activity.sql"
         )))
         .execute(&pool)
         .await
-        .unwrap();
+        .expect("execute should succeed");
         sqlx::raw_sql(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/migrations/20261121120000_optimize_activity_retention.sql"
         )))
         .execute(&pool)
         .await
-        .unwrap();
+        .expect("execute should succeed");
         (pool.clone(), ActivityRepository::new(pool))
     }
 
@@ -238,7 +238,7 @@ mod tests {
             .bind(generation)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("execute should succeed");
     }
 
     fn bucket(instance_id: &str, start: i64) -> ActivityBucket {
@@ -265,25 +265,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_is_idempotent_and_history_is_chronological() {
+    async fn save_is_idempotent_and_history_is_chronological() -> anyhow::Result<()> {
         let (pool, repository) = repository().await;
         seed(&pool, "tenant-a", "generation-a").await;
         let mut first = bucket("tenant-a", 60);
-        repository.save(&[first.clone()]).await.unwrap();
+        repository.save(&[first.clone()]).await?;
         first.accepted.read = 9;
-        repository
-            .save(&[first.clone(), first.clone()])
-            .await
-            .unwrap();
+        repository.save(&[first.clone(), first.clone()]).await?;
         repository
             .save(&[bucket("tenant-a", 120), bucket("tenant-a", 180)])
-            .await
-            .unwrap();
+            .await?;
 
         let history = repository
             .history("tenant-a", "generation-a", Some(180), 10)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].bucket_start_unix, 60);
         assert_eq!(history[0].accepted.read, 9);
@@ -291,10 +286,12 @@ mod tests {
         assert_eq!(history[1].bucket_start_unix, 120);
         assert_eq!(history[0].cpu_time_micros, None);
         assert_eq!(history[0].peak_query_memory_bytes, Some(0));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn late_buckets_use_the_newest_stored_timestamp_for_retention() {
+    async fn late_buckets_use_the_newest_stored_timestamp_for_retention() -> anyhow::Result<()> {
         let (pool, repository) = repository().await;
         seed(&pool, "tenant-a", "generation-a").await;
         repository
@@ -303,103 +300,99 @@ mod tests {
                 bucket("tenant-a", 3_599),
                 bucket("tenant-a", 3_600),
             ])
-            .await
-            .unwrap();
+            .await?;
 
         let starts: Vec<i64> = sqlx::query_scalar(
             "SELECT bucket_start_unix FROM tenant_activity_buckets ORDER BY bucket_start_unix",
         )
         .fetch_all(&pool)
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(starts, [3_600, 90_000]);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn retention_and_foreign_key_are_enforced_by_sqlite() {
+    async fn retention_and_foreign_key_are_enforced_by_sqlite() -> anyhow::Result<()> {
         let (pool, repository) = repository().await;
         seed(&pool, "tenant-a", "generation-a").await;
         let buckets = (0..1_445)
             .map(|index| bucket("tenant-a", i64::from(index) * 60))
             .collect::<Vec<_>>();
-        repository.save(&buckets).await.unwrap();
+        repository.save(&buckets).await?;
 
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tenant_activity_buckets WHERE instance_id = 'tenant-a'",
         )
         .fetch_one(&pool)
-        .await
-        .unwrap();
+        .await?;
         let oldest: i64 = sqlx::query_scalar(
             "SELECT MIN(bucket_start_unix) FROM tenant_activity_buckets WHERE instance_id = 'tenant-a'",
         )
         .fetch_one(&pool)
         .await
-        .unwrap();
+        ?;
         assert_eq!(count, i64::from(MAX_HISTORY_ROWS));
         assert_eq!(oldest, 5 * 60);
 
-        repository
-            .save(&[bucket("tenant-a", 3 * 86_400)])
-            .await
-            .unwrap();
+        repository.save(&[bucket("tenant-a", 3 * 86_400)]).await?;
         let stale: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tenant_activity_buckets WHERE instance_id = 'tenant-a' AND bucket_start_unix < 172800",
         )
         .fetch_one(&pool)
         .await
-        .unwrap();
+        ?;
         assert_eq!(stale, 0);
 
         sqlx::query("DELETE FROM instance_metadata WHERE instance_id = 'tenant-a'")
             .execute(&pool)
-            .await
-            .unwrap();
+            .await?;
         let after_delete: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenant_activity_buckets")
             .fetch_one(&pool)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(after_delete, 0);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn deleted_instance_does_not_poison_the_batch() {
+    async fn deleted_instance_does_not_poison_the_batch() -> anyhow::Result<()> {
         let (pool, repository) = repository().await;
         seed(&pool, "tenant-live", "generation-a").await;
 
         repository
             .save(&[bucket("tenant-deleted", 60), bucket("tenant-live", 60)])
-            .await
-            .unwrap();
+            .await?;
 
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT instance_id FROM tenant_activity_buckets ORDER BY instance_id",
         )
         .fetch_all(&pool)
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(rows, ["tenant-live"]);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn delayed_bucket_cannot_attach_to_a_recreated_instance() {
+    async fn delayed_bucket_cannot_attach_to_a_recreated_instance() -> anyhow::Result<()> {
         let (pool, repository) = repository().await;
         seed(&pool, "tenant-a", "generation-a").await;
         let delayed = bucket("tenant-a", 60);
 
         sqlx::query("DELETE FROM instance_metadata WHERE instance_id = 'tenant-a'")
             .execute(&pool)
-            .await
-            .unwrap();
+            .await?;
         seed(&pool, "tenant-a", "generation-b").await;
-        repository.save(&[delayed]).await.unwrap();
+        repository.save(&[delayed]).await?;
 
         assert!(
             repository
                 .history("tenant-a", "generation-b", None, 10)
-                .await
-                .unwrap()
+                .await?
                 .is_empty()
         );
+
+        Ok(())
     }
 }

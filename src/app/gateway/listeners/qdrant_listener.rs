@@ -432,6 +432,8 @@ fn qdrant_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint, Li
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::gateway::{listeners::ListenerError, resolver::RouteResolver};
     use crate::{
@@ -470,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_every_http1_hop_by_hop_header() {
+    fn removes_every_http1_hop_by_hop_header() -> anyhow::Result<()> {
         let mut headers = http::HeaderMap::new();
         for name in [
             "connection",
@@ -484,7 +486,7 @@ mod tests {
             "proxy-connection",
         ] {
             headers.insert(
-                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderName::from_bytes(name.as_bytes())?,
                 http::HeaderValue::from_static("x"),
             );
         }
@@ -496,11 +498,18 @@ mod tests {
         );
         remove_hop_by_hop_headers(&mut headers);
         assert_eq!(headers.len(), 1);
-        assert_eq!(headers.get("api-key").unwrap(), "secret");
+        assert_eq!(
+            headers
+                .get("api-key")
+                .context("get should provide a value")?,
+            "secret"
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn every_h2_stream_must_repeat_the_same_route_key() {
+    fn every_h2_stream_must_repeat_the_same_route_key() -> anyhow::Result<()> {
         let resolver = RouteResolver::new(
             InstanceStore::default(),
             ResourceCache::default(),
@@ -510,38 +519,47 @@ mod tests {
         let route = resolver.qdrant_route_fingerprint("secret");
         let valid = http::Request::builder()
             .header("api-key", "secret")
-            .body(())
-            .unwrap();
+            .body(())?;
         let wrong = http::Request::builder()
             .header("api-key", "other")
-            .body(())
-            .unwrap();
+            .body(())?;
         let missing = http::Request::new(());
         assert!(matches_qdrant_route(&valid, &route, &resolver));
         assert!(!matches_qdrant_route(&wrong, &route, &resolver));
         assert!(!matches_qdrant_route(&missing, &route, &resolver));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rest_authentication_is_checked_on_every_keepalive_request() {
-        let directory = tempfile::tempdir().unwrap();
+    async fn rest_authentication_is_checked_on_every_keepalive_request() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let grpc_socket = directory.path().join("qdrant-grpc.sock");
         let http_socket = directory.path().join("qdrant-http.sock");
-        let backend_listener = tokio::net::UnixListener::bind(&http_socket).unwrap();
+        let backend_listener = tokio::net::UnixListener::bind(&http_socket)?;
         let backend = tokio::spawn(async move {
-            let (stream, _) = backend_listener.accept().await.unwrap();
+            let (stream, _) = backend_listener
+                .accept()
+                .await
+                .expect("accept should succeed");
             hyper::server::conn::http1::Builder::new()
                 .serve_connection(
                     TokioIo::new(stream),
                     service_fn(|request: http::Request<Incoming>| async move {
-                        assert_eq!(request.headers().get("api-key").unwrap(), "secret");
+                        assert_eq!(
+                            request
+                                .headers()
+                                .get("api-key")
+                                .expect("get should provide a value"),
+                            "secret"
+                        );
                         Ok::<_, Infallible>(http::Response::new(Full::new(Bytes::from_static(
                             b"backend-ok",
                         ))))
                     }),
                 )
                 .await
-                .unwrap();
+                .expect("from static should succeed");
         });
 
         let store = InstanceStore::default();
@@ -552,31 +570,30 @@ mod tests {
             test_qdrant_route_key(),
             crate::gateway::sessions::TenantSessions::default(),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let gateway = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_qdrant_client(stream, resolver, None).await.unwrap();
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            handle_qdrant_client(stream, resolver, None)
+                .await
+                .expect("handle qdrant client should succeed");
         });
 
-        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .unwrap();
+        let stream = tokio::net::TcpStream::connect(address).await?;
+        let (mut client, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
         let client_driver = tokio::spawn(connection);
         let response = client
             .send_request(
                 http::Request::builder()
                     .uri("/collections")
                     .header("api-key", "secret")
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
+                    .body(Full::new(Bytes::new()))?,
             )
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
-            response.into_body().collect().await.unwrap().to_bytes(),
+            response.into_body().collect().await?.to_bytes(),
             Bytes::from_static(b"backend-ok")
         );
 
@@ -585,16 +602,16 @@ mod tests {
                 http::Request::builder()
                     .uri("/collections")
                     .header("api-key", "wrong")
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
+                    .body(Full::new(Bytes::new()))?,
             )
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(rejected.status(), http::StatusCode::UNAUTHORIZED);
         drop(client);
-        client_driver.await.unwrap().unwrap();
-        gateway.await.unwrap();
-        backend.await.unwrap();
+        client_driver.await??;
+        gateway.await?;
+        backend.await?;
+
+        Ok(())
     }
 
     fn qdrant_metadata(grpc_socket: &std::path::Path) -> crate::server::metadata::InstanceMetadata {

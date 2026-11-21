@@ -10,7 +10,7 @@ use super::{
 };
 
 #[test]
-fn request_csv_preserves_quoting_precision_and_empty_fields() {
+fn request_csv_preserves_quoting_precision_and_empty_fields() -> anyhow::Result<()> {
     let sample = crate::commands::bench::metrics::RequestSample {
         phase: "test".into(),
         target: "a,b".into(),
@@ -21,15 +21,17 @@ fn request_csv_preserves_quoting_precision_and_empty_fields() {
         error: Some("a\"b\r\nc".into()),
     };
     let header = "phase,target,index,duration_micros,duration_ms,status_code,success,error\n";
-    assert_eq!(request_samples_csv(&[]).unwrap(), header.as_bytes());
+    assert_eq!(request_samples_csv(&[])?, header.as_bytes());
     assert_eq!(
-        request_samples_csv(&[sample]).unwrap(),
+        request_samples_csv(&[sample])?,
         format!("{header}test,\"a,b\",7,1234,1.234,,false,\"a\"\"b\r\nc\"\n").as_bytes()
     );
+
+    Ok(())
 }
 
 #[test]
-fn resource_csv_preserves_decimal_precision_and_optional_columns() {
+fn resource_csv_preserves_decimal_precision_and_optional_columns() -> anyhow::Result<()> {
     let sample = crate::commands::bench::metrics::ResourceSample {
         elapsed_ms: 17,
         phase: "steady".into(),
@@ -44,11 +46,13 @@ fn resource_csv_preserves_decimal_precision_and_optional_columns() {
         instance_memory_bytes: None,
     };
     let header = "elapsed_ms,phase,daemon_cpu_percent,daemon_rss_bytes,benchmark_cpu_percent,benchmark_rss_bytes,instance_id,instance_protocol,instance_sample_failed,instance_cpu_percent,instance_memory_bytes\n";
-    assert_eq!(resource_samples_csv(&[]).unwrap(), header.as_bytes());
+    assert_eq!(resource_samples_csv(&[])?, header.as_bytes());
     assert_eq!(
-        resource_samples_csv(&[sample]).unwrap(),
+        resource_samples_csv(&[sample])?,
         format!("{header}17,steady,1.250000,4096,,,\"db,1\",mysql,false,0.000000,\n").as_bytes()
     );
+
+    Ok(())
 }
 
 #[test]
@@ -102,17 +106,19 @@ fn manual_active_job_recommendation_rows_expose_model_inputs_and_result() {
 }
 
 #[tokio::test]
-async fn report_directory_and_files_refuse_reuse() {
+async fn report_directory_and_files_refuse_reuse() -> anyhow::Result<()> {
     let directory =
         std::env::temp_dir().join(format!("dbev-bench-report-test-{}", uuid::Uuid::new_v4()));
-    reserve_report_directory(&directory).unwrap();
+    reserve_report_directory(&directory)?;
     assert!(reserve_report_directory(&directory).is_err());
 
     let report = directory.join("report.json");
-    write_private(&report, b"first").await.unwrap();
+    write_private(&report, b"first").await?;
     assert!(write_private(&report, b"second").await.is_err());
-    assert_eq!(tokio::fs::read(&report).await.unwrap(), b"first");
+    assert_eq!(tokio::fs::read(&report).await?, b"first");
 
-    tokio::fs::remove_file(report).await.unwrap();
-    tokio::fs::remove_dir(directory).await.unwrap();
+    tokio::fs::remove_file(report).await?;
+    tokio::fs::remove_dir(directory).await?;
+
+    Ok(())
 }

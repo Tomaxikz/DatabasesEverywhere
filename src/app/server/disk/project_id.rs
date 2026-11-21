@@ -617,51 +617,55 @@ impl Hasher for Fnv1a32 {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn allocation_is_stable_and_persisted() {
-        let temp = tempfile::tempdir().unwrap();
+    fn allocation_is_stable_and_persisted() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
 
-        let first = allocate_sync(&registry, "inst_one", 200_000).unwrap();
-        let second = allocate_sync(&registry, "inst_one", 200_000).unwrap();
+        let first = allocate_sync(&registry, "inst_one", 200_000)?;
+        let second = allocate_sync(&registry, "inst_one", 200_000)?;
 
         assert_eq!(first, second);
         assert_eq!(
-            find_sync(&registry, "inst_one", 200_000).unwrap(),
+            find_sync(&registry, "inst_one", 200_000)?,
             Some(ProjectIdClaim {
                 id: first,
                 state: ProjectIdState::Pending,
             })
         );
         assert_eq!(
-            std::fs::read_to_string(registry.join(first.to_string())).unwrap(),
+            std::fs::read_to_string(registry.join(first.to_string()))?,
             "inst_one\n"
         );
         assert_eq!(
-            std::fs::read_to_string(pending_path(&registry, first)).unwrap(),
+            std::fs::read_to_string(pending_path(&registry, first))?,
             "inst_one\n"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn activation_is_the_only_pending_to_active_transition() {
-        let temp = tempfile::tempdir().unwrap();
+    fn activation_is_the_only_pending_to_active_transition() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
         let base = 200_000;
-        let id = allocate_sync(&registry, "tenant", base).unwrap();
+        let id = allocate_sync(&registry, "tenant", base)?;
 
         assert_eq!(
-            find_sync(&registry, "tenant", base).unwrap(),
+            find_sync(&registry, "tenant", base)?,
             Some(ProjectIdClaim {
                 id,
                 state: ProjectIdState::Pending,
             })
         );
-        activate_sync(&registry, "tenant", id).unwrap();
+        activate_sync(&registry, "tenant", id)?;
         assert_eq!(
-            find_sync(&registry, "tenant", base).unwrap(),
+            find_sync(&registry, "tenant", base)?,
             Some(ProjectIdClaim {
                 id,
                 state: ProjectIdState::Active,
@@ -671,27 +675,29 @@ mod tests {
 
         // Activation and subsequent allocation are idempotent and do not
         // recreate the pending marker.
-        activate_sync(&registry, "tenant", id).unwrap();
-        assert_eq!(allocate_sync(&registry, "tenant", base).unwrap(), id);
+        activate_sync(&registry, "tenant", id)?;
+        assert_eq!(allocate_sync(&registry, "tenant", base)?, id);
         assert!(!pending_path(&registry, id).exists());
+
+        Ok(())
     }
 
     #[test]
-    fn interrupted_pending_publication_is_recovered_by_retry() {
-        let temp = tempfile::tempdir().unwrap();
+    fn interrupted_pending_publication_is_recovered_by_retry() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
         let base = u32::MAX;
-        create_private_registry(&registry).unwrap();
+        create_private_registry(&registry)?;
         let id = initial_project_id("tenant", base, allocation_span(base));
 
         // This is the only on-disk state possible between publishing the
         // pending marker and publishing the owner claim.
-        claim(&pending_path(&registry, id), "tenant").unwrap();
+        claim(&pending_path(&registry, id), "tenant")?;
         assert!(!registry.join(id.to_string()).exists());
-        assert_eq!(allocate_sync(&registry, "tenant", base).unwrap(), id);
+        assert_eq!(allocate_sync(&registry, "tenant", base)?, id);
         assert!(registry.join(id.to_string()).is_file());
         assert_eq!(
-            find_sync(&registry, "tenant", base).unwrap(),
+            find_sync(&registry, "tenant", base)?,
             Some(ProjectIdClaim {
                 id,
                 state: ProjectIdState::Pending,
@@ -703,48 +709,54 @@ mod tests {
             allocate_sync(&registry, "other", base),
             Err(DiskLimitError::ProjectIdExhausted { .. })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn pending_is_published_before_a_claim_write_failure() {
-        let temp = tempfile::tempdir().unwrap();
+    fn pending_is_published_before_a_claim_write_failure() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
-        create_private_registry(&registry).unwrap();
+        create_private_registry(&registry)?;
         let id = 200_001;
-        std::fs::create_dir(registry.join(id.to_string())).unwrap();
+        std::fs::create_dir(registry.join(id.to_string()))?;
 
         assert!(publish_pending_claim(&registry, id, "tenant").is_err());
         assert_eq!(
-            std::fs::read_to_string(pending_path(&registry, id)).unwrap(),
+            std::fs::read_to_string(pending_path(&registry, id))?,
             "tenant\n"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn legacy_claim_without_pending_marker_remains_active() {
-        let temp = tempfile::tempdir().unwrap();
+    fn legacy_claim_without_pending_marker_remains_active() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
         let base = u32::MAX;
-        create_private_registry(&registry).unwrap();
+        create_private_registry(&registry)?;
         let id = initial_project_id("legacy", base, allocation_span(base));
-        claim(&registry.join(id.to_string()), "legacy").unwrap();
+        claim(&registry.join(id.to_string()), "legacy")?;
 
         assert_eq!(
-            find_sync(&registry, "legacy", base).unwrap(),
+            find_sync(&registry, "legacy", base)?,
             Some(ProjectIdClaim {
                 id,
                 state: ProjectIdState::Active,
             })
         );
-        assert_eq!(allocate_sync(&registry, "legacy", base).unwrap(), id);
+        assert_eq!(allocate_sync(&registry, "legacy", base)?, id);
         assert!(!pending_path(&registry, id).exists());
+
+        Ok(())
     }
 
     #[test]
-    fn explicit_global_registry_prevents_cross_parent_collisions() {
-        let temp = tempfile::tempdir().unwrap();
+    fn explicit_global_registry_prevents_cross_parent_collisions() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry_root = temp.path().join("global-quota-registry");
-        std::fs::create_dir(&registry_root).unwrap();
+        std::fs::create_dir(&registry_root)?;
         let registry = registry_path(&registry_root);
         let base = u32::MAX - 1;
         let first_name = "tenant_from_pool_a";
@@ -752,44 +764,40 @@ mod tests {
         let second_name = (0..1_000)
             .map(|value| format!("tenant_from_pool_b_{value}"))
             .find(|name| initial_project_id(name, base, 2) == initial)
-            .unwrap();
+            .context("expected a value from find")?;
 
-        let first = allocate_sync(&registry, first_name, base).unwrap();
-        let second = allocate_sync(&registry, &second_name, base).unwrap();
+        let first = allocate_sync(&registry, first_name, base)?;
+        let second = allocate_sync(&registry, &second_name, base)?;
 
         assert_ne!(first, second);
         assert_eq!(first, initial);
+
+        Ok(())
     }
 
     #[test]
-    fn release_is_idempotent_and_never_frees_the_claim_for_another_owner() {
-        let temp = tempfile::tempdir().unwrap();
+    fn release_is_idempotent_and_never_frees_the_claim_for_another_owner() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
         let base = u32::MAX;
-        let id = allocate_sync(&registry, "tenant_one", base).unwrap();
+        let id = allocate_sync(&registry, "tenant_one", base)?;
 
         assert_eq!(
-            find_sync(&registry, "tenant_one", base).unwrap(),
+            find_sync(&registry, "tenant_one", base)?,
             Some(ProjectIdClaim {
                 id,
                 state: ProjectIdState::Pending,
             })
         );
 
+        assert_eq!(release_sync(&registry, "tenant_one", base)?, Some(id));
+        assert_eq!(release_sync(&registry, "tenant_one", base)?, Some(id));
         assert_eq!(
-            release_sync(&registry, "tenant_one", base).unwrap(),
-            Some(id)
-        );
-        assert_eq!(
-            release_sync(&registry, "tenant_one", base).unwrap(),
-            Some(id)
-        );
-        assert_eq!(
-            std::fs::read_to_string(registry.join(id.to_string())).unwrap(),
+            std::fs::read_to_string(registry.join(id.to_string()))?,
             "tenant_one\n"
         );
         assert_eq!(
-            find_sync(&registry, "tenant_one", base).unwrap(),
+            find_sync(&registry, "tenant_one", base)?,
             Some(ProjectIdClaim {
                 id,
                 state: ProjectIdState::Released,
@@ -797,7 +805,7 @@ mod tests {
         );
         assert!(!pending_path(&registry, id).exists());
         assert_eq!(
-            std::fs::read_to_string(tombstone_path(&registry, id)).unwrap(),
+            std::fs::read_to_string(tombstone_path(&registry, id))?,
             "tenant_one\n"
         );
         assert!(matches!(
@@ -809,42 +817,46 @@ mod tests {
             Err(DiskLimitError::ProjectIdExhausted { .. })
         ));
         assert!(tombstone_path(&registry, id).exists());
+
+        Ok(())
     }
 
     #[test]
-    fn recreated_owner_gets_a_new_id_without_reactivating_its_tombstone() {
-        let temp = tempfile::tempdir().unwrap();
+    fn recreated_owner_gets_a_new_id_without_reactivating_its_tombstone() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
         let base = u32::MAX - 1;
-        let old_id = allocate_sync(&registry, "tenant_one", base).unwrap();
-        release_sync(&registry, "tenant_one", base).unwrap();
+        let old_id = allocate_sync(&registry, "tenant_one", base)?;
+        release_sync(&registry, "tenant_one", base)?;
 
-        let new_id = allocate_sync(&registry, "tenant_one", base).unwrap();
+        let new_id = allocate_sync(&registry, "tenant_one", base)?;
 
         assert_ne!(old_id, new_id);
         assert!(tombstone_path(&registry, old_id).exists());
         assert_eq!(
-            find_sync(&registry, "tenant_one", base).unwrap(),
+            find_sync(&registry, "tenant_one", base)?,
             Some(ProjectIdClaim {
                 id: new_id,
                 state: ProjectIdState::Pending,
             })
         );
+
+        Ok(())
     }
 
     #[test]
-    fn release_tombstones_a_pending_only_reservation() {
-        let temp = tempfile::tempdir().unwrap();
+    fn release_tombstones_a_pending_only_reservation() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
         let base = u32::MAX;
-        create_private_registry(&registry).unwrap();
+        create_private_registry(&registry)?;
         let id = initial_project_id("tenant", base, allocation_span(base));
-        claim(&pending_path(&registry, id), "tenant").unwrap();
+        claim(&pending_path(&registry, id), "tenant")?;
 
-        assert_eq!(release_sync(&registry, "tenant", base).unwrap(), Some(id));
+        assert_eq!(release_sync(&registry, "tenant", base)?, Some(id));
         assert!(!pending_path(&registry, id).exists());
         assert_eq!(
-            find_sync(&registry, "tenant", base).unwrap(),
+            find_sync(&registry, "tenant", base)?,
             Some(ProjectIdClaim {
                 id,
                 state: ProjectIdState::Released,
@@ -854,27 +866,31 @@ mod tests {
             allocate_sync(&registry, "tenant", base),
             Err(DiskLimitError::ProjectIdExhausted { .. })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn allocation_is_confined_to_the_reserved_range() {
-        let temp = tempfile::tempdir().unwrap();
+    fn allocation_is_confined_to_the_reserved_range() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
         let base = 200_000;
 
-        let id = allocate_sync(&registry, "inst_one", base).unwrap();
+        let id = allocate_sync(&registry, "inst_one", base)?;
 
         assert!(id >= base);
         assert!(u64::from(id) < u64::from(base) + PROJECT_ID_ALLOCATION_RANGE_SIZE);
         assert_eq!(allocation_span(base), PROJECT_ID_ALLOCATION_RANGE_SIZE);
         assert_eq!(allocation_span(u32::MAX - 1), 2);
+
+        Ok(())
     }
 
     #[test]
-    fn concurrent_allocation_for_one_instance_returns_one_id() {
+    fn concurrent_allocation_for_one_instance_returns_one_id() -> anyhow::Result<()> {
         use std::sync::{Arc, Barrier};
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let registry = Arc::new(temp.path().join(REGISTRY_DIRECTORY));
         let barrier = Arc::new(Barrier::new(8));
         let handles = (0..8)
@@ -883,53 +899,59 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    allocate_sync(&registry, "inst_one", 200_000).unwrap()
+                    allocate_sync(&registry, "inst_one", 200_000)
+                        .expect("allocate sync should succeed")
                 })
             })
             .collect::<Vec<_>>();
         let ids = handles
             .into_iter()
-            .map(|handle| handle.join().unwrap())
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("concurrent allocation for one instance returns one id should succeed")
+            })
             .collect::<Vec<_>>();
 
         assert!(ids.iter().all(|id| *id == ids[0]));
+
+        Ok(())
     }
 
     #[test]
-    fn registry_permissions_are_private() {
+    fn registry_permissions_are_private() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let registry = temp.path().join(REGISTRY_DIRECTORY);
-        let id = allocate_sync(&registry, "inst_one", 200_000).unwrap();
+        let id = allocate_sync(&registry, "inst_one", 200_000)?;
 
         assert_eq!(
-            std::fs::metadata(&registry).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&registry)?.permissions().mode() & 0o777,
             0o700
         );
         assert_eq!(
-            std::fs::metadata(registry.join(id.to_string()))
-                .unwrap()
+            std::fs::metadata(registry.join(id.to_string()))?
                 .permissions()
                 .mode()
                 & 0o777,
             0o600
         );
         assert_eq!(
-            std::fs::metadata(pending_path(&registry, id))
-                .unwrap()
+            std::fs::metadata(pending_path(&registry, id))?
                 .permissions()
                 .mode()
                 & 0o777,
             0o600
         );
         assert_eq!(
-            std::fs::metadata(registry.join(REGISTRY_LOCK_FILE))
-                .unwrap()
+            std::fs::metadata(registry.join(REGISTRY_LOCK_FILE))?
                 .permissions()
                 .mode()
                 & 0o777,
             0o600
         );
+
+        Ok(())
     }
 }

@@ -432,48 +432,51 @@ mod tests {
     }
 
     #[test]
-    fn verification_checks_sizes_and_checksums() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(snapshot_file(0)), b"test").unwrap();
-        std::fs::write(dir.path().join(snapshot_file(1)), b"test").unwrap();
+    fn verification_checks_sizes_and_checksums() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(snapshot_file(0)), b"test")?;
+        std::fs::write(dir.path().join(snapshot_file(1)), b"test")?;
         std::fs::write(
             dir.path().join(MANIFEST_FILE),
-            serde_json::to_vec(&manifest()).unwrap(),
-        )
-        .unwrap();
-        let summary = verify_collections(dir.path()).unwrap();
+            serde_json::to_vec(&manifest())?,
+        )?;
+        let summary = verify_collections(dir.path()).map_err(anyhow::Error::msg)?;
         assert_eq!(
             (summary.collections, summary.aliases, summary.bytes),
             (2, 1, 8)
         );
 
-        std::fs::write(dir.path().join(snapshot_file(1)), b"tess").unwrap();
+        std::fs::write(dir.path().join(snapshot_file(1)), b"tess")?;
         assert!(
             verify_collections(dir.path())
-                .unwrap_err()
+                .expect_err("path should return an error")
                 .contains("checksum")
         );
-        std::fs::write(dir.path().join(snapshot_file(1)), b"tests").unwrap();
+        std::fs::write(dir.path().join(snapshot_file(1)), b"tests")?;
         assert!(
             verify_collections(dir.path())
-                .unwrap_err()
+                .expect_err("path should return an error")
                 .contains("bytes")
         );
-        std::fs::remove_file(dir.path().join(snapshot_file(1))).unwrap();
+        std::fs::remove_file(dir.path().join(snapshot_file(1)))?;
         assert!(verify_collections(dir.path()).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn staging_moves_snapshots_into_the_import_layout() {
-        let payload = tempfile::tempdir().unwrap();
-        let staging = tempfile::tempdir().unwrap();
-        std::fs::write(payload.path().join(snapshot_file(0)), b"a").unwrap();
-        std::fs::write(payload.path().join(snapshot_file(1)), b"b").unwrap();
-        stage_snapshots(payload.path(), staging.path(), &manifest()).unwrap();
+    fn staging_moves_snapshots_into_the_import_layout() -> anyhow::Result<()> {
+        let payload = tempfile::tempdir()?;
+        let staging = tempfile::tempdir()?;
+        std::fs::write(payload.path().join(snapshot_file(0)), b"a")?;
+        std::fs::write(payload.path().join(snapshot_file(1)), b"b")?;
+        stage_snapshots(payload.path(), staging.path(), &manifest()).map_err(anyhow::Error::msg)?;
         assert_eq!(
-            std::fs::read(staging.path().join("source-1.snapshot")).unwrap(),
+            std::fs::read(staging.path().join("source-1.snapshot"))?,
             b"b"
         );
         assert!(!payload.path().join(snapshot_file(0)).exists());
+
+        Ok(())
     }
 }

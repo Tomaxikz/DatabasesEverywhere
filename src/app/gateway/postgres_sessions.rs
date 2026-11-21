@@ -191,6 +191,8 @@ fn auth_needs_frontend_reply(message: &[u8]) -> Result<bool, PostgresSessionErro
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     async fn proxy_startup_and_register<C, B>(
@@ -214,26 +216,30 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_authentication_messages_that_require_a_frontend_reply() {
+    fn recognizes_only_authentication_messages_that_require_a_frontend_reply() -> anyhow::Result<()>
+    {
         for code in [3_i32, 5, 7, 8, 9, 10, 11] {
             let mut message = vec![b'R'];
             message.extend_from_slice(&8_u32.to_be_bytes());
             message.extend_from_slice(&code.to_be_bytes());
-            assert!(auth_needs_frontend_reply(&message).unwrap());
+            assert!(auth_needs_frontend_reply(&message)?);
         }
         for code in [0_i32, 2, 6, 12] {
             let mut message = vec![b'R'];
             message.extend_from_slice(&8_u32.to_be_bytes());
             message.extend_from_slice(&code.to_be_bytes());
-            assert!(!auth_needs_frontend_reply(&message).unwrap());
+            assert!(!auth_needs_frontend_reply(&message)?);
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn backend_key_is_registered_only_for_the_live_session_and_forwards_exact_cancel() {
-        let directory = tempfile::tempdir().unwrap();
+    async fn backend_key_is_registered_only_for_the_live_session_and_forwards_exact_cancel()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let socket = directory.path().join("postgres.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket)?;
         let instance_id = "inst_postgres_cancel";
         let endpoint = BackendEndpoint::UnixSocket {
             socket_path: socket.display().to_string(),
@@ -245,18 +251,18 @@ mod tests {
             backend
                 .write_all(&postgres_message(b'R', &0_i32.to_be_bytes()))
                 .await
-                .unwrap();
+                .expect("to be bytes should succeed");
             let mut key_body = Vec::new();
             key_body.extend_from_slice(&123_i32.to_be_bytes());
             key_body.extend_from_slice(&456_i32.to_be_bytes());
             backend
                 .write_all(&postgres_message(b'K', &key_body))
                 .await
-                .unwrap();
+                .expect("postgres message should succeed");
             backend
                 .write_all(&postgres_message(b'Z', b"I"))
                 .await
-                .unwrap();
+                .expect("postgres message should succeed");
         });
         let registration = proxy_startup_and_register(
             &mut proxy_client,
@@ -265,12 +271,11 @@ mod tests {
             &endpoint,
             &network,
         )
-        .await
-        .unwrap();
+        .await?;
         assert!(registration.is_some());
-        backend_startup.await.unwrap();
+        backend_startup.await?;
         let mut forwarded_startup = vec![0_u8; 9 + 13 + 6];
-        client.read_exact(&mut forwarded_startup).await.unwrap();
+        client.read_exact(&mut forwarded_startup).await?;
         assert!(
             forwarded_startup
                 .windows(5)
@@ -288,28 +293,25 @@ mod tests {
             packet
         };
         let received_cancel = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut stream, _) = listener.accept().await.expect("accept should succeed");
             let mut packet = [0_u8; 16];
-            stream.read_exact(&mut packet).await.unwrap();
+            stream
+                .read_exact(&mut packet)
+                .await
+                .expect("read exact should succeed");
             packet
         });
-        assert!(
-            forward_cancel(CancelKey::from((123, 456)), &cancel)
-                .await
-                .unwrap()
-        );
-        assert_eq!(received_cancel.await.unwrap().as_slice(), cancel);
+        assert!(forward_cancel(CancelKey::from((123, 456)), &cancel).await?);
+        assert_eq!(received_cancel.await?.as_slice(), cancel);
 
         drop(registration);
-        assert!(
-            !forward_cancel(CancelKey::from((123, 456)), &cancel)
-                .await
-                .unwrap()
-        );
+        assert!(!forward_cancel(CancelKey::from((123, 456)), &cancel).await?);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn backend_error_is_not_an_authenticated_session() {
+    async fn backend_error_is_not_an_authenticated_session() -> anyhow::Result<()> {
         let endpoint = BackendEndpoint::UnixSocket {
             socket_path: "/tmp/not-used.sock".to_string(),
         };
@@ -320,7 +322,7 @@ mod tests {
             backend
                 .write_all(&postgres_message(b'E', b"SERROR\0\0"))
                 .await
-                .unwrap();
+                .expect("postgres message should succeed");
         });
 
         let registration = proxy_startup_and_register(
@@ -330,14 +332,15 @@ mod tests {
             &endpoint,
             &network,
         )
-        .await
-        .unwrap();
-        backend_startup.await.unwrap();
+        .await?;
+        backend_startup.await?;
 
         assert!(registration.is_none());
         let mut forwarded = vec![0_u8; 13];
-        client.read_exact(&mut forwarded).await.unwrap();
+        client.read_exact(&mut forwarded).await?;
         assert_eq!(forwarded[0], b'E');
+
+        Ok(())
     }
 
     fn postgres_message(kind: u8, body: &[u8]) -> Vec<u8> {
@@ -348,30 +351,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn variable_cancel_keys_wait_for_admission_and_forward_unchanged() {
+    async fn variable_cancel_keys_wait_for_admission_and_forward_unchanged() -> anyhow::Result<()> {
         for key_size in [32, 256] {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir()?;
             let socket = directory.path().join("postgres.sock");
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let listener = tokio::net::UnixListener::bind(&socket)?;
             let endpoint = BackendEndpoint::UnixSocket {
                 socket_path: socket.display().to_string(),
             };
             let mut body = 789_i32.to_be_bytes().to_vec();
             body.extend(vec![7_u8; key_size]);
-            let key = CancelKey::from_backend_data(&body).unwrap();
+            let key = CancelKey::from_backend_data(&body)
+                .context("expected a value from from_backend_data")?;
             let mut startup_bytes = postgres_message(b'R', &0_i32.to_be_bytes());
             startup_bytes.extend(postgres_message(b'K', &body));
             let forwarded_len = startup_bytes.len();
             startup_bytes.extend(postgres_message(b'Z', b"I"));
             let (mut backend, mut engine) = tokio::io::duplex(1024);
-            engine.write_all(&startup_bytes).await.unwrap();
+            engine.write_all(&startup_bytes).await?;
             let (mut proxy, mut client) = tokio::io::duplex(1024);
             let startup = proxy_startup(&mut proxy, &mut backend)
-                .await
-                .unwrap()
-                .unwrap();
+                .await?
+                .context("proxy startup should provide a value")?;
             let mut forwarded = vec![0; forwarded_len];
-            client.read_exact(&mut forwarded).await.unwrap();
+            client.read_exact(&mut forwarded).await?;
             assert_eq!(forwarded, startup_bytes[..forwarded_len]);
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(1), client.read_u8())
@@ -386,10 +389,9 @@ mod tests {
                     &endpoint,
                     &NetworkCounter::default(),
                 )
-                .await
-                .unwrap();
+                .await?;
             let mut ready = [0; 6];
-            client.read_exact(&mut ready).await.unwrap();
+            client.read_exact(&mut ready).await?;
             assert_eq!(ready.as_slice(), postgres_message(b'Z', b"I"));
 
             let mut packet = ((8 + body.len()) as u32).to_be_bytes().to_vec();
@@ -399,13 +401,15 @@ mod tests {
                 crate::gateway::protocols::postgres::cancel_request_key(&packet),
                 Some(key.clone())
             );
-            assert!(forward_cancel(key.clone(), &packet).await.unwrap());
-            let (mut received, _) = listener.accept().await.unwrap();
+            assert!(forward_cancel(key.clone(), &packet).await?);
+            let (mut received, _) = listener.accept().await?;
             let mut bytes = Vec::new();
-            received.read_to_end(&mut bytes).await.unwrap();
+            received.read_to_end(&mut bytes).await?;
             assert_eq!(bytes, packet);
             drop(registration);
             assert!(!cancel_targets().read().contains_key(&key));
         }
+
+        Ok(())
     }
 }

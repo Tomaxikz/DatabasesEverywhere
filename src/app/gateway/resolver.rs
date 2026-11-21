@@ -396,6 +396,8 @@ fn should_retry_without_database(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::{
         databases::protocol::Protocol,
@@ -428,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mongodb_accounting_opens_only_after_current_route_activation() {
+    async fn mongodb_accounting_opens_only_after_current_route_activation() -> anyhow::Result<()> {
         let store = InstanceStore::default();
         let resources = ResourceCache::default();
         let sessions = crate::gateway::sessions::TenantSessions::default();
@@ -444,7 +446,7 @@ mod tests {
         let pending = resolver
             .resolve_mongodb_pending("tenant_user", "tenant_db")
             .await
-            .unwrap();
+            .context("expected a value from resolve_mongodb_pending")?;
         assert_eq!(sessions.active("tenant-mongo"), 0);
         assert!(store.fence_routes("tenant-mongo").await);
         assert!(resolver.activate_mongodb(pending).await.is_none());
@@ -454,11 +456,16 @@ mod tests {
         let pending = resolver
             .resolve_mongodb_pending("tenant_user", "tenant_db")
             .await
-            .unwrap();
-        let active = resolver.activate_mongodb(pending).await.unwrap();
+            .context("expected a value from resolve_mongodb_pending")?;
+        let active = resolver
+            .activate_mongodb(pending)
+            .await
+            .context("expected a value from activate_mongodb")?;
         assert_eq!(sessions.active("tenant-mongo"), 1);
         drop(active);
         assert_eq!(sessions.active("tenant-mongo"), 0);
+
+        Ok(())
     }
 
     fn mongodb_metadata() -> InstanceMetadata {

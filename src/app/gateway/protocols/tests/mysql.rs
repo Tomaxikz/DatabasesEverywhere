@@ -8,7 +8,9 @@ const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 const CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
 
 #[tokio::test]
-async fn gateway_wire_versions_are_plain_vendor_compatible_ascii() {
+async fn gateway_wire_versions_are_plain_vendor_compatible_ascii() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     for (flavor, expected) in [
         (GatewayFlavor::Mysql, "8.0.11"),
         (GatewayFlavor::Mariadb, "5.5.5-10.11.0-MariaDB"),
@@ -17,48 +19,54 @@ async fn gateway_wire_versions_are_plain_vendor_compatible_ascii() {
         let task = tokio::spawn(async move {
             mariadb::send_gateway_handshake(&mut writer, b"12345678901234567890", flavor, false)
                 .await
-                .unwrap();
+                .expect("send gateway handshake should succeed");
         });
-        let packet = mariadb::read_packet(&mut reader).await.unwrap();
-        task.await.unwrap();
+        let packet = mariadb::read_packet(&mut reader).await?;
+        task.await?;
         assert_eq!(packet.payload[0], 10);
         let version_end = packet.payload[1..]
             .iter()
             .position(|byte| *byte == 0)
-            .unwrap()
+            .context("expected a value from position")?
             + 1;
         assert_eq!(
-            std::str::from_utf8(&packet.payload[1..version_end]).unwrap(),
+            std::str::from_utf8(&packet.payload[1..version_end])?,
             expected
         );
         assert!(!expected.contains("databases-everywhere"));
     }
+
+    Ok(())
 }
 
 #[test]
-fn recognizes_the_official_fixed_size_ssl_request() {
+fn recognizes_the_official_fixed_size_ssl_request() -> anyhow::Result<()> {
     let mut request = vec![0_u8; 32];
     request[..4].copy_from_slice(&(CLIENT_PROTOCOL_41 | CLIENT_SSL).to_le_bytes());
     request[8] = 45;
-    assert!(mariadb::is_ssl_request(&request).unwrap());
+    assert!(mariadb::is_ssl_request(&request)?);
 
     request.extend_from_slice(b"not-an-ssl-request");
-    assert!(!mariadb::is_ssl_request(&request).unwrap());
+    assert!(!mariadb::is_ssl_request(&request)?);
+
+    Ok(())
 }
 
 #[test]
-fn connector_j_and_mariadb_jdbc_handshake_shapes_route_identically() {
+fn connector_j_and_mariadb_jdbc_handshake_shapes_route_identically() -> anyhow::Result<()> {
     for attributes in [
         &b"\x0c\x03_os\x05Linux"[..],
         &b"\x17\x0c_client_name\x07libmariadb"[..],
         &b"\x1a\x0f_client_version\x079.2.0"[..],
     ] {
         let payload = handshake_response("tenant_user", "tenant_db", attributes);
-        let route = mariadb::parse_client_handshake_response(&payload).unwrap();
+        let route = mariadb::parse_client_handshake_response(&payload)?;
         assert_eq!(route.username, "tenant_user");
         assert_eq!(route.database, "tenant_db");
         assert_eq!(route.auth_response, vec![0x41; 20]);
     }
+
+    Ok(())
 }
 
 #[test]
@@ -96,7 +104,7 @@ fn native_password_tokens_keep_the_existing_sha1_format() {
 }
 
 #[test]
-fn backend_handshake_preserves_the_client_character_set() {
+fn backend_handshake_preserves_the_client_character_set() -> anyhow::Result<()> {
     let seed = b"12345678901234567890";
     let verifier = mariadb::native_password_sha1_stage2_hex("secret");
     for character_set in [8, 33, 45, 63, 224, 255] {
@@ -105,7 +113,7 @@ fn backend_handshake_preserves_the_client_character_set() {
         let token_offset = 32 + "tenant_user".len() + 2;
         payload[token_offset..token_offset + 20]
             .copy_from_slice(&mariadb::native_password_token("secret", seed));
-        let route = mariadb::parse_client_handshake_response(&payload).unwrap();
+        let route = mariadb::parse_client_handshake_response(&payload)?;
         for plugin in ["mysql_native_password", "caching_sha2_password"] {
             let backend = mariadb::BackendHandshake {
                 auth_seed: seed.to_vec(),
@@ -117,11 +125,12 @@ fn backend_handshake_preserves_the_client_character_set() {
                 seed,
                 &verifier,
                 Some("secret"),
-            )
-            .unwrap();
+            )?;
             assert_eq!(response[8], character_set);
         }
     }
+
+    Ok(())
 }
 
 fn handshake_response(username: &str, database: &str, attributes: &[u8]) -> Vec<u8> {

@@ -202,7 +202,7 @@ mod tests {
             client
                 .write_all(&((MAX_ROUTING_HANDSHAKE_BYTES + 1) as u32).to_be_bytes())
                 .await
-                .unwrap();
+                .expect("to be bytes should succeed");
         });
 
         assert!(matches!(

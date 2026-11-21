@@ -31,6 +31,8 @@ pub(super) fn for_protocol(protocol: Protocol) -> Option<&'static dyn EngineTele
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::super::SampleMode;
     use super::*;
 
@@ -47,15 +49,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_preserves_preparation_and_send_contracts() {
+    async fn registry_preserves_preparation_and_send_contracts() -> anyhow::Result<()> {
         let docker = DockerRuntime::offline_for_tests(&Default::default(), false);
         for protocol in [Protocol::Mysql, Protocol::Mariadb, Protocol::Clickhouse] {
-            let backend = for_protocol(protocol).unwrap();
+            let backend = for_protocol(protocol).context("expected a value from for_protocol")?;
             let runtime = runtime(protocol);
             let result = assert_send(backend.prepare(&docker, &runtime)).await;
             if protocol == Protocol::Clickhouse {
                 assert!(!backend.requires_preparation());
-                assert_eq!(result.unwrap(), None);
+                assert_eq!(result?, None);
             } else {
                 assert!(backend.requires_preparation());
                 assert!(matches!(result, Err(CollectError::Unavailable)));
@@ -72,6 +74,8 @@ mod tests {
             .await;
             assert!(matches!(result, Err(CollectError::Unavailable)));
         }
+
+        Ok(())
     }
 
     #[test]
@@ -88,19 +92,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mysql_without_capabilities_does_not_execute_a_command() {
+    async fn mysql_without_capabilities_does_not_execute_a_command() -> anyhow::Result<()> {
         let docker = DockerRuntime::offline_for_tests(&Default::default(), false);
         let runtime = runtime(Protocol::Mysql);
         let capabilities = Capabilities::default();
         let sample = for_protocol(runtime.protocol)
-            .unwrap()
+            .context("expected a value from for_protocol")?
             .collect(&docker, &runtime, capabilities, Some(42))
-            .await
-            .unwrap();
+            .await?;
 
         assert_eq!(sample.capabilities, capabilities);
         assert_eq!(sample.mode, SampleMode::Cumulative);
         assert!(sample.rows.is_empty());
         assert_eq!(sample.next_clickhouse_checkpoint, None);
+
+        Ok(())
     }
 }

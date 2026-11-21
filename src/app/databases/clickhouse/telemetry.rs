@@ -68,13 +68,15 @@ impl ClickhouseTelemetry {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn clickhouse_sample_preserves_interval_capabilities_and_checkpoint() {
+    fn clickhouse_sample_preserves_interval_capabilities_and_checkpoint() -> anyhow::Result<()> {
         let output = "__DBE_CUTOFF__\t42\nuser_a\t25\t4096\t2\t1\t0\t1\n";
         for previous in [None, Some(41), Some(42)] {
-            let sample = ClickhouseTelemetry::sample(output, previous).unwrap();
+            let sample = ClickhouseTelemetry::sample(output, previous)?;
             assert_eq!(sample.mode, SampleMode::Interval);
             assert_eq!(sample.next_clickhouse_checkpoint, Some(42));
             assert_eq!(
@@ -85,7 +87,7 @@ mod tests {
                     operations: true,
                 }
             );
-            let row = sample.rows.get("user_a").unwrap();
+            let row = sample.rows.get("user_a").context("missing user_a entry")?;
             assert_eq!(row.cpu_time_micros, 25);
             assert_eq!(row.peak_query_memory_bytes, 4096);
             assert_eq!(row.operations.read, 2);
@@ -93,6 +95,8 @@ mod tests {
             assert_eq!(row.operations.ddl, 0);
             assert_eq!(row.operations.other, 1);
         }
+
+        Ok(())
     }
 
     #[test]

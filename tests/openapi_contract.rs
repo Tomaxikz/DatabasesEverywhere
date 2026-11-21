@@ -564,8 +564,8 @@ fn openapi_describes_the_current_response_contract() {
 }
 
 #[test]
-fn lean_stream_and_catalog_schemas_match_the_current_payloads() {
-    let document: Value = yaml_serde::from_str(include_str!("../docs/api/openapi.yml")).unwrap();
+fn lean_stream_and_catalog_schemas_match_the_current_payloads() -> anyhow::Result<()> {
+    let document: Value = yaml_serde::from_str(include_str!("../docs/api/openapi.yml"))?;
     let schemas = &document["components"]["schemas"];
     assert_eq!(
         property_names(&schemas["MonitoringResources"]),
@@ -599,4 +599,6 @@ fn lean_stream_and_catalog_schemas_match_the_current_payloads() {
     assert!(property_names(&schemas["BackupObjectSummary"]).contains("column_count"));
     assert!(!property_names(&schemas["BackupObjectSummary"]).contains("columns"));
     assert!(property_names(&schemas["BackupObjectSelection"]).contains("columns"));
+
+    Ok(())
 }

@@ -179,44 +179,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn required_capacity_includes_existing_reservations_and_safety_reserve() {
+    fn required_capacity_includes_existing_reservations_and_safety_reserve() -> anyhow::Result<()> {
         assert_eq!(
-            required_capacity(1024, 2048).unwrap(),
+            required_capacity(1024, 2048)?,
             DISK_SAFETY_RESERVE_BYTES + 3072
         );
         assert!(matches!(
             required_capacity(u64::MAX, 1),
             Err(CapacityError::Overflow)
         ));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn reservations_share_filesystem_totals_and_release_exactly_once() {
+    async fn reservations_share_filesystem_totals_and_release_exactly_once() -> anyhow::Result<()> {
         let service = DiskCapacityService::default();
-        let directory = tempfile::tempdir().unwrap();
-        let first = service.reserve(directory.path(), 1024).await.unwrap();
-        let second = service.reserve(directory.path(), 2048).await.unwrap();
+        let directory = tempfile::tempdir()?;
+        let first = service.reserve(directory.path(), 1024).await?;
+        let second = service.reserve(directory.path(), 2048).await?;
         assert_eq!(service.reserved_bytes(), 3072);
 
         drop(first);
         assert_eq!(service.reserved_bytes(), 2048);
         drop(second);
         assert_eq!(service.reserved_bytes(), 0);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn reservation_rejects_symlink_roots() {
+    async fn reservation_rejects_symlink_roots() -> anyhow::Result<()> {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let target = directory.path().join("target");
-        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(&target)?;
         let link = directory.path().join("link");
-        symlink(&target, &link).unwrap();
+        symlink(&target, &link)?;
 
         assert!(matches!(
             DiskCapacityService::default().reserve(&link, 1).await,
             Err(CapacityError::InvalidRoot)
         ));
+
+        Ok(())
     }
 }

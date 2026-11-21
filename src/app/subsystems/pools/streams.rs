@@ -305,9 +305,11 @@ pub(crate) async fn backups(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     #[test]
-    fn pool_grants_are_bound_to_owner_and_generation() {
+    fn pool_grants_are_bound_to_owner_and_generation() -> anyhow::Result<()> {
         let pool = crate::server::placement::test_support::runtime(
             "pool-one",
             crate::databases::protocol::Protocol::Mysql,
@@ -316,13 +318,15 @@ mod tests {
         let mut grant = PoolGrant {
             runtime_id: pool.runtime_id.clone(),
             created_at: pool.created_at.clone(),
-            owner: pool.owner.clone().unwrap(),
+            owner: pool.owner.clone().context("expected a value from clone")?,
         };
         assert!(grant.matches(&pool));
         grant.owner.server_id = "other-server".into();
         assert!(!grant.matches(&pool));
-        grant.owner = pool.owner.clone().unwrap();
+        grant.owner = pool.owner.clone().context("expected a value from clone")?;
         grant.created_at = "different-generation".into();
         assert!(!grant.matches(&pool));
+
+        Ok(())
     }
 }

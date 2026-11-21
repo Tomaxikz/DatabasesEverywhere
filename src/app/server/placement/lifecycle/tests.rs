@@ -23,16 +23,18 @@ use crate::{
 };
 
 #[tokio::test]
-async fn runtime_tenant_lookup_preserves_provisioning_state() {
-    let directory = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(directory.path()).await.unwrap();
+async fn runtime_tenant_lookup_preserves_provisioning_state() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let directory = tempfile::tempdir()?;
+    let pool = sqlite::connect(directory.path()).await?;
     let placements = PlacementRepository::new(pool.clone());
     let manager = InstanceManager::new(
         InstanceStore::default(),
         InstanceRepository::new(pool.clone()),
     );
     let runtime = runtime();
-    placements.save(&runtime).await.unwrap();
+    placements.save(&runtime).await?;
     let limits = InstanceLimits {
         cpu_cores: 0.1,
         memory_mib: 128,
@@ -41,15 +43,16 @@ async fn runtime_tenant_lookup_preserves_provisioning_state() {
     };
     placements
         .reserve(ReserveTenant {
-            owner: runtime.owner.clone().unwrap(),
+            owner: runtime.owner.clone().context(
+                "runtime tenant lookup preserves provisioning state should provide a value",
+            )?,
             instance_id: "tenant-in-progress",
             runtime_id: &runtime.runtime_id,
             database: "tenant_db",
             username: "tenant_user",
             limits: &limits,
         })
-        .await
-        .unwrap();
+        .await?;
 
     let tenants = runtime_tenants(&placements, &manager, &runtime.runtime_id).await;
     assert_eq!(
@@ -57,15 +60,14 @@ async fn runtime_tenant_lookup_preserves_provisioning_state() {
         Some(&Some(TenantReservationState::Reserved))
     );
 
-    placements
-        .mark_provisioned("tenant-in-progress")
-        .await
-        .unwrap();
+    placements.mark_provisioned("tenant-in-progress").await?;
     let tenants = runtime_tenants(&placements, &manager, &runtime.runtime_id).await;
     assert_eq!(
         tenants.get("tenant-in-progress"),
         Some(&Some(TenantReservationState::Provisioned))
     );
+
+    Ok(())
 }
 
 #[test]
@@ -156,7 +158,9 @@ fn container_identity_and_event_staleness_handle_docker_short_ids() {
 }
 
 #[test]
-fn shared_attestation_reuse_requires_exact_container_image_and_revision() {
+fn shared_attestation_reuse_requires_exact_container_image_and_revision() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let mut runtime = runtime();
     for (container, image, expected) in [
         ("container-id", "sha256:image-id", true),
@@ -168,13 +172,18 @@ fn shared_attestation_reuse_requires_exact_container_image_and_revision() {
             expected
         );
     }
-    runtime.compatibility.as_mut().unwrap().probe_revision =
-        COMPATIBILITY_PROBE_REVISION.saturating_add(1);
+    runtime
+        .compatibility
+        .as_mut()
+        .context("expected a value from as_mut")?
+        .probe_revision = COMPATIBILITY_PROBE_REVISION.saturating_add(1);
     assert!(!compatibility::attestation_matches(
         &runtime,
         "container-id",
         "sha256:image-id"
     ));
+
+    Ok(())
 }
 
 #[test]

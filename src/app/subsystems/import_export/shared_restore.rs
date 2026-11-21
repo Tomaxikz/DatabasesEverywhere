@@ -454,15 +454,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn helper_reads_only_the_mounted_inspected_input() {
+    fn helper_reads_only_the_mounted_inspected_input() -> anyhow::Result<()> {
         let script = "set -eu\nmysql < /dev/stdin\ncat /dev/stdin >/tmp/check";
-        let rewritten = helper_script(script).unwrap();
+        let rewritten = helper_script(script)?;
         assert!(!rewritten.contains("/dev/stdin"));
         assert_eq!(rewritten.matches(IMPORT_HELPER_INPUT_PATH).count(), 2);
+
+        Ok(())
     }
 
     #[test]
-    fn shared_helper_rejects_admin_credentials() {
+    fn shared_helper_rejects_admin_credentials() -> anyhow::Result<()> {
         let password = SecretString::from("secret".to_string());
         assert!(
             tenant_environment(
@@ -476,13 +478,14 @@ mod tests {
             Protocol::Mysql,
             "tenant_db",
             &[("DBE_IMPORT_PASSWORD", &password)],
-        )
-        .unwrap();
+        )?;
         assert_eq!(environment[0].key, "DBE_IMPORT_PASSWORD");
+
+        Ok(())
     }
 
     #[test]
-    fn shared_helper_receives_each_tenant_database_name() {
+    fn shared_helper_receives_each_tenant_database_name() -> anyhow::Result<()> {
         let stale_database = SecretString::from("dbe_control".to_string());
         for (protocol, key) in [
             (Protocol::Postgres, "POSTGRES_DB"),
@@ -491,54 +494,52 @@ mod tests {
             (Protocol::Mongodb, "DBE_MONGO_DATABASE"),
             (Protocol::Clickhouse, "CLICKHOUSE_DB"),
         ] {
-            let environment =
-                tenant_environment(protocol, "tenant_db", &[(key, &stale_database)]).unwrap();
+            let environment = tenant_environment(protocol, "tenant_db", &[(key, &stale_database)])?;
             assert_eq!(environment.len(), 1);
             assert_eq!(environment[0].key, key);
             assert_eq!(environment[0].value.expose_secret(), "tenant_db");
         }
         assert!(tenant_environment(Protocol::Redis, "tenant_db", &[]).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn tiny_restore_has_a_bounded_workspace_margin() {
-        assert_eq!(
-            helper_work_limit(1).unwrap(),
-            SHARED_HELPER_WORK_MARGIN_BYTES + 1
-        );
+    fn tiny_restore_has_a_bounded_workspace_margin() -> anyhow::Result<()> {
+        assert_eq!(helper_work_limit(1)?, SHARED_HELPER_WORK_MARGIN_BYTES + 1);
         assert!(helper_work_limit(u64::MAX).is_err());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn pinned_input_survives_source_inode_mutation() {
-        let directory = tempfile::tempdir().unwrap();
+    async fn pinned_input_survives_source_inode_mutation() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let source = directory.path().join("dump.sql");
-        std::fs::write(&source, b"SELECT 1;").unwrap();
+        std::fs::write(&source, b"SELECT 1;")?;
         let expected: [u8; 32] = Sha256::digest(b"SELECT 1;").into();
-        let pinned = pin_input(&source, directory.path(), 9, &expected)
-            .await
-            .unwrap();
+        let pinned = pin_input(&source, directory.path(), 9, &expected).await?;
 
-        std::fs::write(&source, b"malicious").unwrap();
+        std::fs::write(&source, b"malicious")?;
 
-        assert_eq!(std::fs::read(&pinned.input).unwrap(), b"SELECT 1;");
+        assert_eq!(std::fs::read(&pinned.input)?, b"SELECT 1;");
         assert_eq!(
-            Sha256::digest(std::fs::read(&pinned.input).unwrap()).as_slice(),
+            Sha256::digest(std::fs::read(&pinned.input)?).as_slice(),
             expected
         );
-        pinned.cleanup().await.unwrap();
+        pinned.cleanup().await?;
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn dropped_pin_schedules_sandbox_cleanup() {
-        let directory = tempfile::tempdir().unwrap();
+    async fn dropped_pin_schedules_sandbox_cleanup() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let source = directory.path().join("dump.sql");
-        std::fs::write(&source, b"SELECT 1;").unwrap();
+        std::fs::write(&source, b"SELECT 1;")?;
         let root = {
             let expected: [u8; 32] = Sha256::digest(b"SELECT 1;").into();
-            let pinned = pin_input(&source, directory.path(), 9, &expected)
-                .await
-                .unwrap();
+            let pinned = pin_input(&source, directory.path(), 9, &expected).await?;
             pinned.root.clone()
         };
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -548,6 +549,8 @@ mod tests {
         })
         .await
         .expect("dropped sandbox pin must be cleaned up");
+
+        Ok(())
     }
     #[test]
     fn privileged_wipe_requires_exact_tenant_reservation_and_pool_ownership() {

@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[tokio::test]
-async fn create_request_enforces_configured_and_allowlisted_images() {
+async fn create_request_enforces_configured_and_allowlisted_images() -> anyhow::Result<()> {
     let (state, _directory) = test_state(Config {
         images: ImageConfig {
             postgres: "postgres:18.4".to_string(),
@@ -26,16 +26,18 @@ async fn create_request_enforces_configured_and_allowlisted_images() {
     for image in ["postgres:18.4", "postgres:18.5"] {
         let mut request = create_request(Protocol::Postgres);
         request.image = Some(image.to_string());
-        assert_eq!(resolve_image(&state, &request).unwrap(), image);
+        assert_eq!(resolve_image(&state, &request)?, image);
     }
     let mut request = create_request(Protocol::Postgres);
     request.image = Some("postgres:18.6".to_string());
     assert!(
         resolve_image(&state, &request)
-            .unwrap_err()
+            .expect_err("resolve image should return an error")
             .to_string()
             .contains("is not allowed")
     );
+
+    Ok(())
 }
 
 #[test]
@@ -47,7 +49,8 @@ fn qdrant_creation_resolves_fuse_fallback_to_soft_scanner() {
 }
 
 #[tokio::test]
-async fn create_request_allows_same_database_name_for_a_distinct_route_user() {
+async fn create_request_allows_same_database_name_for_a_distinct_route_user() -> anyhow::Result<()>
+{
     let (state, _directory) = test_state(Config::default()).await;
     state
         .instances
@@ -63,7 +66,9 @@ async fn create_request_allows_same_database_name_for_a_distinct_route_user() {
     request.database = "shared_db".to_string();
     request.username = "second_user".to_string();
 
-    reject_duplicate_instance(&state, &request).await.unwrap();
+    reject_duplicate_instance(&state, &request).await?;
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -86,7 +91,7 @@ async fn create_request_rejects_existing_cache_route_for_username() {
 
         let error = reject_duplicate_instance(&state, &request)
             .await
-            .unwrap_err();
+            .expect_err("reject duplicate instance should return an error");
         assert!(matches!(error, ApiError::Conflict(_)));
         assert!(
             error.to_string().contains(&format!(
@@ -98,7 +103,7 @@ async fn create_request_rejects_existing_cache_route_for_username() {
 }
 
 #[tokio::test]
-async fn redis_and_valkey_use_separate_route_namespaces() {
+async fn redis_and_valkey_use_separate_route_namespaces() -> anyhow::Result<()> {
     let (state, _directory) = test_state(Config::default()).await;
     state
         .instances
@@ -114,11 +119,13 @@ async fn redis_and_valkey_use_separate_route_namespaces() {
     request.database = "cache".to_string();
     request.username = "shared_user".to_string();
 
-    reject_duplicate_instance(&state, &request).await.unwrap();
+    reject_duplicate_instance(&state, &request).await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn create_never_adopts_or_purges_an_existing_runtime_id() {
+async fn create_never_adopts_or_purges_an_existing_runtime_id() -> anyhow::Result<()> {
     let (state, _directory) = test_state(Config::default()).await;
     let runtime_id = "pool_postgres_reserved";
     let runtime = crate::server::placement::EngineRuntime::legacy_dedicated(
@@ -131,7 +138,7 @@ async fn create_never_adopts_or_purges_an_existing_runtime_id() {
         crate::server::placement::EngineRuntimeStatus::Running,
         "postgres:18.4".to_string(),
     );
-    state.placements.save(&runtime).await.unwrap();
+    state.placements.save(&runtime).await?;
 
     let mut request = create_request(Protocol::Postgres);
     request.instance_id = runtime_id.to_string();
@@ -144,10 +151,12 @@ async fn create_never_adopts_or_purges_an_existing_runtime_id() {
 
     let error = reject_duplicate_instance(&state, &request)
         .await
-        .unwrap_err();
+        .expect_err("reject duplicate instance should return an error");
     assert!(matches!(error, ApiError::Conflict(_)));
     assert!(error.to_string().contains("managed database runtime"));
-    assert!(state.placements.get(runtime_id).await.unwrap().is_some());
+    assert!(state.placements.get(runtime_id).await?.is_some());
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -169,13 +178,15 @@ async fn shared_create_waits_for_boot_recovery() {
 
     let error = create_instance_from_request(&state, request)
         .await
-        .unwrap_err();
+        .expect_err("create instance from request should return an error");
     assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
     assert!(error.to_string().contains("gateway recovery completes"));
 }
 
 #[tokio::test]
-async fn shared_claim_keeps_pool_locked_through_caller_handoff() {
+async fn shared_claim_keeps_pool_locked_through_caller_handoff() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let mut config = Config::default();
     config.allocation.prevent_cpu_overallocation = false;
     config.allocation.prevent_memory_overallocation = false;
@@ -183,7 +194,7 @@ async fn shared_claim_keeps_pool_locked_through_caller_handoff() {
     let (state, _directory) = test_state(config).await;
     let mut request = create_request(Protocol::Postgres);
     request.deployment_mode = crate::server::placement::DeploymentMode::Shared;
-    let image = resolve_image(&state, &request).unwrap();
+    let image = resolve_image(&state, &request)?;
     let limits = crate::utils::limits::InstanceLimits {
         cpu_cores: 0.1,
         memory_mib: 128,
@@ -210,19 +221,16 @@ async fn shared_claim_keeps_pool_locked_through_caller_handoff() {
     request.pool_id = Some(runtime.runtime_id.clone());
     request.owner = runtime.owner.clone();
 
-    state.placements.save(&runtime).await.unwrap();
+    state.placements.save(&runtime).await?;
 
     let (claimed, operation) =
-        super::shared::claim_runtime(&state, &request, &image, &mut limits.clone())
-            .await
-            .unwrap();
+        super::shared::claim_runtime(&state, &request, &image, &mut limits.clone()).await?;
     assert_eq!(
         state
             .placements
             .get_reservation(&request.instance_id)
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get reservation should provide a value")?
             .state,
         crate::server::placement::TenantReservationState::Reserved
     );
@@ -230,8 +238,7 @@ async fn shared_claim_keeps_pool_locked_through_caller_handoff() {
         state
             .manager
             .get_persisted(&request.instance_id)
-            .await
-            .unwrap()
+            .await?
             .is_none()
     );
 
@@ -243,10 +250,9 @@ async fn shared_claim_keeps_pool_locked_through_caller_handoff() {
     tokio::task::yield_now().await;
     assert!(!waiter.is_finished());
     drop(operation);
-    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await??;
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -288,7 +294,7 @@ async fn failed_legacy_mysql_is_removed_without_affecting_healthy_mysql_routes()
 }
 
 #[test]
-fn allocation_guard_rejects_overcommit_but_allows_decreases() {
+fn allocation_guard_rejects_overcommit_but_allows_decreases() -> anyhow::Result<()> {
     for (resource, allocated, requested, pool, free, reserve, diagnostic) in [
         (
             "memory",
@@ -318,7 +324,7 @@ fn allocation_guard_rejects_overcommit_but_allows_decreases() {
             mib_to_bytes(free),
             mib_to_bytes(reserve),
         )
-        .unwrap_err();
+        .expect_err("mib to bytes should return an error");
 
         assert!(matches!(error, ApiError::ServiceUnavailable(_)));
         assert!(error.to_string().contains(diagnostic));
@@ -332,13 +338,15 @@ fn allocation_guard_rejects_overcommit_but_allows_decreases() {
         mib_to_bytes(8_000),
         0,
         mib_to_bytes(512),
-    )
-    .unwrap();
+    )?;
+
+    Ok(())
 }
 
 #[test]
-fn cpu_allocation_guard_rejects_overcommit_but_allows_decreases() {
-    let error = enforce_cpu_allocation(7.5, 0.0, 1.0, 8).unwrap_err();
+fn cpu_allocation_guard_rejects_overcommit_but_allows_decreases() -> anyhow::Result<()> {
+    let error = enforce_cpu_allocation(7.5, 0.0, 1.0, 8)
+        .expect_err("enforce cpu allocation should return an error");
 
     assert!(matches!(error, ApiError::ServiceUnavailable(_)));
     assert!(
@@ -348,7 +356,9 @@ fn cpu_allocation_guard_rejects_overcommit_but_allows_decreases() {
     );
     assert!(error.to_string().contains("detected 8-core capacity"));
 
-    enforce_cpu_allocation(12.0, 4.0, 2.0, 8).unwrap();
+    enforce_cpu_allocation(12.0, 4.0, 2.0, 8)?;
+
+    Ok(())
 }
 
 fn create_request(protocol: Protocol) -> CreateInstanceRequest {
@@ -390,7 +400,10 @@ fn sample_metadata(
 }
 
 #[tokio::test]
-async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool() {
+async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     for protocol in Protocol::ALL
         .into_iter()
         .filter(|protocol| crate::server::placement::DeploymentMode::Shared.supports(*protocol))
@@ -408,7 +421,7 @@ async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool
             if problem == "stopped" {
                 pool.status = crate::server::placement::EngineRuntimeStatus::Stopped;
             }
-            state.placements.save(&pool).await.unwrap();
+            state.placements.save(&pool).await?;
             let mut limits = crate::utils::limits::InstanceLimits {
                 disk_mib: 128,
                 ..Default::default()
@@ -417,15 +430,14 @@ async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool
                 state
                     .placements
                     .reserve(crate::server::placement::ReserveTenant {
-                        owner: pool.owner.clone().unwrap(),
+                        owner: pool.owner.clone().context("expected a value from clone")?,
                         instance_id: "existing-tenant",
                         runtime_id: &pool.runtime_id,
                         database: "existing_db",
                         username: "existing_user",
                         limits: &limits,
                     })
-                    .await
-                    .unwrap();
+                    .await?;
             }
             let mut request = create_request(protocol);
             request.server_id = Some("server-a".into());
@@ -444,19 +456,18 @@ async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool
             let image = request.image.as_deref().unwrap_or("existing-image");
             let error = super::shared::claim_runtime(&state, &request, image, &mut limits)
                 .await
-                .unwrap_err();
+                .expect_err("claim runtime should return an error");
             assert_eq!(
                 error.status(),
                 http::StatusCode::CONFLICT,
                 "{protocol}/{problem}: {error}"
             );
-            assert_eq!(state.placements.list().await.unwrap().len(), 1);
+            assert_eq!(state.placements.list().await?.len(), 1);
             assert!(
                 state
                     .placements
                     .get_reservation(&request.instance_id)
-                    .await
-                    .unwrap()
+                    .await?
                     .is_none()
             );
             if problem == "full" {
@@ -466,17 +477,21 @@ async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool
                     disk_mib: 128,
                 });
                 let instance_id = request.instance_id.clone();
-                let error = super::shared::create(&state, request).await.unwrap_err();
+                let error = super::shared::create(&state, request)
+                    .await
+                    .expect_err("create should return an error");
                 assert_eq!(error.status(), http::StatusCode::CONFLICT);
                 let diagnostic = state
                     .install_progress
                     .get(&instance_id)
-                    .unwrap()
+                    .context("expected a value from get")?
                     .diagnostic
-                    .unwrap();
+                    .context("get should provide a value")?;
                 assert_eq!(diagnostic.code, "conflict");
                 assert!(diagnostic.message.contains("shared_pool_full"));
             }
         }
     }
+
+    Ok(())
 }

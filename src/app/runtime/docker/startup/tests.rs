@@ -29,62 +29,73 @@ async fn seed(pool: &sqlx::SqlitePool) {
             "clickhouse:26.4",
         ))
         .await
-        .unwrap();
+        .expect("runtime should succeed");
 }
 
 #[tokio::test]
-async fn startup_budget_survives_boots_and_unrelated_metadata_writes() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn startup_budget_survives_boots_and_unrelated_metadata_writes() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     seed(&pool).await;
     let runtime = DockerRuntime::offline_for_tests(&DaemonConfig::default(), false)
         .with_startup_history(pool.clone());
     for id in [ID, "pool_guard"] {
-        runtime.check_autostart(id).await.unwrap();
-        runtime.note_start(id, true).await.unwrap();
-        runtime.check_autostart(id).await.unwrap();
-        runtime.note_start(id, true).await.unwrap();
+        runtime.check_autostart(id).await?;
+        runtime.note_start(id, true).await?;
+        runtime.check_autostart(id).await?;
+        runtime.note_start(id, true).await?;
         assert!(matches!(
             runtime.check_autostart(id).await,
             Err(DockerError::AutostartBlocked(_))
         ));
     }
     let repository = InstanceRepository::new(pool.clone());
-    let metadata = repository.get(ID).await.unwrap().unwrap();
-    repository.upsert(&metadata).await.unwrap();
+    let metadata = repository
+        .get(ID)
+        .await?
+        .context("get should provide a value")?;
+    repository.upsert(&metadata).await?;
     let placements = PlacementRepository::new(pool.clone());
-    let shared = placements.get("pool_guard").await.unwrap().unwrap();
-    placements.save(&shared).await.unwrap();
+    let shared = placements
+        .get("pool_guard")
+        .await?
+        .context("get should provide a value")?;
+    placements.save(&shared).await?;
     // Reconciliation and secret/placement persistence cannot reset the budget.
     assert!(runtime.check_autostart(ID).await.is_err());
     assert!(runtime.check_autostart("pool_guard").await.is_err());
     pool.close().await;
-    let reopened = sqlite::connect(dir.path()).await.unwrap();
+    let reopened = sqlite::connect(dir.path()).await?;
     let runtime = DockerRuntime::offline_for_tests(&DaemonConfig::default(), false)
         .with_startup_history(reopened.clone());
     assert!(runtime.check_autostart(ID).await.is_err());
     assert!(runtime.note_start(ID, true).await.is_err());
     // An explicit repair/start is allowed; it does not clear history until ready.
-    runtime.note_start(ID, false).await.unwrap();
+    runtime.note_start(ID, false).await?;
     assert!(runtime.check_autostart(ID).await.is_err());
-    runtime.startup_ready(ID).await.unwrap();
-    runtime.check_autostart(ID).await.unwrap();
+    runtime.startup_ready(ID).await?;
+    runtime.check_autostart(ID).await?;
     assert!(runtime.check_autostart("pool_guard").await.is_err());
     assert!(runtime.note_start("deleted", true).await.is_err());
     reopened.close().await;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn automatic_recovery_admission_is_atomic_and_database_errors_fail_closed() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+async fn automatic_recovery_admission_is_atomic_and_database_errors_fail_closed()
+-> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = sqlite::connect(dir.path()).await?;
     seed(&pool).await;
     let runtime = DockerRuntime::offline_for_tests(&DaemonConfig::default(), false)
         .with_startup_history(pool.clone());
     let outcomes = futures::future::join_all((0..12).map(|_| runtime.note_start(ID, true))).await;
     assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 2);
     assert!(runtime.check_autostart(ID).await.is_err());
-    runtime.check_autostart("pool_guard").await.unwrap();
+    runtime.check_autostart("pool_guard").await?;
     pool.close().await;
     assert!(matches!(
         runtime.check_autostart(ID).await,
@@ -92,6 +103,8 @@ async fn automatic_recovery_admission_is_atomic_and_database_errors_fail_closed(
     ));
     assert!(runtime.note_start(ID, false).await.is_err());
     assert!(runtime.startup_ready(ID).await.is_err());
+
+    Ok(())
 }
 
 #[derive(Default)]
@@ -116,18 +129,24 @@ async fn serve(
 ) -> Result<Response<Body>, Infallible> {
     let path = request.uri().path().to_owned();
     if path.ends_with("/update") {
-        let body = request.into_body().collect().await.unwrap().to_bytes();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = request
+            .into_body()
+            .collect()
+            .await
+            .expect("collect should succeed")
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("from slice should succeed");
         assert_eq!(body["RestartPolicy"]["Name"], "no");
         assert_eq!(body["RestartPolicy"]["MaximumRetryCount"], 0);
-        let mut state = engine.lock().unwrap();
+        let mut state = engine.lock().expect("lock should succeed");
         state.updates += 1;
         if !state.ignore_policy_update {
             state.restart_policy_fixed = true;
         }
         return Ok(Response::new(Body::from("{\"Warnings\":[]}")));
     }
-    let mut state = engine.lock().unwrap();
+    let mut state = engine.lock().expect("lock should succeed");
     let (status, value) = if state.missing {
         (404, serde_json::json!({"message":"no such container"}))
     } else if path.contains("/exec/") && path.ends_with("/start") {
@@ -135,7 +154,7 @@ async fn serve(
         let hang = state.hang_probe;
         let upgrade = hyper::upgrade::on(&mut request);
         tokio::spawn(async move {
-            let stream = upgrade.await.unwrap();
+            let stream = upgrade.await.expect("serve should succeed");
             if hang {
                 use tokio::io::AsyncReadExt;
                 let mut stream = TokioIo::new(stream);
@@ -148,7 +167,7 @@ async fn serve(
             .header("Connection", "Upgrade")
             .header("Upgrade", "tcp")
             .body(Body::empty())
-            .unwrap());
+            .expect("empty should succeed"));
     } else if path.contains("/exec/") {
         (
             200,
@@ -182,13 +201,19 @@ async fn serve(
         state.starts += 1;
         if state.start_succeeds {
             state.running = true;
-            return Ok(Response::builder().status(204).body(Body::empty()).unwrap());
+            return Ok(Response::builder()
+                .status(204)
+                .body(Body::empty())
+                .expect("empty should succeed"));
         }
         (500, serde_json::json!({"message":"startup failed"}))
     } else if path.ends_with("/kill") {
         state.kills += 1;
         state.running = false;
-        return Ok(Response::builder().status(204).body(Body::empty()).unwrap());
+        return Ok(Response::builder()
+            .status(204)
+            .body(Body::empty())
+            .expect("empty should succeed"));
     } else {
         panic!("unexpected runtime request: {path}");
     };
@@ -196,17 +221,18 @@ async fn serve(
         .status(status)
         .header("Content-Type", "application/json")
         .body(Body::from(value.to_string()))
-        .unwrap())
+        .expect("to string should succeed"))
 }
 
 #[tokio::test]
-async fn real_runtime_paths_count_starts_but_never_restart_a_readiness_probe() {
+async fn real_runtime_paths_count_starts_but_never_restart_a_readiness_probe() -> anyhow::Result<()>
+{
     for daemon_engine in [DaemonEngine::Docker, DaemonEngine::Podman] {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let dir = tempfile::tempdir()?;
+        let pool = sqlite::connect(dir.path()).await?;
         seed(&pool).await;
         let socket = dir.path().join("docker.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = UnixListener::bind(&socket)?;
         let state = Arc::new(Mutex::new(Engine::default()));
         let server_state = state.clone();
         let server = tokio::spawn(async move {
@@ -214,7 +240,7 @@ async fn real_runtime_paths_count_starts_but_never_restart_a_readiness_probe() {
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let (stream, _) = accepted.unwrap();
+                        let (stream, _) = accepted.expect("real runtime paths count starts but never restart a readiness probe should succeed");
                         let state = server_state.clone();
                         connections.spawn(async move {
                             let _ = http1::Builder::new().serve_connection(TokioIo::new(stream),
@@ -232,46 +258,63 @@ async fn real_runtime_paths_count_starts_but_never_restart_a_readiness_probe() {
                 ..Default::default()
             },
             false,
-        )
-        .unwrap()
+        )?
         .with_node_id("test-node")
         .with_startup_history(pool.clone());
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             for _ in 0..2 {
-                runtime.check_autostart(ID).await.unwrap();
+                runtime
+                    .check_autostart(ID)
+                    .await
+                    .expect("check autostart should succeed");
                 assert!(runtime.start(Protocol::Postgres, ID).await.is_err());
             }
             assert!(runtime.check_autostart(ID).await.is_err());
-            assert_eq!(state.lock().unwrap().starts, 2);
-            assert_eq!(state.lock().unwrap().updates, 1);
-            state.lock().unwrap().start_succeeds = true;
-            runtime.start(Protocol::Postgres, ID).await.unwrap();
-            runtime.start(Protocol::Postgres, ID).await.unwrap();
-            assert_eq!(state.lock().unwrap().starts, 3);
+            assert_eq!(state.lock().expect("lock should succeed").starts, 2);
+            assert_eq!(state.lock().expect("lock should succeed").updates, 1);
+            state.lock().expect("lock should succeed").start_succeeds = true;
+            runtime
+                .start(Protocol::Postgres, ID)
+                .await
+                .expect("start should succeed");
+            runtime
+                .start(Protocol::Postgres, ID)
+                .await
+                .expect("start should succeed");
+            assert_eq!(state.lock().expect("lock should succeed").starts, 3);
             assert!(runtime.check_autostart(ID).await.is_err());
             runtime
                 .wait_until_ready(Protocol::Postgres, ID, Duration::from_secs(1))
                 .await
-                .unwrap();
-            runtime.check_autostart(ID).await.unwrap();
-            runtime.note_start(ID, true).await.unwrap();
-            state.lock().unwrap().unknown_exit = true;
+                .expect("from secs should succeed");
+            runtime
+                .check_autostart(ID)
+                .await
+                .expect("check autostart should succeed");
+            runtime
+                .note_start(ID, true)
+                .await
+                .expect("note start should succeed");
+            state.lock().expect("lock should succeed").unknown_exit = true;
             assert!(
                 runtime
                     .exec_readiness_probe(Protocol::Postgres, ID, "SELECT 1")
                     .await
                     .is_err()
             );
-            state.lock().unwrap().unknown_exit = false;
-            state.lock().unwrap().hang_probe = true;
-            let before = state.lock().unwrap().probes;
+            state.lock().expect("lock should succeed").unknown_exit = false;
+            state.lock().expect("lock should succeed").hang_probe = true;
+            let before = state.lock().expect("lock should succeed").probes;
             assert!(
                 runtime
                     .wait_until_ready(Protocol::Postgres, ID, Duration::from_millis(60))
                     .await
                     .is_err()
             );
-            assert_eq!(state.lock().unwrap().probes, before + 1);
+            assert_eq!(
+                state.lock().expect("lock should succeed").probes,
+                before + 1
+            );
             assert!(
                 runtime
                     .exec_secret_readiness_probe(
@@ -284,10 +327,13 @@ async fn real_runtime_paths_count_starts_but_never_restart_a_readiness_probe() {
                     .await
                     .is_err()
             );
-            assert_eq!(state.lock().unwrap().starts, 3);
-            assert_eq!(state.lock().unwrap().kills, 0);
+            assert_eq!(state.lock().expect("lock should succeed").starts, 3);
+            assert_eq!(state.lock().expect("lock should succeed").kills, 0);
             // Readiness failures did not clear the previous pending attempt.
-            runtime.note_start(ID, true).await.unwrap();
+            runtime
+                .note_start(ID, true)
+                .await
+                .expect("note start should succeed");
             assert!(runtime.check_autostart(ID).await.is_err());
             // Exec recovery must still kill the uncertain process, but may
             // not bypass the cutoff through its low-level start_container call.
@@ -303,35 +349,43 @@ async fn real_runtime_paths_count_starts_but_never_restart_a_readiness_probe() {
                     .await
                     .is_err()
             );
-            assert_eq!(state.lock().unwrap().kills, 1);
-            assert_eq!(state.lock().unwrap().starts, 3);
-            state.lock().unwrap().foreign = true;
+            assert_eq!(state.lock().expect("lock should succeed").kills, 1);
+            assert_eq!(state.lock().expect("lock should succeed").starts, 3);
+            state.lock().expect("lock should succeed").foreign = true;
             assert!(
                 runtime
                     .disable_restarts(Protocol::Postgres, ID)
                     .await
                     .is_err()
             );
-            assert_eq!(state.lock().unwrap().updates, 1);
-            state.lock().unwrap().foreign = false;
-            state.lock().unwrap().restart_policy_fixed = false;
-            state.lock().unwrap().ignore_policy_update = true;
+            assert_eq!(state.lock().expect("lock should succeed").updates, 1);
+            state.lock().expect("lock should succeed").foreign = false;
+            state
+                .lock()
+                .expect("lock should succeed")
+                .restart_policy_fixed = false;
+            state
+                .lock()
+                .expect("lock should succeed")
+                .ignore_policy_update = true;
             assert!(matches!(
                 runtime.disable_restarts(Protocol::Postgres, ID).await,
                 Err(DockerError::RestartPolicyNotDisabled(_))
             ));
-            state.lock().unwrap().missing = true;
+            state.lock().expect("lock should succeed").missing = true;
             runtime
                 .disable_restarts(Protocol::Postgres, ID)
                 .await
-                .unwrap();
+                .expect("disable restarts should succeed");
             assert!(runtime.start(Protocol::Postgres, ID).await.is_err());
-            assert_eq!(state.lock().unwrap().starts, 3);
+            assert_eq!(state.lock().expect("lock should succeed").starts, 3);
         })
         .await;
         server.abort();
         let _ = server.await;
-        result.unwrap();
+        result?;
         pool.close().await;
     }
+
+    Ok(())
 }

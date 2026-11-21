@@ -22,14 +22,16 @@ fn scan_sql(protocol: Protocol, sql: &[u8]) -> Result<DumpInspection, Inspection
 
 fn write_temp_file(directory: &TempDir, name: &str, contents: &[u8]) -> PathBuf {
     let path = directory.path().join(name);
-    std::fs::write(&path, contents).unwrap();
+    std::fs::write(&path, contents).expect("write should succeed");
     path
 }
 
 fn gzip(contents: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(contents).unwrap();
-    encoder.finish().unwrap()
+    encoder
+        .write_all(contents)
+        .expect("write all should succeed");
+    encoder.finish().expect("finish should succeed")
 }
 
 fn mongodb_archive(metadata: &[(&str, &str)]) -> Vec<u8> {
@@ -41,7 +43,7 @@ fn mongodb_archive(metadata: &[(&str, &str)]) -> Vec<u8> {
             "server_version": "8.0.0",
             "tool_version": "100.12.2",
         })
-        .unwrap(),
+        .expect("to vec should succeed"),
     );
     for (database, collection) in metadata {
         bytes.extend(
@@ -52,7 +54,7 @@ fn mongodb_archive(metadata: &[(&str, &str)]) -> Vec<u8> {
                 "size": 0_i32,
                 "type": "collection",
             })
-            .unwrap(),
+            .expect("to vec should succeed"),
         );
     }
     bytes.extend(u32::MAX.to_le_bytes());
@@ -60,21 +62,25 @@ fn mongodb_archive(metadata: &[(&str, &str)]) -> Vec<u8> {
 }
 
 #[test]
-fn tar_gzip_uses_the_documented_json_value() {
+fn tar_gzip_uses_the_documented_json_value() -> anyhow::Result<()> {
     assert_eq!(
-        serde_json::to_string(&DumpArchiveFormat::TarGzip).unwrap(),
+        serde_json::to_string(&DumpArchiveFormat::TarGzip)?,
         r#""tar.gz""#
     );
     assert_eq!(
-        serde_json::from_str::<DumpArchiveFormat>(r#""tar.gz""#).unwrap(),
+        serde_json::from_str::<DumpArchiveFormat>(r#""tar.gz""#)?,
         DumpArchiveFormat::TarGzip
     );
+
+    Ok(())
 }
 
 fn bzip2(contents: &[u8]) -> Vec<u8> {
     let mut encoder = BzEncoder::new(Vec::new(), bzip2::Compression::default());
-    encoder.write_all(contents).unwrap();
-    encoder.finish().unwrap()
+    encoder
+        .write_all(contents)
+        .expect("write all should succeed");
+    encoder.finish().expect("finish should succeed")
 }
 
 fn tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -87,9 +93,11 @@ fn tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
             header.set_mode(0o600);
             header.set_size(contents.len() as u64);
             header.set_cksum();
-            archive.append_data(&mut header, *name, *contents).unwrap();
+            archive
+                .append_data(&mut header, *name, *contents)
+                .expect("append data should succeed");
         }
-        archive.finish().unwrap();
+        archive.finish().expect("finish should succeed");
     }
     output
 }
@@ -101,16 +109,18 @@ fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         for (name, contents) in entries {
             archive
                 .start_file(*name, zip::write::SimpleFileOptions::default())
-                .unwrap();
-            archive.write_all(contents).unwrap();
+                .expect("default should succeed");
+            archive
+                .write_all(contents)
+                .expect("write all should succeed");
         }
-        archive.finish().unwrap();
+        archive.finish().expect("finish should succeed");
     }
     output.into_inner()
 }
 
 #[test]
-fn postgres_catalog_handles_quotes_copy_and_ignored_sql_text() {
+fn postgres_catalog_handles_quotes_copy_and_ignored_sql_text() -> anyhow::Result<()> {
     let sql = br#"-- PostgreSQL database dump
 CREATE SCHEMA "public";
 CREATE TABLE "public"."Users" (id bigint);
@@ -124,7 +134,7 @@ DO $body$ BEGIN RAISE NOTICE 'CREATE TABLE fake.body'; END $body$;
 /* CREATE TABLE fake.block_comment (id int); */
 /* outer /* CREATE TABLE fake.nested_comment (id int); */ still outer */
 "#;
-    let result = scan_sql(Protocol::Postgres, sql).unwrap();
+    let result = scan_sql(Protocol::Postgres, sql)?;
 
     let keys = result
         .objects
@@ -135,10 +145,12 @@ DO $body$ BEGIN RAISE NOTICE 'CREATE TABLE fake.body'; END $body$;
     assert_eq!(result.namespaces, ["audit", "public"]);
     assert!(!result.selective_supported);
     assert!(result.catalog_complete);
+
+    Ok(())
 }
 
 #[test]
-fn mysql_and_mariadb_catalogs_parse_common_mysqldump_statements() {
+fn mysql_and_mariadb_catalogs_parse_common_mysqldump_statements() -> anyhow::Result<()> {
     let sql = br#"-- MySQL dump 10.13
 CREATE DATABASE IF NOT EXISTS `tenant`;
 USE `tenant`;
@@ -147,7 +159,7 @@ INSERT IGNORE INTO `tenant`.`customers` VALUES (1, 'INSERT INTO fake VALUES (1)'
 CREATE TEMPORARY TABLE `scratch` (`id` int);
 "#;
     for protocol in [Protocol::Mysql, Protocol::Mariadb] {
-        let result = scan_sql(protocol, sql).unwrap();
+        let result = scan_sql(protocol, sql)?;
         let keys = result
             .objects
             .iter()
@@ -156,20 +168,24 @@ CREATE TEMPORARY TABLE `scratch` (`id` int);
         assert_eq!(keys, ["scratch", "tenant.customers", "tenant.orders"]);
         assert_eq!(result.namespaces, ["tenant"]);
     }
+
+    Ok(())
 }
 
 #[test]
-fn clickhouse_catalog_deduplicates_create_and_insert() {
+fn clickhouse_catalog_deduplicates_create_and_insert() -> anyhow::Result<()> {
     let sql = br#"-- DatabasesEverywhere ClickHouse logical dump
 CREATE TABLE `events` (id UInt64) ENGINE = MergeTree ORDER BY id;
 INSERT INTO `events` VALUES (1);
 CREATE TABLE analytics.metrics (value Float64) ENGINE = TinyLog;
 "#;
-    let result = scan_sql(Protocol::Clickhouse, sql).unwrap();
+    let result = scan_sql(Protocol::Clickhouse, sql)?;
     assert_eq!(result.objects.len(), 2);
     assert_eq!(result.objects[0].selection_key, "events");
     assert_eq!(result.objects[1].selection_key, "metrics");
     assert_eq!(result.objects[1].namespace.as_deref(), Some("analytics"));
+
+    Ok(())
 }
 
 #[test]
@@ -178,7 +194,7 @@ fn sql_failures_reject_mismatches_malformed_contexts_and_binary_data() {
         Protocol::Postgres,
         b"-- MySQL dump secret-marker-which-must-not-leak\nCREATE TABLE users(id int);",
     )
-    .unwrap_err();
+    .expect_err("users should return an error");
     let message = error.to_string();
     assert!(message.contains("does not match"));
     assert!(!message.contains("secret-marker"));
@@ -196,17 +212,17 @@ fn sql_failures_reject_mismatches_malformed_contexts_and_binary_data() {
         Protocol::Postgres,
         b"CREATE TABLE users(id int);\0CREATE TABLE hidden(id int);",
     )
-    .unwrap_err();
+    .expect_err("hidden should return an error");
     assert!(error.to_string().contains("binary data"));
 }
 
 #[test]
-fn sql_identifier_and_catalog_limits_are_bounded() {
+fn sql_identifier_and_catalog_limits_are_bounded() -> anyhow::Result<()> {
     let sql = br#"
 CREATE TABLE "public"."normal-name" (id int);
 CREATE TABLE "public"."not selectable" (id int);
 "#;
-    let result = scan_sql(Protocol::Postgres, sql).unwrap();
+    let result = scan_sql(Protocol::Postgres, sql)?;
     assert_eq!(result.objects.len(), 1);
     assert_eq!(result.objects[0].selection_key, "public.normal-name");
     assert_eq!(result.unselectable_object_count, 1);
@@ -215,8 +231,7 @@ CREATE TABLE "public"."not selectable" (id int);
     let result = scan_sql(
         Protocol::Postgres,
         format!("CREATE TABLE {long_name} (id int);").as_bytes(),
-    )
-    .unwrap();
+    )?;
     assert!(result.objects.is_empty());
     assert_eq!(result.unselectable_object_count, 1);
 
@@ -224,7 +239,7 @@ CREATE TABLE "public"."not selectable" (id int);
     for index in 0..=MAX_OBJECTS {
         many.push_str(&format!("CREATE TABLE table_{index} (id int);\n"));
     }
-    let result = scan_sql(Protocol::Postgres, many.as_bytes()).unwrap();
+    let result = scan_sql(Protocol::Postgres, many.as_bytes())?;
     assert_eq!(result.objects.len(), MAX_OBJECTS);
     assert!(!result.catalog_complete);
 
@@ -232,14 +247,16 @@ CREATE TABLE "public"."not selectable" (id int);
     let sql = format!(
         "-- MySQL dump\nCREATE TABLE `payloads` (`value` longblob); INSERT INTO `payloads` VALUES (0x{value});"
     );
-    let result = scan_sql(Protocol::Mysql, sql.as_bytes()).unwrap();
+    let result = scan_sql(Protocol::Mysql, sql.as_bytes())?;
     assert_eq!(result.objects.len(), 1);
     assert_eq!(result.objects[0].selection_key, "payloads");
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn plain_gzip_and_bzip2_are_detected_and_hashed() {
-    let directory = TempDir::new().unwrap();
+async fn plain_gzip_and_bzip2_are_detected_and_hashed() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let sql = b"-- PostgreSQL database dump\nCREATE TABLE public.users(id int);";
     let inputs = [
         ("dump.sql", sql.to_vec(), DumpArchiveFormat::Plain),
@@ -248,29 +265,31 @@ async fn plain_gzip_and_bzip2_are_detected_and_hashed() {
     ];
     for (name, contents, expected_format) in inputs {
         let path = write_temp_file(&directory, name, &contents);
-        let result = inspect_uploaded_dump(&path, Protocol::Postgres, None)
-            .await
-            .unwrap();
+        let result = inspect_uploaded_dump(&path, Protocol::Postgres, None).await?;
         assert_eq!(result.detected_archive_format, expected_format);
         assert_eq!(result.source_size_bytes, contents.len() as u64);
         assert_eq!(result.sha256, hex::encode(Sha256::digest(&contents)));
         assert_eq!(result.objects[0].selection_key, "public.users");
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn requested_wrapper_must_match_detected_content() {
-    let directory = TempDir::new().unwrap();
+async fn requested_wrapper_must_match_detected_content() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let path = write_temp_file(&directory, "dump.sql", b"CREATE TABLE users(id int);");
     let error = inspect_uploaded_dump(&path, Protocol::Postgres, Some("gzip"))
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     assert!(error.to_string().contains("does not match"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn tar_tar_gzip_and_zip_select_exactly_one_sql_member() {
-    let directory = TempDir::new().unwrap();
+async fn tar_tar_gzip_and_zip_select_exactly_one_sql_member() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let sql = b"-- MySQL dump\nCREATE TABLE `orders` (`id` bigint);";
     let tar_bytes = tar(&[("nested/dump.mysql.sql", sql)]);
     let inputs = [
@@ -284,17 +303,17 @@ async fn tar_tar_gzip_and_zip_select_exactly_one_sql_member() {
     ];
     for (name, contents, expected_format) in inputs {
         let path = write_temp_file(&directory, name, &contents);
-        let result = inspect_uploaded_dump(&path, Protocol::Mysql, None)
-            .await
-            .unwrap();
+        let result = inspect_uploaded_dump(&path, Protocol::Mysql, None).await?;
         assert_eq!(result.detected_archive_format, expected_format);
         assert_eq!(result.objects[0].selection_key, "orders");
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn archives_reject_ambiguous_candidates_and_missing_dump() {
-    let directory = TempDir::new().unwrap();
+async fn archives_reject_ambiguous_candidates_and_missing_dump() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let ambiguous = zip(&[
         ("one.sql", b"CREATE TABLE one(id int);"),
         ("two.postgres.sql", b"CREATE TABLE two(id int);"),
@@ -302,25 +321,27 @@ async fn archives_reject_ambiguous_candidates_and_missing_dump() {
     let path = write_temp_file(&directory, "ambiguous.zip", &ambiguous);
     let error = inspect_uploaded_dump(&path, Protocol::Postgres, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     assert!(error.to_string().contains("multiple candidate"));
 
     let missing = tar(&[("README.txt", b"not a dump")]);
     let path = write_temp_file(&directory, "missing.tar", &missing);
     let error = inspect_uploaded_dump(&path, Protocol::Postgres, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     assert!(error.to_string().contains("does not contain"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn zip_traversal_and_tar_symlink_entries_are_rejected() {
-    let directory = TempDir::new().unwrap();
+async fn zip_traversal_and_tar_symlink_entries_are_rejected() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let traversal = zip(&[("../escape.sql", b"CREATE TABLE escaped(id int);")]);
     let path = write_temp_file(&directory, "traversal.zip", &traversal);
     let error = inspect_uploaded_dump(&path, Protocol::Postgres, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     assert!(error.to_string().contains("unsafe entry path"));
 
     let mut symlink_archive = Vec::new();
@@ -330,23 +351,23 @@ async fn zip_traversal_and_tar_symlink_entries_are_rejected() {
         header.set_entry_type(tar::EntryType::Symlink);
         header.set_mode(0o777);
         header.set_size(0);
-        header.set_link_name("outside.sql").unwrap();
+        header.set_link_name("outside.sql")?;
         header.set_cksum();
-        builder
-            .append_data(&mut header, "dump.sql", io::empty())
-            .unwrap();
-        builder.finish().unwrap();
+        builder.append_data(&mut header, "dump.sql", io::empty())?;
+        builder.finish()?;
     }
     let path = write_temp_file(&directory, "symlink.tar", &symlink_archive);
     let error = inspect_uploaded_dump(&path, Protocol::Postgres, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     assert!(error.to_string().contains("link"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn archive_depth_and_expansion_limits_fail_before_extraction() {
-    let directory = TempDir::new().unwrap();
+async fn archive_depth_and_expansion_limits_fail_before_extraction() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let deep_name = format!(
         "{}/dump.sql",
         vec!["level"; MAX_ARCHIVE_DEPTH + 1].join("/")
@@ -355,14 +376,14 @@ async fn archive_depth_and_expansion_limits_fail_before_extraction() {
     let path = write_temp_file(&directory, "deep.zip", &deep);
     let error = inspect_uploaded_dump(&path, Protocol::Postgres, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     assert!(error.to_string().contains("too deep"));
 
     let mut oversized = Vec::new();
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(tar::EntryType::Regular);
     header.set_mode(0o600);
-    header.set_path("dump.sql").unwrap();
+    header.set_path("dump.sql")?;
     header.set_size(MAX_INSPECTED_BYTES + 1);
     header.set_cksum();
     oversized.extend_from_slice(header.as_bytes());
@@ -370,18 +391,20 @@ async fn archive_depth_and_expansion_limits_fail_before_extraction() {
     let path = write_temp_file(&directory, "bomb.tar", &oversized);
     let error = inspect_uploaded_dump(&path, Protocol::Postgres, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     assert!(error.to_string().contains("expansion"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn bounded_failure_retains_the_confirmed_wrapper_format() {
-    let directory = TempDir::new().unwrap();
+async fn bounded_failure_retains_the_confirmed_wrapper_format() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let mut oversized = Vec::new();
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(tar::EntryType::Regular);
     header.set_mode(0o600);
-    header.set_path("dump.sql").unwrap();
+    header.set_path("dump.sql")?;
     header.set_size(MAX_INSPECTED_BYTES + 1);
     header.set_cksum();
     oversized.extend_from_slice(header.as_bytes());
@@ -390,12 +413,14 @@ async fn bounded_failure_retains_the_confirmed_wrapper_format() {
 
     let failure = inspect_uploaded_dump_with_format(&path, Protocol::Postgres, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump with format should return an error");
     assert!(matches!(failure.error, ApiError::ServiceUnavailable(_)));
     assert_eq!(
         failure.detected_archive_format,
         Some(DumpArchiveFormat::Tar)
     );
+
+    Ok(())
 }
 
 #[test]
@@ -403,13 +428,15 @@ fn bounded_reader_enforces_decompressed_limit_even_when_metadata_lies() {
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut reader = BoundedReader::new(Cursor::new(b"12345"), 4, deadline);
     let mut output = Vec::new();
-    let error = reader.read_to_end(&mut output).unwrap_err();
+    let error = reader
+        .read_to_end(&mut output)
+        .expect_err("read to end should return an error");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
 #[tokio::test]
-async fn malformed_archives_return_sanitized_errors() {
-    let directory = TempDir::new().unwrap();
+async fn malformed_archives_return_sanitized_errors() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let path = write_temp_file(
         &directory,
         "broken.zip",
@@ -417,14 +444,16 @@ async fn malformed_archives_return_sanitized_errors() {
     );
     let error = inspect_uploaded_dump(&path, Protocol::Postgres, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     let message = error.to_string();
     assert!(message.contains("malformed"));
     assert!(!message.contains("SECRET_DUMP_CONTENT"));
+
+    Ok(())
 }
 
 #[test]
-fn prefix_reads_are_not_confused_by_short_underlying_reads() {
+fn prefix_reads_are_not_confused_by_short_underlying_reads() -> anyhow::Result<()> {
     struct OneByteAtATime(Cursor<Vec<u8>>);
 
     impl Read for OneByteAtATime {
@@ -436,21 +465,23 @@ fn prefix_reads_are_not_confused_by_short_underlying_reads() {
 
     let mut reader = OneByteAtATime(Cursor::new(b"complete-prefix".to_vec()));
     let mut prefix = [0_u8; 15];
-    assert_eq!(read_up_to(&mut reader, &mut prefix).unwrap(), 15);
+    assert_eq!(read_up_to(&mut reader, &mut prefix)?, 15);
     assert_eq!(&prefix, b"complete-prefix");
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_and_physical_protocols_report_bounded_full_only_catalogs() {
-    let directory = TempDir::new().unwrap();
+async fn mongodb_and_physical_protocols_report_bounded_full_only_catalogs() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let directory = TempDir::new()?;
     let gzip_bytes = gzip(&mongodb_archive(&[
         ("tenant", "users"),
         ("tenant", "orders"),
     ]));
     let mongo = write_temp_file(&directory, "mongo.archive.gz", &gzip_bytes);
-    let mongo_result = inspect_uploaded_dump(&mongo, Protocol::Mongodb, None)
-        .await
-        .unwrap();
+    let mongo_result = inspect_uploaded_dump(&mongo, Protocol::Mongodb, None).await?;
     assert_eq!(mongo_result.selection_kind, DumpSelectionKind::Collections);
     assert!(!mongo_result.selective_supported);
     assert!(mongo_result.catalog_complete);
@@ -459,7 +490,7 @@ async fn mongodb_and_physical_protocols_report_bounded_full_only_catalogs() {
         mongo_result
             .selective_unavailable_reason
             .as_deref()
-            .unwrap()
+            .context("as deref should provide a value")?
             .contains("complete selected source database")
     );
 
@@ -470,12 +501,14 @@ async fn mongodb_and_physical_protocols_report_bounded_full_only_catalogs() {
             &format!("{}.tar.gz", protocol.as_str()),
             &gzip(&physical_archive),
         );
-        let result = inspect_uploaded_dump(&path, protocol, None).await.unwrap();
+        let result = inspect_uploaded_dump(&path, protocol, None).await?;
         assert_eq!(result.selection_kind, DumpSelectionKind::FullOnly);
         assert!(!result.selective_supported);
         assert!(result.catalog_complete);
         assert!(result.objects.is_empty());
     }
+
+    Ok(())
 }
 
 #[test]
@@ -488,18 +521,20 @@ fn bounded_inspection_limits_are_retryable_not_malformed() {
 }
 
 #[tokio::test]
-async fn mongodb_rejects_uncompressed_native_uploads() {
-    let directory = TempDir::new().unwrap();
+async fn mongodb_rejects_uncompressed_native_uploads() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let path = write_temp_file(&directory, "mongo.archive", b"opaque native archive");
     let error = inspect_uploaded_dump(&path, Protocol::Mongodb, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     assert!(error.to_string().contains("native gzip archives"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_wrappers_require_one_valid_native_gzip_archive() {
-    let directory = TempDir::new().unwrap();
+async fn mongodb_wrappers_require_one_valid_native_gzip_archive() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
 
     let missing = write_temp_file(
         &directory,
@@ -509,7 +544,7 @@ async fn mongodb_wrappers_require_one_valid_native_gzip_archive() {
     assert!(
         inspect_uploaded_dump(&missing, Protocol::Mongodb, Some("tar"))
             .await
-            .unwrap_err()
+            .expect_err("inspect uploaded dump should return an error")
             .to_string()
             .contains("does not contain")
     );
@@ -531,7 +566,7 @@ async fn mongodb_wrappers_require_one_valid_native_gzip_archive() {
     assert!(
         inspect_uploaded_dump(&two, Protocol::Mongodb, Some("tar"))
             .await
-            .unwrap_err()
+            .expect_err("inspect uploaded dump should return an error")
             .to_string()
             .contains("multiple")
     );
@@ -542,16 +577,16 @@ async fn mongodb_wrappers_require_one_valid_native_gzip_archive() {
         "valid.tar",
         &tar(&[("nested/dump.mongodb.archive.gz", &valid_gzip)]),
     );
-    let result = inspect_uploaded_dump(&valid, Protocol::Mongodb, Some("tar"))
-        .await
-        .unwrap();
+    let result = inspect_uploaded_dump(&valid, Protocol::Mongodb, Some("tar")).await?;
     assert_eq!(result.detected_archive_format, DumpArchiveFormat::Tar);
     assert_eq!(result.namespaces, ["legacy"]);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_discovery_represents_one_multiple_and_no_source_databases() {
-    let directory = TempDir::new().unwrap();
+async fn mongodb_discovery_represents_one_multiple_and_no_source_databases() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let cases = [
         (
             "one.archive.gz",
@@ -581,19 +616,19 @@ async fn mongodb_discovery_represents_one_multiple_and_no_source_databases() {
             name,
             &gzip(&mongodb_archive(metadata.as_slice())),
         );
-        let result = inspect_uploaded_dump(&path, Protocol::Mongodb, None)
-            .await
-            .unwrap();
+        let result = inspect_uploaded_dump(&path, Protocol::Mongodb, None).await?;
         assert_eq!(result.namespaces, expected);
         assert!(result.catalog_complete);
         assert!(!result.selective_supported);
         assert!(result.objects.is_empty());
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_rejects_gzip_that_is_not_a_native_archive() {
-    let directory = TempDir::new().unwrap();
+async fn mongodb_rejects_gzip_that_is_not_a_native_archive() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let path = write_temp_file(
         &directory,
         "fake.archive.gz",
@@ -601,22 +636,22 @@ async fn mongodb_rejects_gzip_that_is_not_a_native_archive() {
     );
     let error = inspect_uploaded_dump(&path, Protocol::Mongodb, None)
         .await
-        .unwrap_err();
+        .expect_err("inspect uploaded dump should return an error");
     assert!(error.to_string().contains("native mongodump archive"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_validates_every_gzip_member_and_rejects_trailing_data() {
-    let directory = TempDir::new().unwrap();
+async fn mongodb_validates_every_gzip_member_and_rejects_trailing_data() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let archive = mongodb_archive(&[("tenant", "users")]);
 
     let split = archive.len() / 2;
     let mut multistream = gzip(&archive[..split]);
     multistream.extend(gzip(&archive[split..]));
     let valid = write_temp_file(&directory, "multi.archive.gz", &multistream);
-    let result = inspect_uploaded_dump(&valid, Protocol::Mongodb, None)
-        .await
-        .unwrap();
+    let result = inspect_uploaded_dump(&valid, Protocol::Mongodb, None).await?;
     assert_eq!(result.namespaces, ["tenant"]);
 
     let mut trailing = gzip(&archive);
@@ -625,7 +660,7 @@ async fn mongodb_validates_every_gzip_member_and_rejects_trailing_data() {
     assert!(
         inspect_uploaded_dump(&invalid, Protocol::Mongodb, None)
             .await
-            .unwrap_err()
+            .expect_err("inspect uploaded dump should return an error")
             .to_string()
             .contains("malformed native gzip archive")
     );
@@ -636,15 +671,17 @@ async fn mongodb_validates_every_gzip_member_and_rejects_trailing_data() {
     assert!(
         inspect_uploaded_dump(&invalid, Protocol::Mongodb, None)
             .await
-            .unwrap_err()
+            .expect_err("inspect uploaded dump should return an error")
             .to_string()
             .contains("malformed")
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_tar_gzip_wrapper_validates_its_complete_outer_stream() {
-    let directory = TempDir::new().unwrap();
+async fn mongodb_tar_gzip_wrapper_validates_its_complete_outer_stream() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let inner = gzip(&mongodb_archive(&[("tenant", "users")]));
     let mut outer = gzip(&tar(&[("dump.mongodb.archive.gz", &inner)]));
     outer.extend(b"trailing outer data");
@@ -654,11 +691,13 @@ async fn mongodb_tar_gzip_wrapper_validates_its_complete_outer_stream() {
             .await
             .is_err()
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_zip_tar_gzip_and_bzip2_wrappers_preserve_discovery() {
-    let directory = TempDir::new().unwrap();
+async fn mongodb_zip_tar_gzip_and_bzip2_wrappers_preserve_discovery() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
     let native_gzip = gzip(&mongodb_archive(&[("legacy", "users")]));
     let tar_bytes = tar(&[("nested/dump.mongodb.archive.gz", &native_gzip)]);
     let inputs = [
@@ -683,11 +722,11 @@ async fn mongodb_zip_tar_gzip_and_bzip2_wrappers_preserve_discovery() {
     ];
     for (name, bytes, requested, expected_format) in inputs {
         let path = write_temp_file(&directory, name, &bytes);
-        let result = inspect_uploaded_dump(&path, Protocol::Mongodb, requested)
-            .await
-            .unwrap();
+        let result = inspect_uploaded_dump(&path, Protocol::Mongodb, requested).await?;
         assert_eq!(result.namespaces, ["legacy"]);
         assert_eq!(result.detected_archive_format, expected_format);
         assert!(result.catalog_complete);
     }
+
+    Ok(())
 }

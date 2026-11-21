@@ -396,6 +396,8 @@ fn same_initial_runtime(stored: &EngineRuntime, expected: &EngineRuntime) -> boo
 }
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::utils::limits::InstanceLimits;
     fn initial_runtime() -> EngineRuntime {
@@ -423,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn lost_initial_save_ack_only_adopts_exact_creating_runtime() {
+    fn lost_initial_save_ack_only_adopts_exact_creating_runtime() -> anyhow::Result<()> {
         let expected = initial_runtime();
         let mut persisted = expected.clone();
         assert!(same_initial_runtime(&persisted, &expected));
@@ -432,14 +434,17 @@ mod tests {
         assert!(!same_initial_runtime(&persisted, &expected));
         persisted = expected.clone();
         persisted.limits.disk_mib =
-            crate::server::placement::policy::pool_disk_mib(Protocol::Postgres, 0).unwrap();
+            crate::server::placement::policy::pool_disk_mib(Protocol::Postgres, 0)
+                .context("expected a value from pool_disk_mib")?;
         persisted.runtime.container_name.push_str("-different");
         assert!(!same_initial_runtime(&persisted, &expected));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unpersisted_runtime_cleanup_removes_every_created_pool_path() {
-        let namespace = tempfile::tempdir().unwrap();
+    async fn unpersisted_runtime_cleanup_removes_every_created_pool_path() -> anyhow::Result<()> {
+        let namespace = tempfile::tempdir()?;
         let root = namespace.path();
         let path = |name: &str| root.join(name).display().to_string();
         let mut config = crate::config::Config::default();
@@ -457,9 +462,9 @@ mod tests {
         config.paths.fuse = path("fuse");
         config.paths.tmp = path("tmp");
         let (state, _database) = crate::subsystems::test_support::database(config).await;
-        let paths = InstancePaths::new(&state.config.paths, "pool_postgres_unpersisted").unwrap();
-        paths.create_dirs().await.unwrap();
-        tokio::fs::create_dir_all(&paths.logs).await.unwrap();
+        let paths = InstancePaths::new(&state.config.paths, "pool_postgres_unpersisted")?;
+        paths.create_dirs().await?;
+        tokio::fs::create_dir_all(&paths.logs).await?;
         for path in [
             &paths.data,
             &paths.logs,
@@ -467,9 +472,7 @@ mod tests {
             &paths.artifacts,
             &paths.runtime_config,
         ] {
-            tokio::fs::write(path.join("partial-create"), b"orphan")
-                .await
-                .unwrap();
+            tokio::fs::write(path.join("partial-create"), b"orphan").await?;
         }
 
         let error = cleanup_unpersisted_runtime(
@@ -495,5 +498,7 @@ mod tests {
                 path.display()
             );
         }
+
+        Ok(())
     }
 }

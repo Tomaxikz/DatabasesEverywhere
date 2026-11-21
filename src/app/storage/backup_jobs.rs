@@ -589,6 +589,8 @@ pub enum BackupJobStorageError {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::storage::sqlite;
 
@@ -617,10 +619,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jobs_follow_only_the_declared_state_machine() {
-        let dir = tempfile::tempdir().unwrap();
-        let repository = BackupJobRepository::new(sqlite::connect(dir.path()).await.unwrap());
-        repository.admit(&job("job_a")).await.unwrap();
+    async fn jobs_follow_only_the_declared_state_machine() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repository = BackupJobRepository::new(sqlite::connect(dir.path()).await?);
+        repository.admit(&job("job_a")).await?;
         let now = "2026-01-01T00:00:01Z";
 
         assert!(
@@ -635,10 +637,7 @@ mod tests {
             BackupJobState::Validated,
             BackupJobState::Published,
         ] {
-            repository
-                .transition("job_a", state, None, now)
-                .await
-                .unwrap();
+            repository.transition("job_a", state, None, now).await?;
         }
         assert!(
             repository
@@ -646,44 +645,41 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(repository.needing_recovery(None).await.unwrap().is_empty());
+        assert!(repository.needing_recovery(None).await?.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resources_are_journaled_until_released_and_recovery_sees_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let repository = BackupJobRepository::new(sqlite::connect(dir.path()).await.unwrap());
-        repository.admit(&job("job_b")).await.unwrap();
+    async fn resources_are_journaled_until_released_and_recovery_sees_them() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repository = BackupJobRepository::new(sqlite::connect(dir.path()).await?);
+        repository.admit(&job("job_b")).await?;
         let now = "2026-01-01T00:00:01Z";
         repository
             .transition("job_b", BackupJobState::Capturing, None, now)
-            .await
-            .unwrap();
+            .await?;
         repository
             .register_resource("job_b", &slot("dbev_bk_a"), now)
-            .await
-            .unwrap();
+            .await?;
         repository
             .register_resource("job_b", &slot("dbev_bk_b"), now)
-            .await
-            .unwrap();
+            .await?;
         repository
             .release_resource("job_b", "replication_slot", "dbev_bk_a")
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(
-            repository.unreleased_resources("job_b").await.unwrap(),
+            repository.unreleased_resources("job_b").await?,
             vec![slot("dbev_bk_b")]
         );
 
-        let pending = repository.needing_recovery(Some("inst_one")).await.unwrap();
+        let pending = repository.needing_recovery(Some("inst_one")).await?;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].state, BackupJobState::Capturing);
         assert!(
             repository
                 .needing_recovery(Some("inst_two"))
-                .await
-                .unwrap()
+                .await?
                 .is_empty()
         );
 
@@ -694,8 +690,7 @@ mod tests {
                 Some("crashed"),
                 now,
             )
-            .await
-            .unwrap();
+            .await?;
         // A job being recovered can no longer acquire resources.
         assert!(
             repository
@@ -705,18 +700,22 @@ mod tests {
         );
         repository
             .transition("job_b", BackupJobState::Failed, None, now)
-            .await
-            .unwrap();
-        let stored = repository.get("job_b").await.unwrap().unwrap();
+            .await?;
+        let stored = repository
+            .get("job_b")
+            .await?
+            .context("get should provide a value")?;
         assert_eq!(stored.state, BackupJobState::Failed);
         assert_eq!(stored.error.as_deref(), Some("crashed"));
-        assert!(repository.needing_recovery(None).await.unwrap().is_empty());
+        assert!(repository.needing_recovery(None).await?.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn publications_stay_journaled_until_settled_and_never_revert() {
-        let dir = tempfile::tempdir().unwrap();
-        let repository = BackupJobRepository::new(sqlite::connect(dir.path()).await.unwrap());
+    async fn publications_stay_journaled_until_settled_and_never_revert() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repository = BackupJobRepository::new(sqlite::connect(dir.path()).await?);
         let now = "2026-01-01T00:00:01Z";
         let record = BackupPublicationRecord {
             backup_id: "one.physical.tar.gz".to_string(),
@@ -729,7 +728,7 @@ mod tests {
             created_at: now.to_string(),
             updated_at: now.to_string(),
         };
-        repository.begin_publication(&record).await.unwrap();
+        repository.begin_publication(&record).await?;
         // One publication per backup id.
         assert!(repository.begin_publication(&record).await.is_err());
         let unpublish = BackupPublicationRecord {
@@ -740,50 +739,38 @@ mod tests {
 
         repository
             .mark_unpublish(&record.backup_id, Some("upload failed"), now)
-            .await
-            .unwrap();
+            .await?;
         repository
             .note_publication_error(&record.backup_id, "storage unavailable", now)
-            .await
-            .unwrap();
-        let pending = repository
-            .unsettled_publications(Some("inst_one"))
-            .await
-            .unwrap();
+            .await?;
+        let pending = repository.unsettled_publications(Some("inst_one")).await?;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].state, PublicationState::Unpublish);
         assert_eq!(pending[0].error.as_deref(), Some("storage unavailable"));
         assert!(
             repository
                 .unsettled_publications(Some("inst_two"))
-                .await
-                .unwrap()
+                .await?
                 .is_empty()
         );
 
-        repository
-            .settle_publication(&record.backup_id)
-            .await
-            .unwrap();
-        assert!(
-            repository
-                .publication(&record.backup_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        repository.settle_publication(&record.backup_id).await?;
+        assert!(repository.publication(&record.backup_id).await?.is_none());
         assert!(
             repository
                 .mark_unpublish(&record.backup_id, None, now)
                 .await
                 .is_err()
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn publication_resources_are_idempotent_and_settle_with_their_publication() {
-        let dir = tempfile::tempdir().unwrap();
-        let repository = BackupJobRepository::new(sqlite::connect(dir.path()).await.unwrap());
+    async fn publication_resources_are_idempotent_and_settle_with_their_publication()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repository = BackupJobRepository::new(sqlite::connect(dir.path()).await?);
         let now = "2026-01-01T00:00:01Z";
         let upload = PublicationResourceRecord {
             kind: "s3_multipart_upload".to_string(),
@@ -809,31 +796,26 @@ mod tests {
                 created_at: now.to_string(),
                 updated_at: now.to_string(),
             })
-            .await
-            .unwrap();
+            .await?;
         for _ in 0..2 {
             repository
                 .record_publication_resource("one.physical.tar.gz", &upload, now)
-                .await
-                .unwrap();
+                .await?;
         }
         assert_eq!(
             repository
                 .publication_resources("one.physical.tar.gz")
-                .await
-                .unwrap(),
+                .await?,
             vec![upload.clone()]
         );
-        repository
-            .settle_publication("one.physical.tar.gz")
-            .await
-            .unwrap();
+        repository.settle_publication("one.physical.tar.gz").await?;
         assert!(
             repository
                 .publication_resources("one.physical.tar.gz")
-                .await
-                .unwrap()
+                .await?
                 .is_empty()
         );
+
+        Ok(())
     }
 }

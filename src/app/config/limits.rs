@@ -95,48 +95,49 @@ impl RuntimeLimits {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn every_limit_rejects_zero_and_overflow() {
-        let defaults = serde_json::to_value(RuntimeLimits::default()).unwrap();
-        for name in defaults.as_object().unwrap().keys() {
+    fn every_limit_rejects_zero_and_overflow() -> anyhow::Result<()> {
+        let defaults = serde_json::to_value(RuntimeLimits::default())?;
+        for name in defaults.as_object().context("expected an object")?.keys() {
             for value in [0, u32::MAX as u64 + 1] {
                 let mut invalid = defaults.clone();
                 invalid[name] = value.into();
-                let limits: RuntimeLimits = serde_json::from_value(invalid).unwrap();
+                let limits: RuntimeLimits = serde_json::from_value(invalid)?;
                 let mut settings = super::super::Config::default();
                 settings.daemon.limits = limits;
-                let error = super::super::RuntimeConfig::new(settings).unwrap_err();
+                let error = super::super::RuntimeConfig::new(settings)
+                    .expect_err("every limit rejects zero and overflow should return an error");
                 assert!(error.to_string().contains(name));
             }
         }
+
+        Ok(())
     }
 
     #[test]
-    fn partial_yaml_preserves_defaults_and_builds_shared_budgets() {
+    fn partial_yaml_preserves_defaults_and_builds_shared_budgets() -> anyhow::Result<()> {
         let config: super::super::Config = yaml_serde::from_str(
             "daemon:\n  limits:\n    gateway_handshakes: 2\n    backup_materializations: 3\n",
-        )
-        .unwrap();
+        )?;
         assert_eq!(config.daemon.sql_buffer_global_mib, 1024);
         assert_eq!(config.daemon.limits.api_connections, 2048);
-        let runtime = std::sync::Arc::new(super::super::RuntimeConfig::new(config).unwrap());
+        let runtime = std::sync::Arc::new(super::super::RuntimeConfig::new(config)?);
         let other = std::sync::Arc::clone(&runtime);
-        let handshakes = runtime
-            .budgets
-            .gateway_handshakes
-            .try_acquire_many(2)
-            .unwrap();
+        let handshakes = runtime.budgets.gateway_handshakes.try_acquire_many(2)?;
         assert!(other.budgets.gateway_handshakes.try_acquire().is_err());
         let backups = runtime
             .budgets
             .backup_materializations
-            .try_acquire_many(3)
-            .unwrap();
+            .try_acquire_many(3)?;
         assert!(other.budgets.backup_materializations.try_acquire().is_err());
         drop((handshakes, backups));
         assert_eq!(other.budgets.gateway_handshakes.available_permits(), 2);
         assert_eq!(other.budgets.backup_materializations.available_permits(), 3);
+
+        Ok(())
     }
 }

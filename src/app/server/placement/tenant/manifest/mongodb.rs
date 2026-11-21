@@ -256,10 +256,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_bson_validation_accepts_nested_values_and_rejects_truncation() {
-        let bytes =
-            bson::Document::to_vec(&doc! { "nested": { "value": 1 }, "items": [1, 2] }).unwrap();
-        validate_bson(&bytes).unwrap();
+    fn raw_bson_validation_accepts_nested_values_and_rejects_truncation() -> anyhow::Result<()> {
+        let bytes = bson::Document::to_vec(&doc! { "nested": { "value": 1 }, "items": [1, 2] })?;
+        validate_bson(&bytes)?;
         assert!(validate_bson(&bytes[..bytes.len() - 1]).is_err());
+
+        Ok(())
     }
 }

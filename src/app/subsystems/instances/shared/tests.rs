@@ -16,7 +16,10 @@ use crate::utils::limits::InstanceLimits;
 use crate::{databases::protocol::Protocol, server::test_support::shared_metadata};
 
 #[test]
-fn runtime_identity_errors_identify_each_field_without_reassigning_ownership() {
+fn runtime_identity_errors_identify_each_field_without_reassigning_ownership() -> anyhow::Result<()>
+{
+    use anyhow::Context as _;
+
     for field in [
         "none",
         "runtime_deployment_mode",
@@ -43,7 +46,13 @@ fn runtime_identity_errors_identify_each_field_without_reassigning_ownership() {
             "runtime_id" => runtime.runtime_id = "another-pool".into(),
             "tenant_owner_missing" => metadata.owner = None,
             "runtime_owner_missing" => runtime.owner = None,
-            "owner" => runtime.owner.as_mut().unwrap().server_id = "private-other-server".into(),
+            "owner" => {
+                runtime
+                    .owner
+                    .as_mut()
+                    .context("expected a value from as_mut")?
+                    .server_id = "private-other-server".into()
+            }
             "both_owners_missing" => {
                 metadata.owner = None;
                 runtime.owner = None;
@@ -56,7 +65,7 @@ fn runtime_identity_errors_identify_each_field_without_reassigning_ownership() {
         if field == "none" {
             assert!(result.is_ok());
         } else {
-            let error = result.unwrap_err();
+            let error = result.expect_err("runtime identity errors identify each field without reassigning ownership should return an error");
             assert_eq!(error.status(), http::StatusCode::CONFLICT);
             let message = error.to_string();
             if field == "both_owners_missing" {
@@ -70,6 +79,8 @@ fn runtime_identity_errors_identify_each_field_without_reassigning_ownership() {
         assert_eq!(metadata.owner, original_owner);
         assert_eq!(runtime.owner, original_runtime_owner);
     }
+
+    Ok(())
 }
 
 #[test]
@@ -125,7 +136,7 @@ fn post_runtime_lock_state_keeps_new_quota_blocks_for_repair() {
 }
 
 #[test]
-fn hard_disk_state_clears_a_legacy_soft_block() {
+fn hard_disk_state_clears_a_legacy_soft_block() -> anyhow::Result<()> {
     let mut metadata = shared_metadata();
     metadata.disk_limit_blocked = true;
     let enforcement = DiskEnforcement {
@@ -134,20 +145,19 @@ fn hard_disk_state_clears_a_legacy_soft_block() {
         container_data_path: None,
     };
 
-    assert!(
-        tenant::disk::update_state(
-            &mut metadata.limits,
-            &mut metadata.disk_limit_blocked,
-            &enforcement,
-        )
-        .unwrap()
-    );
+    assert!(tenant::disk::update_state(
+        &mut metadata.limits,
+        &mut metadata.disk_limit_blocked,
+        &enforcement,
+    )?);
     assert!(metadata.limits.disk_enforced);
     assert_eq!(
         metadata.limits.disk_enforcement_method,
         "host_xfs_project_quota"
     );
     assert!(!metadata.disk_limit_blocked);
+
+    Ok(())
 }
 
 #[test]

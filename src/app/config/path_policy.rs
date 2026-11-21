@@ -258,12 +258,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_existing_symlink_ancestor() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn rejects_existing_symlink_ancestor() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
         let real = temporary.path().join("real");
         let linked = temporary.path().join("linked");
-        fs::create_dir(&real).unwrap();
-        symlink(&real, &linked).unwrap();
+        fs::create_dir(&real)?;
+        symlink(&real, &linked)?;
         let paths = PathConfig {
             data: linked.join("dbev").display().to_string(),
             ..Default::default()
@@ -273,5 +273,7 @@ mod tests {
             HostPathPolicy::validate(&paths),
             Err(HostPathPolicyError::Symlink { .. })
         ));
+
+        Ok(())
     }
 }

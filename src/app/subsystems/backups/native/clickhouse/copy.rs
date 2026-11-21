@@ -332,26 +332,28 @@ mod tests {
 
     fn write(root: &Path, relative: &str, contents: &[u8]) {
         let path = root.join(relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, contents).unwrap();
+        fs::create_dir_all(path.parent().expect("expected a value from parent"))
+            .expect("parent should succeed");
+        fs::write(path, contents).expect("write should succeed");
     }
 
     fn volume() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().expect("tempdir should succeed");
         let data = root.path().join("data");
         write(&data, "metadata/default.sql", b"ATTACH DATABASE default");
         symlink(
             format!("/var/lib/clickhouse/{DATABASE}"),
             data.join("metadata/default"),
         )
-        .unwrap();
+        .expect("symlink should succeed");
         write(
             &data,
             &format!("{DATABASE}/events.sql"),
             b"ATTACH TABLE events",
         );
-        fs::create_dir_all(data.join("data/default")).unwrap();
-        symlink(format!("../../{TABLE}"), data.join("data/default/events")).unwrap();
+        fs::create_dir_all(data.join("data/default")).expect("create dir all should succeed");
+        symlink(format!("../../{TABLE}"), data.join("data/default/events"))
+            .expect("symlink should succeed");
         write(&data, &format!("{TABLE}/format_version.txt"), b"1");
         write(&data, &format!("{TABLE}/all_2_2_0/checksums.txt"), b"live");
         write(
@@ -390,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_parts_replace_the_live_ones() {
+    fn frozen_parts_replace_the_live_ones() -> anyhow::Result<()> {
         let root = volume();
         let data = root.path().join("data");
         let out = root.path().join("out");
@@ -402,11 +404,11 @@ mod tests {
             &out,
             &limits(),
         )
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
         assert_eq!(stats.parts, 1);
         assert_eq!(stats.omitted_links, 2);
         assert_eq!(
-            fs::read(out.join(format!("{TABLE}/all_1_1_0/data.bin"))).unwrap(),
+            fs::read(out.join(format!("{TABLE}/all_1_1_0/data.bin")))?,
             b"rows"
         );
         assert!(
@@ -426,11 +428,13 @@ mod tests {
         ] {
             assert!(fs::symlink_metadata(out.join(&absent)).is_err(), "{absent}");
         }
-        assert_eq!(count_parts(&out).unwrap(), 1);
+        assert_eq!(count_parts(&out).map_err(anyhow::Error::msg)?, 1);
+
+        Ok(())
     }
 
     #[test]
-    fn unfrozen_tables_keep_no_parts_and_foreign_links_fail() {
+    fn unfrozen_tables_keep_no_parts_and_foreign_links_fail() -> anyhow::Result<()> {
         let root = volume();
         let data = root.path().join("data");
         let stats = copy_frozen(
@@ -440,11 +444,14 @@ mod tests {
             &root.path().join("none"),
             &limits(),
         )
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
         assert_eq!(stats.parts, 0);
-        assert_eq!(count_parts(&root.path().join("none")).unwrap(), 0);
+        assert_eq!(
+            count_parts(&root.path().join("none")).map_err(anyhow::Error::msg)?,
+            0
+        );
 
-        symlink("/etc/passwd", data.join("access/escape")).unwrap();
+        symlink("/etc/passwd", data.join("access/escape"))?;
         let error = copy_frozen(
             &data,
             &data.join("shadow/dbev_bk_x"),
@@ -452,8 +459,10 @@ mod tests {
             &root.path().join("linked"),
             &limits(),
         )
-        .unwrap_err();
+        .expect_err("limits should return an error");
         assert!(error.contains("link"), "{error}");
+
+        Ok(())
     }
 
     #[test]
@@ -475,22 +484,30 @@ mod tests {
     }
 
     #[test]
-    fn parts_without_checksums_fail_the_count() {
-        let root = tempfile::tempdir().unwrap();
+    fn parts_without_checksums_fail_the_count() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
         write(root.path(), &format!("{TABLE}/all_1_1_0/data.bin"), b"x");
-        assert!(count_parts(root.path()).unwrap_err().contains("checksums"));
+        assert!(
+            count_parts(root.path())
+                .expect_err("path should return an error")
+                .contains("checksums")
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn shadow_removal_is_idempotent_and_refuses_links() {
+    fn shadow_removal_is_idempotent_and_refuses_links() -> anyhow::Result<()> {
         let root = volume();
         let data = root.path().join("data");
-        remove_shadow(&data, "dbev_bk_x").unwrap();
+        remove_shadow(&data, "dbev_bk_x").map_err(anyhow::Error::msg)?;
         assert!(!data.join("shadow/dbev_bk_x").exists());
         assert!(data.join("shadow/increment.txt").exists());
-        remove_shadow(&data, "dbev_bk_x").unwrap();
-        symlink("/etc", data.join("shadow/dbev_bk_y")).unwrap();
+        remove_shadow(&data, "dbev_bk_x").map_err(anyhow::Error::msg)?;
+        symlink("/etc", data.join("shadow/dbev_bk_y"))?;
         assert!(remove_shadow(&data, "dbev_bk_y").is_err());
         assert!(Path::new("/etc").exists());
+
+        Ok(())
     }
 }

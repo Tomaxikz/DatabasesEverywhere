@@ -447,7 +447,7 @@ mod lock_tests {
     use crate::server::test_support::shared_metadata;
 
     #[tokio::test]
-    async fn shared_job_locks_runtime_only_after_reconcile_releases_it() {
+    async fn shared_job_locks_runtime_only_after_reconcile_releases_it() -> anyhow::Result<()> {
         let locks = crate::server::locks::InstanceLocks::default();
         let _tenant_operation = locks.lock("tenant-a").await;
         let reconcile_locks = locks.clone();
@@ -462,10 +462,11 @@ mod lock_tests {
             }),
         )
         .await
-        .expect("job lock order must not deadlock shared reconciliation")
-        .unwrap();
+        .expect("job lock order must not deadlock shared reconciliation")?;
 
         assert!(runtime_operation.is_some());
+
+        Ok(())
     }
 
     #[test]

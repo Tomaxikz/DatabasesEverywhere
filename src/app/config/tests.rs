@@ -26,22 +26,19 @@ fn runtime_config_rejects_invalid_limits_before_constructing_resources() {
 }
 
 #[test]
-fn snapshots_contain_only_settings_and_do_not_replace_live_budgets() {
-    let settings: Config = yaml_serde::from_str("daemon:\n  sql_buffer_global_mib: 1\n").unwrap();
-    let running = Arc::new(RuntimeConfig::new(settings).unwrap());
+fn snapshots_contain_only_settings_and_do_not_replace_live_budgets() -> anyhow::Result<()> {
+    let settings: Config = yaml_serde::from_str("daemon:\n  sql_buffer_global_mib: 1\n")?;
+    let running = Arc::new(RuntimeConfig::new(settings)?);
     let consumer = Arc::clone(&running);
-    let reservation = running
-        .sql_buffer_budget
-        .try_acquire_many(1024 * 1024)
-        .unwrap();
+    let reservation = running.sql_buffer_budget.try_acquire_many(1024 * 1024)?;
     assert!(consumer.sql_buffer_budget.try_acquire().is_err());
     let snapshot = running.snapshot();
-    let yaml = yaml_serde::to_string(snapshot.as_ref()).unwrap();
+    let yaml = yaml_serde::to_string(snapshot.as_ref())?;
     assert!(yaml.contains("sql_buffer_global_mib: 1"));
     assert!(!yaml.contains("sql_buffer_budget:"));
     let mut updated = (*snapshot).clone();
     updated.daemon.sql_buffer_global_mib = 2;
-    let next_run = RuntimeConfig::new(updated).unwrap();
+    let next_run = RuntimeConfig::new(updated)?;
     assert_eq!(
         next_run.sql_buffer_budget.available_permits(),
         2 * 1024 * 1024
@@ -50,10 +47,13 @@ fn snapshots_contain_only_settings_and_do_not_replace_live_budgets() {
     assert_eq!(consumer.sql_buffer_budget.available_permits(), 0);
     drop(reservation);
     assert_eq!(consumer.sql_buffer_budget.available_permits(), 1024 * 1024);
+
+    Ok(())
 }
 
 #[test]
-fn overallocation_prevention_defaults_to_enabled_for_new_and_legacy_configs() {
+fn overallocation_prevention_defaults_to_enabled_for_new_and_legacy_configs() -> anyhow::Result<()>
+{
     let allocation = AllocationConfig::default();
 
     assert!(allocation.prevent_cpu_overallocation);
@@ -67,12 +67,13 @@ max_disk_mib: null
 reserved_memory_mib: 512
 reserved_disk_mib: 2048
 "#,
-    )
-    .unwrap();
+    )?;
 
     assert!(allocation.prevent_cpu_overallocation);
     assert!(allocation.prevent_memory_overallocation);
     assert!(allocation.prevent_disk_overallocation);
+
+    Ok(())
 }
 
 #[test]
@@ -103,28 +104,29 @@ fn explicit_pool_can_only_reduce_the_safe_physical_pool() {
 }
 
 #[test]
-fn runtime_disk_mode_is_not_serialized_as_configuration() {
+fn runtime_disk_mode_is_not_serialized_as_configuration() -> anyhow::Result<()> {
     let disk = DiskConfig {
         mode: DiskLimitMode::ProjectQuota,
         ..DiskConfig::default()
     };
 
-    let yaml = yaml_serde::to_string(&disk).unwrap();
+    let yaml = yaml_serde::to_string(&disk)?;
 
     assert!(yaml.contains("mode: auto"));
     assert!(!yaml.contains("host_filesystem_quota"));
     assert!(yaml.contains("project_id_base:"));
+
+    Ok(())
 }
 
 #[test]
-fn legacy_soft_scanner_config_receives_safe_hybrid_defaults() {
+fn legacy_soft_scanner_config_receives_safe_hybrid_defaults() -> anyhow::Result<()> {
     let scanner: SoftDiskScannerConfig = yaml_serde::from_str(
         r#"
 scan_interval_seconds: 20
 max_concurrent_scans: 3
 "#,
-    )
-    .unwrap();
+    )?;
 
     assert!(scanner.use_inotify);
     assert_eq!(scanner.full_scan_interval_seconds, 90);
@@ -132,4 +134,6 @@ max_concurrent_scans: 3
     assert_eq!(scanner.max_dirty_paths_per_instance, 512);
     assert_eq!(scanner.scan_interval_seconds, 20);
     assert_eq!(scanner.max_concurrent_scans, 3);
+
+    Ok(())
 }

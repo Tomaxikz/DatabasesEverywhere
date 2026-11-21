@@ -47,32 +47,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_roundtrip_next_to_the_config_and_tolerate_absence() {
-        let directory = tempfile::tempdir().unwrap();
+    fn settings_roundtrip_next_to_the_config_and_tolerate_absence() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let config = directory.path().join("config.yml");
         assert_eq!(ConsoleSettings::load(&config), Default::default());
         let settings = ConsoleSettings {
             public_host: "db.example.com".to_string(),
         };
-        std::fs::write(ConsoleSettings::path(&config), settings.to_yaml().unwrap()).unwrap();
+        std::fs::write(ConsoleSettings::path(&config), settings.to_yaml()?)?;
         assert_eq!(ConsoleSettings::load(&config), (settings, vec![]));
         assert_eq!(
             ConsoleSettings::path(&config),
             directory.path().join("console.yml")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn unknown_console_fields_report_only_keys_and_preserve_known_settings() {
-        let directory = tempfile::tempdir().unwrap();
+    fn unknown_console_fields_report_only_keys_and_preserve_known_settings() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("config.yml");
         std::fs::write(
             ConsoleSettings::path(&path),
             "public_host: db.example.com\npubic_host: example-secret\n",
-        )
-        .unwrap();
+        )?;
         let (settings, ignored) = ConsoleSettings::load(&path);
         assert_eq!(settings.public_host, "db.example.com");
         assert_eq!(ignored, ["pubic_host"]);
+
+        Ok(())
     }
 }

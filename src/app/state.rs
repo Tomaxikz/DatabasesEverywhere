@@ -148,14 +148,18 @@ impl DaemonShutdown {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn compatibility_exports_share_the_same_shutdown_coordinator() {
+    fn compatibility_exports_share_the_same_shutdown_coordinator() -> anyhow::Result<()> {
         let shutdown = DaemonShutdown::default();
         let http: crate::routes::http::state::DaemonShutdown = shutdown.clone();
         let router: crate::routes::http::router::DaemonShutdown = http.clone();
-        let permit = router.try_admit_mutation().unwrap();
+        let permit = router
+            .try_admit_mutation()
+            .context("expected a value from try_admit_mutation")?;
         assert_eq!(shutdown.active_mutation_count(), 1);
 
         http.trigger();
@@ -163,10 +167,12 @@ mod tests {
         assert!(router.try_admit_mutation().is_none());
         drop(permit);
         assert_eq!(shutdown.active_mutation_count(), 0);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cloned_state_gateways_use_the_configured_shared_budget() {
+    async fn cloned_state_gateways_use_the_configured_shared_budget() -> anyhow::Result<()> {
         let settings = crate::config::Config {
             daemon: crate::config::DaemonConfig {
                 sql_buffer_global_mib: 1,
@@ -179,20 +185,31 @@ mod tests {
         assert!(Arc::ptr_eq(&state.config, &other.config));
         let first = state.gateway_supervisor.tenant_sessions().open("tenant-a");
         let second = other.gateway_supervisor.tenant_sessions().open("tenant-b");
-        let reserved = first.query_budget().reserve(1024 * 1024).unwrap();
+        let reserved = first.query_budget().reserve(1024 * 1024)?;
         assert_eq!(
-            second.query_budget().reserve(1).err().unwrap().kind(),
+            second
+                .query_budget()
+                .reserve(1)
+                .err()
+                .context("err should provide a value")?
+                .kind(),
             std::io::ErrorKind::WouldBlock
         );
         drop(reserved);
         assert!(second.query_budget().reserve(1024 * 1024).is_ok());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn shutdown_closes_mutation_admission_and_drains_existing_work() {
+    async fn shutdown_closes_mutation_admission_and_drains_existing_work() -> anyhow::Result<()> {
         let shutdown = DaemonShutdown::default();
-        let mutation = shutdown.try_admit_mutation().unwrap();
-        let background = shutdown.try_admit_background_mutation().unwrap();
+        let mutation = shutdown
+            .try_admit_mutation()
+            .context("expected a value from try_admit_mutation")?;
+        let background = shutdown
+            .try_admit_background_mutation()
+            .context("expected a value from try_admit_background_mutation")?;
         assert_eq!(shutdown.active_mutation_count(), 2);
         shutdown.trigger();
         assert!(shutdown.try_admit_mutation().is_none());
@@ -210,12 +227,16 @@ mod tests {
                 .await
         );
         assert_eq!(shutdown.active_mutation_count(), 0);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn the_drain_times_out_while_a_change_is_still_running() {
+    async fn the_drain_times_out_while_a_change_is_still_running() -> anyhow::Result<()> {
         let shutdown = DaemonShutdown::default();
-        let _running = shutdown.try_admit_mutation().unwrap();
+        let _running = shutdown
+            .try_admit_mutation()
+            .context("expected a value from try_admit_mutation")?;
         shutdown.trigger();
         assert!(
             !shutdown
@@ -223,5 +244,7 @@ mod tests {
                 .await
         );
         assert_eq!(shutdown.active_mutation_count(), 1);
+
+        Ok(())
     }
 }

@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_trees_are_frozen_and_metadata_engines_ride_along() {
+    fn merge_trees_are_frozen_and_metadata_engines_ride_along() -> anyhow::Result<()> {
         let plan = plan(
             &[database("default", "Atomic"), database("system", "Atomic")],
             &[
@@ -169,8 +169,7 @@ mod tests {
                 table("system", "query_log", "MergeTree"),
                 table("system", "one", "SystemOne"),
             ],
-        )
-        .unwrap();
+        )?;
         assert_eq!(
             plan.frozen,
             vec![FrozenTable {
@@ -180,6 +179,8 @@ mod tests {
             }]
         );
         assert_eq!((plan.memory_tables, plan.system_merge_trees), (1, 1));
+
+        Ok(())
     }
 
     #[test]

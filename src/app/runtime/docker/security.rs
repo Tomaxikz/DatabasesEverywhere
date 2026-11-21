@@ -359,7 +359,7 @@ mod tests {
 
             let error = DockerSecurityPolicy::default()
                 .validate_spec(&spec)
-                .unwrap_err();
+                .expect_err("validate spec should return an error");
 
             assert!(matches!(error, DockerSecurityError::ForbiddenMount { .. }));
         }
@@ -408,7 +408,7 @@ mod tests {
 
             let error = DockerSecurityPolicy::default()
                 .validate_spec(&spec)
-                .unwrap_err();
+                .expect_err("validate spec should return an error");
 
             match target {
                 "/mnt/config" => {
@@ -427,10 +427,10 @@ mod tests {
     }
 
     #[test]
-    fn allows_clickhouse_hosted_config_extra_mount_target() {
-        let tempdir = tempfile::tempdir().unwrap();
+    fn allows_clickhouse_hosted_config_extra_mount_target() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
         let source = tempdir.path().join("dbe-hosted-overrides.xml");
-        std::fs::write(&source, "<clickhouse/>").unwrap();
+        std::fs::write(&source, "<clickhouse/>")?;
         let mut spec = test_spec();
         spec.extra_mounts.push(super::super::DockerMount {
             source,
@@ -438,9 +438,9 @@ mod tests {
             read_only: true,
         });
 
-        DockerSecurityPolicy::default()
-            .validate_spec(&spec)
-            .unwrap();
+        DockerSecurityPolicy::default().validate_spec(&spec)?;
+
+        Ok(())
     }
 
     #[test]
@@ -459,12 +459,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_extra_mount_source_symlink_to_forbidden_path() {
+    fn rejects_extra_mount_source_symlink_to_forbidden_path() -> anyhow::Result<()> {
         use std::os::unix::fs::symlink;
 
-        let tempdir = tempfile::tempdir().unwrap();
+        let tempdir = tempfile::tempdir()?;
         let link = tempdir.path().join("etc-link");
-        symlink("/etc", &link).unwrap();
+        symlink("/etc", &link)?;
         let mut spec = test_spec();
         spec.extra_mounts.push(super::super::DockerMount {
             source: link,
@@ -474,9 +474,11 @@ mod tests {
 
         let error = DockerSecurityPolicy::default()
             .validate_spec(&spec)
-            .unwrap_err();
+            .expect_err("validate spec should return an error");
 
         assert!(matches!(error, DockerSecurityError::ForbiddenMount { .. }));
+
+        Ok(())
     }
 
     fn test_spec() -> DockerInstanceSpec {

@@ -2,7 +2,7 @@ use super::super::WEBSOCKET_MAX_MESSAGE_BYTES;
 use super::*;
 
 #[test]
-fn history_and_live_data_are_emitted_once_and_reset_on_reconnect() {
+fn history_and_live_data_are_emitted_once_and_reset_on_reconnect() -> anyhow::Result<()> {
     let mut stream = LogRedactor::default();
     assert_eq!(stream.push("old line\n"), "old line\n");
     assert_eq!(stream.push("new"), "");
@@ -13,8 +13,7 @@ fn history_and_live_data_are_emitted_once_and_reset_on_reconnect() {
         identity: LogIdentity::Instance { instance_id: "db" },
         sequence: 0,
         change: LogChange::Reset,
-    })
-    .unwrap();
+    })?;
     assert_eq!(
         reset,
         serde_json::json!({"type":"logs","instance_id":"db","sequence":0,"event":"reset"})
@@ -27,13 +26,14 @@ fn history_and_live_data_are_emitted_once_and_reset_on_reconnect() {
             stream: LogStream::Stderr,
             data: "new line\n",
         },
-    })
-    .unwrap();
+    })?;
     assert_eq!(event["event"], "append");
     assert_eq!(event["stream"], "stderr");
     assert!(event.get("stdout").is_none());
     assert!(!event.to_string().contains("old line"));
     assert_eq!(LogRedactor::default().push("new line\n"), "new line\n");
+
+    Ok(())
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn partial_final_records_and_redaction_overflow_are_explicit() {
 }
 
 #[test]
-fn serialized_log_chunks_fit_the_frame_budget_without_splitting_utf8() {
+fn serialized_log_chunks_fit_the_frame_budget_without_splitting_utf8() -> anyhow::Result<()> {
     for data in ["\0".repeat(LOG_RECORD_LIMIT), "😀\\\"\n".repeat(10_000)] {
         let chunks = text_chunks(&data).collect::<Vec<_>>();
         assert_eq!(chunks.concat(), data);
@@ -96,7 +96,9 @@ fn serialized_log_chunks_fit_the_frame_budget_without_splitting_utf8() {
                     data: chunk,
                 },
             };
-            assert!(serde_json::to_vec(&event).unwrap().len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
+            assert!(serde_json::to_vec(&event)?.len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
         }
     }
+
+    Ok(())
 }

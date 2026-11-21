@@ -251,23 +251,21 @@ pub enum SecretStoreError {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn round_trips_secret_and_binds_aad() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SecretStore::open_or_create(dir.path()).unwrap();
+    fn round_trips_secret_and_binds_aad() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = SecretStore::open_or_create(dir.path())?;
 
-        let encrypted = store
-            .encrypt("mongodb_root_password", "inst_1", "secret")
-            .unwrap();
+        let encrypted = store.encrypt("mongodb_root_password", "inst_1", "secret")?;
 
         assert!(is_encrypted(&encrypted));
         assert!(!encrypted.contains("secret"));
         assert_eq!(
-            store
-                .decrypt("mongodb_root_password", "inst_1", &encrypted)
-                .unwrap(),
+            store.decrypt("mongodb_root_password", "inst_1", &encrypted)?,
             "secret"
         );
         assert!(
@@ -275,36 +273,37 @@ mod tests {
                 .decrypt("mongodb_root_password", "inst_2", &encrypted)
                 .is_err()
         );
+
+        Ok(())
     }
 
     #[test]
-    fn decrypts_metadata_written_by_the_legacy_ring_provider() {
-        let dir = tempfile::tempdir().unwrap();
+    fn decrypts_metadata_written_by_the_legacy_ring_provider() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         fs::write(
             dir.path().join(KEY_FILE_NAME),
             "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
-        )
-        .unwrap();
-        let store = SecretStore::open_or_create(dir.path()).unwrap();
+        )?;
+        let store = SecretStore::open_or_create(dir.path())?;
 
-        let plaintext = store
-            .decrypt(
-                "mongodb_root_password",
-                "inst_legacy",
-                "dbev1:AAECAwQFBgcICQoL:NGe1aaCRDgfNxd8Y9kMrXdOO6BQGgw",
-            )
-            .unwrap();
+        let plaintext = store.decrypt(
+            "mongodb_root_password",
+            "inst_legacy",
+            "dbev1:AAECAwQFBgcICQoL:NGe1aaCRDgfNxd8Y9kMrXdOO6BQGgw",
+        )?;
 
         assert_eq!(plaintext, "secret");
+
+        Ok(())
     }
 
     #[test]
-    fn fingerprints_are_keyed_bound_and_length_delimited() {
-        let first_dir = tempfile::tempdir().unwrap();
-        let second_dir = tempfile::tempdir().unwrap();
-        let first = SecretStore::open_or_create(first_dir.path()).unwrap();
-        let first_reopened = SecretStore::open_or_create(first_dir.path()).unwrap();
-        let second = SecretStore::open_or_create(second_dir.path()).unwrap();
+    fn fingerprints_are_keyed_bound_and_length_delimited() -> anyhow::Result<()> {
+        let first_dir = tempfile::tempdir()?;
+        let second_dir = tempfile::tempdir()?;
+        let first = SecretStore::open_or_create(first_dir.path())?;
+        let first_reopened = SecretStore::open_or_create(first_dir.path())?;
+        let second = SecretStore::open_or_create(second_dir.path())?;
 
         let expected = first.fingerprint("auth", "inst_1", &["ab", "c"]);
         assert_eq!(
@@ -315,7 +314,11 @@ mod tests {
         assert_ne!(expected, first.fingerprint("auth", "inst_2", &["ab", "c"]));
         assert_ne!(expected, second.fingerprint("auth", "inst_1", &["ab", "c"]));
         assert!(expected.starts_with("dbevh1:"));
-        let encoded = expected.strip_prefix("dbevh1:").unwrap();
-        assert_eq!(URL_SAFE_NO_PAD.decode(encoded).unwrap().len(), 32);
+        let encoded = expected
+            .strip_prefix("dbevh1:")
+            .context("expected a value from strip_prefix")?;
+        assert_eq!(URL_SAFE_NO_PAD.decode(encoded)?.len(), 32);
+
+        Ok(())
     }
 }

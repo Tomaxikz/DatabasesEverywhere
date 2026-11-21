@@ -174,38 +174,36 @@ mod tests {
 
     /// `false` makes `begin_attestation` report `current: false`, so `harden_postgres` reruns.
     #[tokio::test]
-    async fn revision_one_attestation_is_not_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
-        let repository = InstanceRepository::encrypted(pool, dir.path()).unwrap();
+    async fn revision_one_attestation_is_not_current() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = sqlite::connect(dir.path()).await?;
+        let repository = InstanceRepository::encrypted(pool, dir.path())?;
         let manager = InstanceManager::new(InstanceStore::default(), repository);
         let mut metadata = test_support::metadata("inst_pg_rev", Protocol::Postgres);
         metadata.tenant_password = Some("tenant-secret".to_string());
         metadata.postgres_admin_password = Some("admin-secret".to_string());
-        manager.upsert(metadata.clone()).await.unwrap();
+        manager.upsert(metadata.clone()).await?;
         let identity = ManagedContainerIdentity {
             id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".into(),
             started_at: "2026-08-13T12:00:00Z".into(),
         };
         manager
             .record_hardening_attestation(&metadata, &identity, 1)
-            .await
-            .unwrap();
+            .await?;
         assert!(
             !manager
                 .hardening_is_current(&metadata, &identity, POSTGRES_HARDENING_REVISION)
-                .await
-                .unwrap()
+                .await?
         );
         manager
             .record_hardening_attestation(&metadata, &identity, POSTGRES_HARDENING_REVISION)
-            .await
-            .unwrap();
+            .await?;
         assert!(
             manager
                 .hardening_is_current(&metadata, &identity, POSTGRES_HARDENING_REVISION)
-                .await
-                .unwrap()
+                .await?
         );
+
+        Ok(())
     }
 }

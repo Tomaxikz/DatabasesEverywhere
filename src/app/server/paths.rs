@@ -398,16 +398,17 @@ mod tests {
     fn rejects_unsafe_instance_ids() {
         let config = PathConfig::default();
 
-        let error = InstancePaths::new(&config, "../bad").unwrap_err();
+        let error = InstancePaths::new(&config, "../bad")
+            .expect_err("rejects unsafe instance ids should return an error");
 
         assert!(matches!(error, InstancePathError::InvalidId(_)));
     }
 
     #[test]
-    fn builds_paths_under_configured_roots() {
+    fn builds_paths_under_configured_roots() -> anyhow::Result<()> {
         let config = PathConfig::default();
 
-        let paths = InstancePaths::new(&config, "inst_abc").unwrap();
+        let paths = InstancePaths::new(&config, "inst_abc")?;
 
         assert!(paths.data.starts_with(&config.data));
         assert!(paths.logs.starts_with(&config.logs));
@@ -415,6 +416,8 @@ mod tests {
         assert!(paths.imports.starts_with(config.imports_root()));
         assert!(paths.backups.starts_with(config.backups_root()));
         assert!(paths.runtime_config.starts_with(config.metadata_root()));
+
+        Ok(())
     }
 
     #[test]
@@ -437,32 +440,33 @@ mod tests {
     }
 
     #[test]
-    fn container_owner_repair_does_not_follow_symlinks() {
+    fn container_owner_repair_does_not_follow_symlinks() -> anyhow::Result<()> {
         use std::os::unix::fs::{MetadataExt, symlink};
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let managed = temp.path().join("managed");
         let outside = temp.path().join("outside");
-        std::fs::create_dir(&managed).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("must-not-be-traversed"), b"outside").unwrap();
-        symlink(&outside, managed.join("outside-link")).unwrap();
+        std::fs::create_dir(&managed)?;
+        std::fs::create_dir(&outside)?;
+        std::fs::write(outside.join("must-not-be-traversed"), b"outside")?;
+        symlink(&outside, managed.join("outside-link"))?;
         let owner = HostOwner {
-            uid: std::fs::metadata(&managed).unwrap().uid(),
-            gid: std::fs::metadata(&managed).unwrap().gid(),
+            uid: std::fs::metadata(&managed)?.uid(),
+            gid: std::fs::metadata(&managed)?.gid(),
         };
 
-        chown_recursive(&managed, owner).unwrap();
+        chown_recursive(&managed, owner)?;
 
         assert_eq!(
-            std::fs::read(outside.join("must-not-be-traversed")).unwrap(),
+            std::fs::read(outside.join("must-not-be-traversed"))?,
             b"outside"
         );
         assert!(
-            std::fs::symlink_metadata(managed.join("outside-link"))
-                .unwrap()
+            std::fs::symlink_metadata(managed.join("outside-link"))?
                 .file_type()
                 .is_symlink()
         );
+
+        Ok(())
     }
 }

@@ -19,7 +19,7 @@ fn recognizes_ssl_gss_and_cancel_startup_packets_without_confusion() {
 }
 
 #[test]
-fn libpq_jdbc_and_hikari_startup_parameters_survive_database_inference() {
+fn libpq_jdbc_and_hikari_startup_parameters_survive_database_inference() -> anyhow::Result<()> {
     for fields in [
         vec![("user", "tenant"), ("application_name", "psql")],
         vec![
@@ -35,8 +35,8 @@ fn libpq_jdbc_and_hikari_startup_parameters_survive_database_inference() {
         ],
     ] {
         let packet = startup_packet(&fields);
-        let rewritten = postgres::startup_packet_with_database(&packet, "tenant_database").unwrap();
-        let route = postgres::parse_startup_route(&rewritten).unwrap();
+        let rewritten = postgres::startup_packet_with_database(&packet, "tenant_database")?;
+        let route = postgres::parse_startup_route(&rewritten)?;
         assert_eq!(route.user, "tenant");
         assert_eq!(route.database.as_deref(), Some("tenant_database"));
         for (key, value) in fields {
@@ -50,6 +50,8 @@ fn libpq_jdbc_and_hikari_startup_parameters_survive_database_inference() {
             }
         }
     }
+
+    Ok(())
 }
 
 #[test]

@@ -17,7 +17,7 @@ async fn purge_rejects_invalid_or_foreign_upload_pages_before_aborting() {
             async move {
                 assert_eq!(req.method(), Method::GET);
                 // Objects are still listed afterwards; nothing may be aborted or deleted.
-                let query = req.uri().query().unwrap();
+                let query = req.uri().query().expect("expected a value from query");
                 assert!(query.contains("uploads=") || query.contains("list-type=2"));
                 page
             }
@@ -26,13 +26,13 @@ async fn purge_rejects_invalid_or_foreign_upload_pages_before_aborting() {
             .await
             .delete_instance("inst_one")
             .await
-            .unwrap_err();
+            .expect_err("delete instance should return an error");
         assert!(matches!(err, BackupStoreError::Corrupt(_)), "{err}");
     }
 }
 
 #[tokio::test]
-async fn object_listing_counts_utf8_bytes() {
+async fn object_listing_counts_utf8_bytes() -> anyhow::Result<()> {
     for size in [1024, 1025] {
         let suffix = "é".repeat((size - PREFIX.len()) / 2);
         let key = format!("{PREFIX}{suffix}{}", "x".repeat((size - PREFIX.len()) % 2));
@@ -43,11 +43,18 @@ async fn object_listing_counts_utf8_bytes() {
         });
         let result = wire::driver(app, 0, 5).await.list_keys(PREFIX).await;
         if size == 1024 {
-            assert_eq!(result.unwrap(), [key]);
+            assert_eq!(result?, [key]);
         } else {
-            assert!(result.unwrap_err().to_string().contains("1024 bytes"));
+            assert!(
+                result
+                    .expect_err("object listing counts utf8 bytes should return an error")
+                    .to_string()
+                    .contains("1024 bytes")
+            );
         }
     }
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -67,7 +74,7 @@ async fn empty_object_pages_with_distinct_tokens_hit_the_page_limit() {
         .await
         .list_keys(PREFIX)
         .await
-        .unwrap_err();
+        .expect_err("list keys should return an error");
     assert!(err.to_string().contains("page safety limit"), "{err}");
     assert_eq!(seen.load(Ordering::Relaxed), MAX_LIST_PAGES);
 }
@@ -78,7 +85,7 @@ async fn multipart_byte_limit_accumulates_ids_and_markers_across_pages() {
     let key = format!("{PREFIX}archive");
     let id = "x".repeat(MAX_RESPONSE_BYTES as usize / 2 - key.len());
     let app = Router::new().fallback(move |req: Request| {
-        let first = !req.uri().query().unwrap().contains("key-marker=");
+        let first = !req.uri().query().expect("expected a value from query").contains("key-marker=");
         let marker = if first { "<NextKeyMarker>next</NextKeyMarker><NextUploadIdMarker>id</NextUploadIdMarker>" } else { "" };
         let page = format!("<ListMultipartUploadsResult><IsTruncated>{first}</IsTruncated>{marker}<Upload><Key>{key}</Key><UploadId>{id}</UploadId></Upload></ListMultipartUploadsResult>");
         async move { page }
@@ -87,7 +94,7 @@ async fn multipart_byte_limit_accumulates_ids_and_markers_across_pages() {
         .await
         .delete_instance("inst_one")
         .await
-        .unwrap_err();
+        .expect_err("delete instance should return an error");
     assert!(error.to_string().contains("byte limit"), "{error}");
 }
 
@@ -98,12 +105,14 @@ async fn final_object_page_must_not_advertise_a_continuation() {
 }
 
 #[tokio::test]
-async fn interleaved_contents_are_all_listed() {
+async fn interleaved_contents_are_all_listed() -> anyhow::Result<()> {
     let mock = mock_s3(|_, _| (StatusCode::OK, format!("<ListBucketResult><Contents><Key>{PREFIX}a</Key></Contents><IsTruncated>false</IsTruncated><Contents><Key>{PREFIX}b</Key></Contents></ListBucketResult>").into_bytes())).await;
     assert_eq!(
-        mock_driver(&mock, 0).list_keys(PREFIX).await.unwrap(),
+        mock_driver(&mock, 0).list_keys(PREFIX).await?,
         [format!("{PREFIX}a"), format!("{PREFIX}b")]
     );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -133,28 +142,45 @@ async fn diagnostics_omit_reflected_codes_element_names_and_invalid_keys() {
     });
     let driver = wire::driver(app, 0, 5).await;
     for error in [
-        driver.get_bytes("key", 1).await.unwrap_err(),
+        driver
+            .get_bytes("key", 1)
+            .await
+            .expect_err("get bytes should return an error"),
         driver
             .client
             .complete_multipart("key", "id", vec![])
             .await
-            .unwrap_err(),
+            .expect_err("complete multipart should return an error"),
     ] {
         assert!(error.to_string().contains("returned HTTP"), "{error}");
         assert!(!error.to_string().contains(SECRET), "{error}");
     }
     for error in [
-        driver.list_keys("invalid-key/").await.unwrap_err(),
-        driver.list_keys(PREFIX).await.unwrap_err(),
-        driver.client.create_multipart("key").await.unwrap_err(),
-        driver.delete_instance("inst_one").await.unwrap_err(),
+        driver
+            .list_keys("invalid-key/")
+            .await
+            .expect_err("list keys should return an error"),
+        driver
+            .list_keys(PREFIX)
+            .await
+            .expect_err("list keys should return an error"),
+        driver
+            .client
+            .create_multipart("key")
+            .await
+            .expect_err("create multipart should return an error"),
+        driver
+            .delete_instance("inst_one")
+            .await
+            .expect_err("delete instance should return an error"),
     ] {
         assert!(!error.to_string().contains(SECRET), "{error}");
     }
 }
 
 #[tokio::test]
-async fn refused_upload_listing_still_removes_the_instance_objects_and_is_reported() {
+async fn refused_upload_listing_still_removes_the_instance_objects_and_is_reported()
+-> anyhow::Result<()> {
     let mock = mock_s3(|method, uri| match (method, uri) {
         ("GET", uri) if uri.contains("uploads=") => (StatusCode::FORBIDDEN, Vec::new()),
         ("GET", _) => (
@@ -170,10 +196,15 @@ async fn refused_upload_listing_still_removes_the_instance_objects_and_is_report
     let error = mock_driver(&mock, 0)
         .delete_instance("inst_one")
         .await
-        .unwrap_err();
+        .expect_err("delete instance should return an error");
     assert!(error.to_string().contains("HTTP 403"), "{error}");
-    let requests = mock.requests.lock().unwrap();
+    let requests = mock
+        .requests
+        .lock()
+        .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?;
     let deleted: Vec<_> = requests.iter().filter(|r| r.0 == "DELETE").collect();
     assert_eq!(deleted.len(), 1);
     assert!(deleted[0].1.ends_with("b1.metadata.json"));
+
+    Ok(())
 }

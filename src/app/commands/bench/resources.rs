@@ -414,6 +414,8 @@ fn memory_usage_bytes(stats: &ContainerStatsResponse) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
@@ -424,12 +426,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_host_ticks_and_cpu_count() {
+    fn parses_host_ticks_and_cpu_count() -> anyhow::Result<()> {
         let stat = "cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4\ncpu1 1 2 3 4\nintr 0\nctxt 0\nbtime 0\nprocesses 0\n";
-        let parsed = parse_host_cpu_counter(stat).unwrap();
+        let parsed =
+            parse_host_cpu_counter(stat).context("expected a value from parse_host_cpu_counter")?;
 
         assert_eq!(parsed.total_ticks, 36);
         assert_eq!(parsed.logical_cpus, 2);
+
+        Ok(())
     }
 
     #[test]
@@ -441,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_container_cpu_and_memory_counters() {
+    fn parses_container_cpu_and_memory_counters() -> anyhow::Result<()> {
         let stats = serde_json::from_value::<ContainerStatsResponse>(serde_json::json!({
             "cpu_stats": {
                 "cpu_usage": { "total_usage": 150 },
@@ -453,31 +458,30 @@ mod tests {
                 "system_cpu_usage": 1_000
             },
             "memory_stats": { "usage": 4096 }
-        }))
-        .unwrap();
+        }))?;
 
         assert_eq!(cpu_percent(&stats), Some(200.0));
         assert_eq!(memory_usage_bytes(&stats), Some(4096));
+
+        Ok(())
     }
 
     #[test]
-    fn computes_container_cpu_across_one_shot_samples_without_precpu_stats() {
+    fn computes_container_cpu_across_one_shot_samples_without_precpu_stats() -> anyhow::Result<()> {
         let first = serde_json::from_value::<ContainerStatsResponse>(serde_json::json!({
             "cpu_stats": {
                 "cpu_usage": { "total_usage": 100 },
                 "system_cpu_usage": 1_000,
                 "online_cpus": 4
             }
-        }))
-        .unwrap();
+        }))?;
         let second = serde_json::from_value::<ContainerStatsResponse>(serde_json::json!({
             "cpu_stats": {
                 "cpu_usage": { "total_usage": 150 },
                 "system_cpu_usage": 1_100,
                 "online_cpus": 4
             }
-        }))
-        .unwrap();
+        }))?;
         let mut previous = HashMap::new();
 
         assert_eq!(
@@ -488,5 +492,7 @@ mod tests {
             sample_container_cpu("instance-one", &second, &mut previous),
             Some(200.0)
         );
+
+        Ok(())
     }
 }

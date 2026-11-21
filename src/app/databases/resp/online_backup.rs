@@ -393,8 +393,8 @@ mod tests {
     }
 
     #[test]
-    fn scripts_never_carry_the_password_and_write_only_into_staging() {
-        let tools = tools(Protocol::Valkey).unwrap();
+    fn scripts_never_carry_the_password_and_write_only_into_staging() -> anyhow::Result<()> {
+        let tools = tools(Protocol::Valkey)?;
         let socket = container_backend_socket_path(Protocol::Valkey);
         let output = format!("{BACKUP_HELPER_STAGING}/{AOF_DIRECTORY}/{BASE_FILE}");
         let capture = capture_script(&capture_argv(tools, &socket, "app's user", &output));
@@ -417,11 +417,13 @@ mod tests {
         let env = auth_environment(&SecretString::from("hunter2"));
         assert!(env.iter().all(|entry| entry.key.ends_with("CLI_AUTH")));
         assert!(INVENTORY_HELPER_SUFFIX.len() <= 16 && VERIFY_HELPER_SUFFIX.len() <= 16);
+
+        Ok(())
     }
 
     #[test]
-    fn check_rdb_must_confirm_the_snapshot() {
-        let tools = tools(Protocol::Redis).unwrap();
+    fn check_rdb_must_confirm_the_snapshot() -> anyhow::Result<()> {
+        let tools = tools(Protocol::Redis)?;
         assert!(
             check_rdb_accepted(
                 tools,
@@ -430,5 +432,7 @@ mod tests {
             .is_ok()
         );
         assert!(check_rdb_accepted(tools, "").is_err());
+
+        Ok(())
     }
 }

@@ -19,7 +19,8 @@ use crate::{
 mod frames;
 
 #[tokio::test(start_paused = true)]
-async fn shared_query_deadline_releases_buffer_without_timing_out_idle_clients() {
+async fn shared_query_deadline_releases_buffer_without_timing_out_idle_clients()
+-> anyhow::Result<()> {
     let (mut client, gateway_client) = tokio::io::duplex(64);
     let (gateway_backend, mut backend) = tokio::io::duplex(64);
     let budget = crate::gateway::buffers::QueryBudget::default();
@@ -35,31 +36,39 @@ async fn shared_query_deadline_releases_buffer_without_timing_out_idle_clients()
     tokio::time::advance(QUERY_BODY_TIMEOUT * 2).await;
     assert!(!proxy.is_finished(), "an idle pooled connection is valid");
     let packet = mysql_packet(0, b"\x03SELECT 1");
-    client.write_all(&packet[..6]).await.unwrap();
+    client.write_all(&packet[..6]).await?;
     tokio::task::yield_now().await;
     assert!(budget.reserve(32 * 1024 * 1024).is_err());
     tokio::time::advance(QUERY_BODY_TIMEOUT).await;
     assert!(
-        matches!(proxy.await.unwrap(), Err(ListenerError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
+        matches!(proxy.await?, Err(ListenerError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
     );
     assert!(budget.reserve(32 * 1024 * 1024).is_ok());
     assert_eq!(
-        backend.read_u8().await.unwrap_err().kind(),
+        backend
+            .read_u8()
+            .await
+            .expect_err("read u8 should return an error")
+            .kind(),
         io::ErrorKind::UnexpectedEof
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_wire_limit_matches_advertised_limit_without_large_allocations() {
+async fn mongodb_wire_limit_matches_advertised_limit_without_large_allocations()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let mut message = mongodb_message(bson::doc! { "insert": "items", "$db": "tenant" });
     let limit = crate::gateway::protocols::mongodb::MAX_WIRE_MESSAGE_BYTES;
     for size in [16 * 1024 * 1024 + 128, limit] {
         message[..4].copy_from_slice(&(size as i32).to_le_bytes());
         let mut prefix = Vec::new();
         let (declared, kind) = read_mongodb_prefix(&mut message.as_slice(), &mut prefix)
-            .await
-            .unwrap()
-            .unwrap();
+            .await?
+            .context("as slice should provide a value")?;
         assert_eq!(declared, size);
         assert!(prefix.len() < 64);
         assert_eq!(kind, Some(OperationKind::Write));
@@ -70,6 +79,8 @@ async fn mongodb_wire_limit_matches_advertised_limit_without_large_allocations()
             .await
             .is_err()
     );
+
+    Ok(())
 }
 
 fn activity() -> Arc<ActivityCounter> {
@@ -102,7 +113,7 @@ fn mongodb_kind_is_case_insensitive_and_conservative() {
 }
 
 #[tokio::test]
-async fn postgres_proxy_forwards_complete_frontend_frames() {
+async fn postgres_proxy_forwards_complete_frontend_frames() -> anyhow::Result<()> {
     let (mut client, gateway_client) = tokio::io::duplex(128);
     let (gateway_backend, mut backend) = tokio::io::duplex(128);
     let activity = activity();
@@ -113,23 +124,25 @@ async fn postgres_proxy_forwards_complete_frontend_frames() {
     ));
     let mut frames = postgres_frame(b'Q', b"SELECT 1\0");
     frames.extend_from_slice(&postgres_frame(b'E', b"\0\0\0\0\0"));
-    client.write_all(&frames).await.unwrap();
-    client.shutdown().await.unwrap();
+    client.write_all(&frames).await?;
+    client.shutdown().await?;
 
     let mut forwarded = vec![0_u8; frames.len()];
-    backend.read_exact(&mut forwarded).await.unwrap();
-    backend.shutdown().await.unwrap();
-    proxy.await.unwrap().unwrap();
+    backend.read_exact(&mut forwarded).await?;
+    backend.shutdown().await?;
+    proxy.await??;
     assert_eq!(forwarded, frames);
     let snapshot = activity.snapshot();
     assert_eq!(snapshot.accepted.read, 1);
     assert_eq!(snapshot.accepted.other, 1);
     assert_eq!(snapshot.gateway.opened_connections, 1);
     assert_eq!(snapshot.gateway.active_connections, 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn postgres_proxy_rejects_invalid_frame_lengths() {
+async fn postgres_proxy_rejects_invalid_frame_lengths() -> anyhow::Result<()> {
     let (mut client, gateway_client) = tokio::io::duplex(32);
     let (gateway_backend, mut backend) = tokio::io::duplex(32);
     let proxy = tokio::spawn(proxy_postgres_session(
@@ -137,17 +150,21 @@ async fn postgres_proxy_rejects_invalid_frame_lengths() {
         gateway_backend,
         activity(),
     ));
-    client.write_all(&[b'Q', 0, 0, 0, 3]).await.unwrap();
-    let error = proxy.await.unwrap().unwrap_err();
+    client.write_all(&[b'Q', 0, 0, 0, 3]).await?;
+    let error = proxy
+        .await?
+        .expect_err("postgres proxy rejects invalid frame lengths should return an error");
     assert!(
         matches!(error, ListenerError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData)
     );
     let mut byte = [0_u8; 1];
-    assert_eq!(backend.read(&mut byte).await.unwrap(), 0);
+    assert_eq!(backend.read(&mut byte).await?, 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mysql_proxy_forwards_commands_but_rejects_change_user() {
+async fn mysql_proxy_forwards_commands_but_rejects_change_user() -> anyhow::Result<()> {
     let (mut client, gateway_client) = tokio::io::duplex(256);
     let (gateway_backend, mut backend) = tokio::io::duplex(256);
     let activity = activity();
@@ -174,16 +191,17 @@ async fn mysql_proxy_forwards_commands_but_rejects_change_user() {
             b'1',
         ],
     );
-    client.write_all(&query).await.unwrap();
+    client.write_all(&query).await?;
     let mut forwarded = vec![0_u8; query.len()];
-    backend.read_exact(&mut forwarded).await.unwrap();
+    backend.read_exact(&mut forwarded).await?;
     assert_eq!(forwarded, query);
 
     client
         .write_all(&mysql_packet(0, &[MYSQL_COM_CHANGE_USER, b'x']))
-        .await
-        .unwrap();
-    let error = proxy.await.unwrap().unwrap_err();
+        .await?;
+    let error = proxy
+        .await?
+        .expect_err("mysql proxy forwards commands but rejects change user should return an error");
     assert!(matches!(
         error,
         ListenerError::IdentitySwitchRejected { protocol: "mysql" }
@@ -193,10 +211,12 @@ async fn mysql_proxy_forwards_commands_but_rejects_change_user() {
     assert_eq!(snapshot.rejected.other, 1);
     assert_eq!(snapshot.gateway.opened_connections, 1);
     assert_eq!(snapshot.gateway.active_connections, 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mysql_continuation_payload_cannot_be_misread_as_change_user() {
+async fn mysql_continuation_payload_cannot_be_misread_as_change_user() -> anyhow::Result<()> {
     let (mut client, gateway_client) = tokio::io::duplex(256);
     let (gateway_backend, mut backend) = tokio::io::duplex(256);
     let proxy = tokio::spawn(proxy_mysql_session(
@@ -208,17 +228,19 @@ async fn mysql_continuation_payload_cannot_be_misread_as_change_user() {
         Default::default(),
     ));
     let continuation = mysql_packet(1, &[MYSQL_COM_CHANGE_USER, b'x']);
-    client.write_all(&continuation).await.unwrap();
-    client.shutdown().await.unwrap();
+    client.write_all(&continuation).await?;
+    client.shutdown().await?;
     let mut forwarded = vec![0_u8; continuation.len()];
-    backend.read_exact(&mut forwarded).await.unwrap();
-    backend.shutdown().await.unwrap();
-    proxy.await.unwrap().unwrap();
+    backend.read_exact(&mut forwarded).await?;
+    backend.shutdown().await?;
+    proxy.await??;
     assert_eq!(forwarded, continuation);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn shared_mysql_nonzero_payload_is_not_misread_as_a_database_command() {
+async fn shared_mysql_nonzero_payload_is_not_misread_as_a_database_command() -> anyhow::Result<()> {
     for protocol in [Protocol::Mysql, Protocol::Mariadb] {
         for command in [MYSQL_COM_CREATE_DB, MYSQL_COM_DROP_DB] {
             let (mut client, gateway_client) = tokio::io::duplex(128);
@@ -233,19 +255,21 @@ async fn shared_mysql_nonzero_payload_is_not_misread_as_a_database_command() {
             ));
             let continuation = mysql_packet(1, &[command, b'x']);
 
-            client.write_all(&continuation).await.unwrap();
-            client.shutdown().await.unwrap();
+            client.write_all(&continuation).await?;
+            client.shutdown().await?;
             let mut forwarded = vec![0_u8; continuation.len()];
-            backend.read_exact(&mut forwarded).await.unwrap();
-            backend.shutdown().await.unwrap();
-            proxy.await.unwrap().unwrap();
+            backend.read_exact(&mut forwarded).await?;
+            backend.shutdown().await?;
+            proxy.await??;
             assert_eq!(forwarded, continuation);
         }
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn shared_mysql_rejects_raw_database_commands_before_forwarding() {
+async fn shared_mysql_rejects_raw_database_commands_before_forwarding() -> anyhow::Result<()> {
     for protocol in [Protocol::Mysql, Protocol::Mariadb] {
         for command in [MYSQL_COM_CREATE_DB, MYSQL_COM_DROP_DB] {
             let (mut client, gateway_client) = tokio::io::duplex(128);
@@ -260,21 +284,23 @@ async fn shared_mysql_rejects_raw_database_commands_before_forwarding() {
             ));
             let packet = mysql_packet(0, &[command, b't', b'e', b'n', b'a', b'n', b't']);
 
-            client.write_all(&packet).await.unwrap();
+            client.write_all(&packet).await?;
 
-            let error = proxy.await.unwrap().unwrap_err();
+            let error = proxy.await?.expect_err("shared mysql rejects raw database commands before forwarding should return an error");
             assert!(matches!(
                 error,
                 ListenerError::Mariadb(mariadb::MariadbProxyError::SharedStorageCommandRejected(_))
             ));
             let mut byte = [0_u8; 1];
-            assert_eq!(backend.read(&mut byte).await.unwrap(), 0);
+            assert_eq!(backend.read(&mut byte).await?, 0);
         }
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn fragmented_shared_mysql_raw_database_commands_are_rejected() {
+async fn fragmented_shared_mysql_raw_database_commands_are_rejected() -> anyhow::Result<()> {
     for protocol in [Protocol::Mysql, Protocol::Mariadb] {
         for command in [MYSQL_COM_CREATE_DB, MYSQL_COM_DROP_DB] {
             let (mut client, gateway_client) = tokio::io::duplex(32);
@@ -292,23 +318,27 @@ async fn fragmented_shared_mysql_raw_database_commands_are_rejected() {
             let packet = mysql_packet(0, &[command]);
 
             for byte in packet {
-                client.write_all(&[byte]).await.unwrap();
+                client.write_all(&[byte]).await?;
                 tokio::task::yield_now().await;
             }
 
-            let error = proxy.await.unwrap().unwrap_err();
+            let error = proxy.await?.expect_err(
+                "fragmented shared mysql raw database commands are rejected should return an error",
+            );
             assert!(matches!(
                 error,
                 ListenerError::Mariadb(mariadb::MariadbProxyError::SharedStorageCommandRejected(_))
             ));
             let mut byte = [0_u8; 1];
-            assert_eq!(backend.read(&mut byte).await.unwrap(), 0);
+            assert_eq!(backend.read(&mut byte).await?, 0);
         }
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn dedicated_mysql_forwards_raw_database_commands() {
+async fn dedicated_mysql_forwards_raw_database_commands() -> anyhow::Result<()> {
     for protocol in [Protocol::Mysql, Protocol::Mariadb] {
         for command in [MYSQL_COM_CREATE_DB, MYSQL_COM_DROP_DB] {
             let (mut client, gateway_client) = tokio::io::duplex(128);
@@ -323,19 +353,22 @@ async fn dedicated_mysql_forwards_raw_database_commands() {
             ));
             let packet = mysql_packet(0, &[command, b't', b'e', b'n', b'a', b'n', b't']);
 
-            client.write_all(&packet).await.unwrap();
-            client.shutdown().await.unwrap();
+            client.write_all(&packet).await?;
+            client.shutdown().await?;
             let mut forwarded = vec![0_u8; packet.len()];
-            backend.read_exact(&mut forwarded).await.unwrap();
+            backend.read_exact(&mut forwarded).await?;
             assert_eq!(forwarded, packet);
-            backend.shutdown().await.unwrap();
-            proxy.await.unwrap().unwrap();
+            backend.shutdown().await?;
+            proxy.await??;
         }
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn shared_mysql_proxy_blocks_storage_escape_before_backend_forwarding() {
+async fn shared_mysql_proxy_blocks_storage_escape_before_backend_forwarding() -> anyhow::Result<()>
+{
     for (protocol, command) in [
         (Protocol::Mysql, MYSQL_COM_QUERY),
         (Protocol::Mariadb, MYSQL_COM_STMT_PREPARE),
@@ -352,20 +385,22 @@ async fn shared_mysql_proxy_blocks_storage_escape_before_backend_forwarding() {
         ));
         let mut payload = vec![command];
         payload.extend_from_slice(b"CREATE TABLE items(id BIGINT) TABLESPACE=innodb_system");
-        client.write_all(&mysql_packet(0, &payload)).await.unwrap();
+        client.write_all(&mysql_packet(0, &payload)).await?;
 
-        let error = proxy.await.unwrap().unwrap_err();
+        let error = proxy.await?.expect_err("shared mysql proxy blocks storage escape before backend forwarding should return an error");
         assert!(matches!(
             error,
             ListenerError::Mariadb(mariadb::MariadbProxyError::SharedStorageCommandRejected(_))
         ));
         let mut byte = [0_u8; 1];
-        assert_eq!(backend.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(backend.read(&mut byte).await?, 0);
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn fragmented_shared_mysql_commands_are_checked_before_forwarding() {
+async fn fragmented_shared_mysql_commands_are_checked_before_forwarding() -> anyhow::Result<()> {
     for (protocol, command) in [
         (Protocol::Mysql, MYSQL_COM_QUERY),
         (Protocol::Mariadb, MYSQL_COM_STMT_PREPARE),
@@ -385,22 +420,26 @@ async fn fragmented_shared_mysql_commands_are_checked_before_forwarding() {
         let packet = mysql_packet(0, &payload);
 
         for byte in packet {
-            client.write_all(&[byte]).await.unwrap();
+            client.write_all(&[byte]).await?;
             tokio::task::yield_now().await;
         }
 
-        let error = proxy.await.unwrap().unwrap_err();
+        let error = proxy.await?.expect_err(
+            "fragmented shared mysql commands are checked before forwarding should return an error",
+        );
         assert!(matches!(
             error,
             ListenerError::Mariadb(mariadb::MariadbProxyError::SharedStorageCommandRejected(_))
         ));
         let mut byte = [0_u8; 1];
-        assert_eq!(backend.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(backend.read(&mut byte).await?, 0);
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn shared_mysql_rejects_multi_packet_text_before_forwarding() {
+async fn shared_mysql_rejects_multi_packet_text_before_forwarding() -> anyhow::Result<()> {
     for command in [MYSQL_COM_QUERY, MYSQL_COM_STMT_PREPARE] {
         let (mut client, gateway_client) = tokio::io::duplex(64);
         let (gateway_backend, mut backend) = tokio::io::duplex(64);
@@ -413,23 +452,24 @@ async fn shared_mysql_rejects_multi_packet_text_before_forwarding() {
             Default::default(),
         ));
 
-        client
-            .write_all(&[0xff, 0xff, 0xff, 0, command])
-            .await
-            .unwrap();
+        client.write_all(&[0xff, 0xff, 0xff, 0, command]).await?;
 
-        let error = proxy.await.unwrap().unwrap_err();
+        let error = proxy.await?.expect_err(
+            "shared mysql rejects multi packet text before forwarding should return an error",
+        );
         assert!(matches!(
             error,
             ListenerError::Mariadb(mariadb::MariadbProxyError::SharedStorageCommandRejected(_))
         ));
         let mut byte = [0_u8; 1];
-        assert_eq!(backend.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(backend.read(&mut byte).await?, 0);
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mysql_storage_policy_is_shared_only_and_preserves_table_ddl() {
+async fn mysql_storage_policy_is_shared_only_and_preserves_table_ddl() -> anyhow::Result<()> {
     for (shared, sql) in [
         (true, "CREATE TABLE items(id BIGINT) ENGINE=InnoDB"),
         (true, "ALTER TABLE items ADD COLUMN note TEXT"),
@@ -449,19 +489,21 @@ async fn mysql_storage_policy_is_shared_only_and_preserves_table_ddl() {
         let mut payload = vec![MYSQL_COM_QUERY];
         payload.extend_from_slice(sql.as_bytes());
         let packet = mysql_packet(0, &payload);
-        client.write_all(&packet).await.unwrap();
-        client.shutdown().await.unwrap();
+        client.write_all(&packet).await?;
+        client.shutdown().await?;
 
         let mut forwarded = vec![0_u8; packet.len()];
-        backend.read_exact(&mut forwarded).await.unwrap();
+        backend.read_exact(&mut forwarded).await?;
         assert_eq!(forwarded, packet);
-        backend.shutdown().await.unwrap();
-        proxy.await.unwrap().unwrap();
+        backend.shutdown().await?;
+        proxy.await??;
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn binary_execute_payload_is_not_treated_as_sql_text() {
+async fn binary_execute_payload_is_not_treated_as_sql_text() -> anyhow::Result<()> {
     let (mut client, gateway_client) = tokio::io::duplex(512);
     let (gateway_backend, mut backend) = tokio::io::duplex(512);
     let proxy = tokio::spawn(proxy_mysql_session(
@@ -475,18 +517,21 @@ async fn binary_execute_payload_is_not_treated_as_sql_text() {
     let mut payload = vec![MYSQL_COM_STMT_EXECUTE];
     payload.extend_from_slice(b"DROP DATABASE tenant_db\0TABLESPACE innodb_system");
     let packet = mysql_packet(0, &payload);
-    client.write_all(&packet).await.unwrap();
-    client.shutdown().await.unwrap();
+    client.write_all(&packet).await?;
+    client.shutdown().await?;
 
     let mut forwarded = vec![0_u8; packet.len()];
-    backend.read_exact(&mut forwarded).await.unwrap();
+    backend.read_exact(&mut forwarded).await?;
     assert_eq!(forwarded, packet);
-    backend.shutdown().await.unwrap();
-    proxy.await.unwrap().unwrap();
+    backend.shutdown().await?;
+    proxy.await??;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_proxy_streams_data_but_rejects_post_auth_identity_commands() {
+async fn mongodb_proxy_streams_data_but_rejects_post_auth_identity_commands() -> anyhow::Result<()>
+{
     let (mut client, gateway_client) = tokio::io::duplex(1024);
     let (gateway_backend, mut backend) = tokio::io::duplex(1024);
     let activity = activity();
@@ -497,9 +542,9 @@ async fn mongodb_proxy_streams_data_but_rejects_post_auth_identity_commands() {
     ));
 
     let ping = mongodb_message(bson::doc! { "ping": 1_i32, "$db": "tenant_db" });
-    client.write_all(&ping).await.unwrap();
+    client.write_all(&ping).await?;
     let mut forwarded = vec![0_u8; ping.len()];
-    backend.read_exact(&mut forwarded).await.unwrap();
+    backend.read_exact(&mut forwarded).await?;
     assert_eq!(forwarded, ping);
 
     let reauth = mongodb_message(bson::doc! {
@@ -507,8 +552,10 @@ async fn mongodb_proxy_streams_data_but_rejects_post_auth_identity_commands() {
         "mechanism": "SCRAM-SHA-256",
         "$db": "victim_db",
     });
-    client.write_all(&reauth).await.unwrap();
-    let error = proxy.await.unwrap().unwrap_err();
+    client.write_all(&reauth).await?;
+    let error = proxy.await?.expect_err(
+        "mongodb proxy streams data but rejects post auth identity commands should return an error",
+    );
     assert!(matches!(
         error,
         ListenerError::IdentitySwitchRejected {
@@ -520,10 +567,13 @@ async fn mongodb_proxy_streams_data_but_rejects_post_auth_identity_commands() {
     assert_eq!(snapshot.rejected.other, 1);
     assert_eq!(snapshot.gateway.opened_connections, 1);
     assert_eq!(snapshot.gateway.active_connections, 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_proxy_streams_large_non_auth_messages_without_handshake_cap() {
+async fn mongodb_proxy_streams_large_non_auth_messages_without_handshake_cap() -> anyhow::Result<()>
+{
     let (mut client, gateway_client) = tokio::io::duplex(4096);
     let (gateway_backend, mut backend) = tokio::io::duplex(4096);
     let proxy = tokio::spawn(proxy_mongodb_session(
@@ -541,15 +591,20 @@ async fn mongodb_proxy_streams_large_non_auth_messages_without_handshake_cap() {
     });
     let expected = message.clone();
     let send = tokio::spawn(async move {
-        client.write_all(&message).await.unwrap();
-        client.shutdown().await.unwrap();
+        client
+            .write_all(&message)
+            .await
+            .expect("write all should succeed");
+        client.shutdown().await.expect("shutdown should succeed");
     });
     let mut forwarded = vec![0_u8; expected.len()];
-    backend.read_exact(&mut forwarded).await.unwrap();
-    backend.shutdown().await.unwrap();
-    send.await.unwrap();
-    proxy.await.unwrap().unwrap();
+    backend.read_exact(&mut forwarded).await?;
+    backend.shutdown().await?;
+    send.await?;
+    proxy.await??;
     assert_eq!(forwarded, expected);
+
+    Ok(())
 }
 
 fn mysql_packet(sequence: u8, payload: &[u8]) -> Vec<u8> {
@@ -568,7 +623,7 @@ fn postgres_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 fn mongodb_message(body: bson::Document) -> Vec<u8> {
-    let body = bson::Document::to_vec(&body).unwrap();
+    let body = bson::Document::to_vec(&body).expect("to vec should succeed");
     let len = 16 + 5 + body.len();
     let mut message = Vec::with_capacity(len);
     message.extend_from_slice(&(len as i32).to_le_bytes());

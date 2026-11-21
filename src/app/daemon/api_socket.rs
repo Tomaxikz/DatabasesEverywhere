@@ -204,6 +204,7 @@ impl Drop for SocketFile {
 
 #[cfg(test)]
 mod tests {
+
     use std::{os::unix::fs::PermissionsExt, time::Duration};
 
     use reqwest::StatusCode;
@@ -221,104 +222,103 @@ mod tests {
     const TOKEN: &str = "test-api-token-0123456789abcdef-01";
 
     #[tokio::test]
-    async fn serves_the_api_router_with_a_local_peer_identity() {
-        let directory = tempfile::tempdir().unwrap();
+    async fn serves_the_api_router_with_a_local_peer_identity() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let socket_directory = directory.path().join("run");
-        fs::create_dir(&socket_directory).unwrap();
-        fs::set_permissions(&socket_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(&socket_directory)?;
+        fs::set_permissions(&socket_directory, fs::Permissions::from_mode(0o755))?;
         let path = socket_directory.join("api.sock");
-        drop(UnixListener::bind(&path).unwrap());
+        drop(UnixListener::bind(&path)?);
 
-        let socket = ApiSocket::bind(&path.display().to_string()).unwrap();
-        let metadata = fs::symlink_metadata(&path).unwrap();
+        let socket = ApiSocket::bind(&path.display().to_string())?;
+        let metadata = fs::symlink_metadata(&path)?;
         assert!(metadata.file_type().is_socket());
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
         assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
         assert_eq!(
-            fs::metadata(&socket_directory)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
+            fs::metadata(&socket_directory)?.permissions().mode() & 0o7777,
             0o700
         );
 
-        let state_directory = tempfile::tempdir().unwrap();
+        let state_directory = tempfile::tempdir()?;
         let router = build_router(test_state(state_directory.path()).await);
         let acceptor =
             ApiConnectionAcceptor::new((), &Default::default()).sharing(DefaultAcceptor::new());
         let handle = Handle::new();
         let server = tokio::spawn(socket.serve(router, acceptor, handle.clone()));
-        handle.listening().await.unwrap();
+        handle
+            .listening()
+            .await
+            .context("expected a value from listening")?;
 
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder()
             .unix_socket(path.as_path())
-            .build()
-            .unwrap();
+            .build()?;
         let response = client
             .get("http://localhost/api/system")
             .bearer_auth(TOKEN)
             .send()
-            .await
-            .unwrap();
+            .await?;
         let status = response.status();
-        let body: serde_json::Value = response.json().await.unwrap();
+        let body: serde_json::Value = response.json().await?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["api_version"], crate::subsystems::system::API_VERSION);
 
-        let response = client
-            .get("http://localhost/api/system")
-            .send()
-            .await
-            .unwrap();
+        let response = client.get("http://localhost/api/system").send().await?;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         // Download handlers extract the peer address; without one they fail.
         let response = client
             .get("http://localhost/api/instances/inst_one/artifacts/art_one/download?token=bad")
             .send()
-            .await
-            .unwrap();
+            .await?;
         assert_ne!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         handle.graceful_shutdown(Some(Duration::from_secs(1)));
-        server.await.unwrap().unwrap();
+        server.await??;
         assert!(fs::symlink_metadata(&path).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn refuses_to_replace_anything_but_a_stale_socket() {
-        let directory = tempfile::tempdir().unwrap();
+    fn refuses_to_replace_anything_but_a_stale_socket() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("api.sock");
 
-        fs::write(&path, b"keep").unwrap();
-        let error = ApiSocket::bind(&path.display().to_string()).err().unwrap();
+        fs::write(&path, b"keep")?;
+        let error = ApiSocket::bind(&path.display().to_string())
+            .err()
+            .context("expected a value from err")?;
         assert!(error.to_string().contains("is not a socket"), "{error:#}");
-        assert_eq!(fs::read(&path).unwrap(), b"keep");
-        fs::remove_file(&path).unwrap();
+        assert_eq!(fs::read(&path)?, b"keep");
+        fs::remove_file(&path)?;
 
         let target = directory.path().join("target.sock");
-        let _target = UnixListener::bind(&target).unwrap();
-        std::os::unix::fs::symlink(&target, &path).unwrap();
-        let error = ApiSocket::bind(&path.display().to_string()).err().unwrap();
+        let _target = UnixListener::bind(&target)?;
+        std::os::unix::fs::symlink(&target, &path)?;
+        let error = ApiSocket::bind(&path.display().to_string())
+            .err()
+            .context("expected a value from err")?;
         assert!(error.to_string().contains("is not a socket"), "{error:#}");
-        assert!(
-            fs::symlink_metadata(&target)
-                .unwrap()
-                .file_type()
-                .is_socket()
-        );
-        fs::remove_file(&path).unwrap();
+        assert!(fs::symlink_metadata(&target)?.file_type().is_socket());
+        fs::remove_file(&path)?;
 
-        let _live = UnixListener::bind(&path).unwrap();
-        let error = ApiSocket::bind(&path.display().to_string()).err().unwrap();
+        let _live = UnixListener::bind(&path)?;
+        let error = ApiSocket::bind(&path.display().to_string())
+            .err()
+            .context("expected a value from err")?;
         assert!(error.to_string().contains("another process"), "{error:#}");
-        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        assert!(fs::symlink_metadata(&path)?.file_type().is_socket());
+
+        Ok(())
     }
 
     async fn test_state(directory: &Path) -> crate::state::AppState {
-        let pool = sqlite::connect(directory).await.unwrap();
+        let pool = sqlite::connect(directory)
+            .await
+            .expect("connect should succeed");
         let instances = InstanceStore::default();
         let manager =
             InstanceManager::new(instances.clone(), InstanceRepository::new(pool.clone()));

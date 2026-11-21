@@ -244,19 +244,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_completed_dumps_pass() {
-        let dir = tempfile::tempdir().unwrap();
+    fn only_completed_dumps_pass() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join(DUMP_FILE);
         std::fs::write(
             &path,
             b"CREATE TABLE t (id int);\n-- Dump completed on 2026-10-25\n",
-        )
-        .unwrap();
-        assert!(check_dump(&path).unwrap() > 0);
-        std::fs::write(&path, b"CREATE TABLE t (id int);\nINSERT INTO t VALUES").unwrap();
-        assert!(check_dump(&path).unwrap_err().contains("complete"));
-        std::fs::write(&path, b"").unwrap();
+        )?;
+        assert!(check_dump(&path).map_err(anyhow::Error::msg)? > 0);
+        std::fs::write(&path, b"CREATE TABLE t (id int);\nINSERT INTO t VALUES")?;
+        assert!(
+            check_dump(&path)
+                .expect_err("check dump should return an error")
+                .contains("complete")
+        );
+        std::fs::write(&path, b"")?;
         assert!(check_dump(&path).is_err());
         assert!(check_dump(&dir.path().join("missing")).is_err());
+
+        Ok(())
     }
 }

@@ -29,17 +29,20 @@ async fn speculative_sasl_relays_nested_reply_before_opening_accounting() {
 }
 
 #[tokio::test]
-async fn omitted_speculative_reply_falls_back_without_early_accounting() {
-    let directory = tempfile::tempdir().unwrap();
+async fn omitted_speculative_reply_falls_back_without_early_accounting() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let socket = directory.path().join("mongodb.sock");
-    let backend_listener = UnixListener::bind(&socket).unwrap();
+    let backend_listener = UnixListener::bind(&socket)?;
     let (resolver, sessions, network) = resolver(&socket).await;
     let (mut client, gateway) = tcp_pair().await;
     let handler = tokio::spawn(handle_mongodb_client(gateway, resolver, None));
 
     send_command(&mut client, speculative_hello()).await;
     let backend = tokio::spawn(async move {
-        let (mut backend, _) = backend_listener.accept().await.unwrap();
+        let (mut backend, _) = backend_listener
+            .accept()
+            .await
+            .expect("accept should succeed");
         let hello = read_message(&mut backend).await;
         mongodb::write_response(
             &mut backend,
@@ -47,7 +50,7 @@ async fn omitted_speculative_reply_falls_back_without_early_accounting() {
             doc! { "ok": 1.0, "maxWireVersion": 25_i32 },
         )
         .await
-        .unwrap();
+        .expect("write response should succeed");
         let start = read_message(&mut backend).await;
         assert_eq!(mongodb::command_name(&start).as_deref(), Some("saslStart"));
         mongodb::write_response(
@@ -61,13 +64,13 @@ async fn omitted_speculative_reply_falls_back_without_early_accounting() {
             },
         )
         .await
-        .unwrap();
-        backend.shutdown().await.unwrap();
+        .expect("empty payload should succeed");
+        backend.shutdown().await.expect("shutdown should succeed");
     });
 
     let hello = read_message(&mut client).await;
     assert_eq!(
-        mongodb::auth_reply_state(&hello, true).unwrap(),
+        mongodb::auth_reply_state(&hello, true)?,
         mongodb::AuthReplyState::SpeculativeFallback
     );
     assert_eq!(sessions.active("tenant-mongo"), 0);
@@ -75,21 +78,25 @@ async fn omitted_speculative_reply_falls_back_without_early_accounting() {
     send_command(&mut client, sasl_start()).await;
     let accepted = read_message(&mut client).await;
     assert_eq!(
-        mongodb::auth_reply_state(&accepted, false).unwrap(),
+        mongodb::auth_reply_state(&accepted, false)?,
         mongodb::AuthReplyState::Authenticated
     );
     assert_eq!(sessions.active("tenant-mongo"), 1);
-    client.shutdown().await.unwrap();
-    backend.await.unwrap();
-    handler.await.unwrap().unwrap();
+    client.shutdown().await?;
+    backend.await?;
+    handler.await??;
     assert_eq!(sessions.active("tenant-mongo"), 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn failed_sasl_never_opens_a_session_or_network_meter() {
-    let directory = tempfile::tempdir().unwrap();
+async fn failed_sasl_never_opens_a_session_or_network_meter() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let directory = tempfile::tempdir()?;
     let socket = directory.path().join("mongodb.sock");
-    let backend_listener = UnixListener::bind(&socket).unwrap();
+    let backend_listener = UnixListener::bind(&socket)?;
     let (resolver, sessions, network) = resolver(&socket).await;
     let (mut client, gateway) = tcp_pair().await;
     let handler = tokio::spawn(handle_mongodb_client(gateway, resolver, None));
@@ -99,7 +106,10 @@ async fn failed_sasl_never_opens_a_session_or_network_meter() {
     send_command(&mut client, sasl_start()).await;
 
     let backend = tokio::spawn(async move {
-        let (mut backend, _) = backend_listener.accept().await.unwrap();
+        let (mut backend, _) = backend_listener
+            .accept()
+            .await
+            .expect("accept should succeed");
         let hello = read_message(&mut backend).await;
         mongodb::write_response(
             &mut backend,
@@ -107,7 +117,7 @@ async fn failed_sasl_never_opens_a_session_or_network_meter() {
             doc! { "ok": 1.0, "maxWireVersion": 25_i32 },
         )
         .await
-        .unwrap();
+        .expect("write response should succeed");
         let auth = read_message(&mut backend).await;
         mongodb::write_response(
             &mut backend,
@@ -115,21 +125,29 @@ async fn failed_sasl_never_opens_a_session_or_network_meter() {
             doc! { "ok": 0.0, "errmsg": "Authentication failed", "code": 18_i32 },
         )
         .await
-        .unwrap();
+        .expect("write response should succeed");
     });
 
     let rejected = read_message(&mut client).await;
-    assert_eq!(rejected.body.unwrap().get_f64("ok").unwrap(), 0.0);
-    backend.await.unwrap();
-    handler.await.unwrap().unwrap();
+    assert_eq!(
+        rejected
+            .body
+            .context("failed sasl never opens a session or network meter should provide a value")?
+            .get_f64("ok")?,
+        0.0
+    );
+    backend.await?;
+    handler.await??;
     assert_eq!(sessions.active("tenant-mongo"), 0);
     assert_eq!(network.snapshot(), (0, 0));
+
+    Ok(())
 }
 
 async fn run_successful_auth(speculative: bool) {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("tempdir should succeed");
     let socket = directory.path().join("mongodb.sock");
-    let backend_listener = UnixListener::bind(&socket).unwrap();
+    let backend_listener = UnixListener::bind(&socket).expect("bind should succeed");
     let (resolver, sessions, network) = resolver(&socket).await;
     let (mut client, gateway) = tcp_pair().await;
     let handler = tokio::spawn(handle_mongodb_client(gateway, resolver, None));
@@ -139,12 +157,20 @@ async fn run_successful_auth(speculative: bool) {
     } else {
         send_plain_hello(&mut client).await;
         let hello = read_message(&mut client).await;
-        assert!(hello.body.unwrap().contains_key("saslSupportedMechs"));
+        assert!(
+            hello
+                .body
+                .expect("run successful auth should provide a value")
+                .contains_key("saslSupportedMechs")
+        );
         send_command(&mut client, sasl_start()).await;
     }
 
     let backend = tokio::spawn(async move {
-        let (mut backend, _) = backend_listener.accept().await.unwrap();
+        let (mut backend, _) = backend_listener
+            .accept()
+            .await
+            .expect("accept should succeed");
         if speculative {
             let hello = read_message(&mut backend).await;
             assert!(mongodb::is_hello(&hello));
@@ -163,7 +189,7 @@ async fn run_successful_auth(speculative: bool) {
                 },
             )
             .await
-            .unwrap();
+            .expect("empty payload should succeed");
         } else {
             let hello = read_message(&mut backend).await;
             assert!(mongodb::is_hello(&hello));
@@ -173,7 +199,7 @@ async fn run_successful_auth(speculative: bool) {
                 doc! { "ok": 1.0, "maxWireVersion": 25_i32 },
             )
             .await
-            .unwrap();
+            .expect("write response should succeed");
             let start = read_message(&mut backend).await;
             assert_eq!(mongodb::command_name(&start).as_deref(), Some("saslStart"));
             mongodb::write_response(
@@ -187,7 +213,7 @@ async fn run_successful_auth(speculative: bool) {
                 },
             )
             .await
-            .unwrap();
+            .expect("empty payload should succeed");
         }
 
         let continued = read_message(&mut backend).await;
@@ -206,14 +232,14 @@ async fn run_successful_auth(speculative: bool) {
             },
         )
         .await
-        .unwrap();
+        .expect("empty payload should succeed");
 
         let ping = read_message(&mut backend).await;
         assert_eq!(mongodb::command_name(&ping).as_deref(), Some("ping"));
         mongodb::write_response(&mut backend, &ping, doc! { "ok": 1.0 })
             .await
-            .unwrap();
-        backend.shutdown().await.unwrap();
+            .expect("write response should succeed");
+        backend.shutdown().await.expect("shutdown should succeed");
     });
 
     let challenge = read_message(&mut client).await;
@@ -222,20 +248,21 @@ async fn run_successful_auth(speculative: bool) {
             challenge
                 .body
                 .as_ref()
-                .unwrap()
+                .expect("run successful auth should provide a value")
                 .get_array("compression")
-                .unwrap()
+                .expect("get array should succeed")
                 .len(),
             0,
             "DBE must not negotiate a compressed mode its identity fence rejects"
         );
     }
-    let state = mongodb::auth_reply_state(&challenge, speculative).unwrap();
+    let state = mongodb::auth_reply_state(&challenge, speculative)
+        .expect("auth reply state should succeed");
     assert_eq!(state, mongodb::AuthReplyState::Continue);
     send_command(&mut client, sasl_continue()).await;
     let accepted = read_message(&mut client).await;
     assert_eq!(
-        mongodb::auth_reply_state(&accepted, false).unwrap(),
+        mongodb::auth_reply_state(&accepted, false).expect("auth reply state should succeed"),
         mongodb::AuthReplyState::Authenticated
     );
     assert_eq!(sessions.active("tenant-mongo"), 1);
@@ -245,14 +272,17 @@ async fn run_successful_auth(speculative: bool) {
         read_message(&mut client)
             .await
             .body
-            .unwrap()
+            .expect("read message should provide a value")
             .get_f64("ok")
-            .unwrap(),
+            .expect("get f64 should succeed"),
         1.0
     );
-    client.shutdown().await.unwrap();
-    backend.await.unwrap();
-    handler.await.unwrap().unwrap();
+    client.shutdown().await.expect("shutdown should succeed");
+    backend.await.expect("run successful auth should succeed");
+    handler
+        .await
+        .expect("run successful auth should succeed")
+        .expect("run successful auth should succeed");
     assert_eq!(sessions.active("tenant-mongo"), 0);
     let (rx, tx) = network.snapshot();
     assert!(rx > 0 && tx > 0);
@@ -295,11 +325,19 @@ fn metadata(socket: &std::path::Path) -> InstanceMetadata {
 }
 
 async fn tcp_pair() -> (TcpStream, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind should succeed");
+    let address = listener.local_addr().expect("local addr should succeed");
     let connect = tokio::spawn(TcpStream::connect(address));
-    let (gateway, _) = listener.accept().await.unwrap();
-    (connect.await.unwrap().unwrap(), gateway)
+    let (gateway, _) = listener.accept().await.expect("accept should succeed");
+    (
+        connect
+            .await
+            .expect("tcp pair should succeed")
+            .expect("tcp pair should succeed"),
+        gateway,
+    )
 }
 
 async fn send_plain_hello(client: &mut TcpStream) {
@@ -317,13 +355,15 @@ async fn send_plain_hello(client: &mut TcpStream) {
 
 async fn send_command(stream: &mut (impl AsyncWrite + Unpin), body: Document) {
     stream
-        .write_all(&mongodb::encode_command(body).unwrap())
+        .write_all(&mongodb::encode_command(body).expect("encode command should succeed"))
         .await
-        .unwrap();
+        .expect("encode command should succeed");
 }
 
 async fn read_message(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> mongodb::MongoMessage {
-    mongodb::read_message(stream).await.unwrap()
+    mongodb::read_message(stream)
+        .await
+        .expect("read message should succeed")
 }
 
 fn speculative_hello() -> Document {

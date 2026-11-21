@@ -282,7 +282,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn destructive_actions_require_confirmation_and_reason() {
+    fn destructive_actions_require_confirmation_and_reason() -> anyhow::Result<()> {
         let missing_confirmation = DestructiveActionConfirmation {
             confirm: false,
             reason: "maintenance".to_string(),
@@ -300,15 +300,15 @@ mod tests {
             reason: " operator approved ".to_string(),
         };
         assert_eq!(
-            DestructiveActionPolicy::authorize("restore", &valid)
-                .unwrap()
-                .reason(),
+            DestructiveActionPolicy::authorize("restore", &valid)?.reason(),
             "operator approved"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_any_query_token_parameter() {
+    fn rejects_any_query_token_parameter() -> anyhow::Result<()> {
         for uri in [
             "/api/system?token=secret",
             "/api/system?other=1&token=secret",
@@ -317,48 +317,55 @@ mod tests {
             "/api/system?tok%65n=secret",
         ] {
             assert!(matches!(
-                reject_query_token(&uri.parse().unwrap()),
+                reject_query_token(&uri.parse()?),
                 Err(ApiError::QueryTokenRejected)
             ));
         }
         for uri in ["/api/system?tokens=1", "/api/system?x=token"] {
-            assert!(reject_query_token(&uri.parse().unwrap()).is_ok(), "{uri}");
+            assert!(reject_query_token(&uri.parse()?).is_ok(), "{uri}");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn standalone_nodes_serve_server_clients_but_no_browser_origin() {
+    fn standalone_nodes_serve_server_clients_but_no_browser_origin() -> anyhow::Result<()> {
         let policy = OriginPolicy::from_config(&Config::default());
         let mut headers = HeaderMap::new();
         assert!(validate_request_origin(&headers, &policy).is_ok());
 
         for origin in ["https://panel.example.com", "http://localhost", "null"] {
-            headers.insert("origin", origin.parse().unwrap());
+            headers.insert("origin", origin.parse()?);
             assert!(matches!(
                 validate_request_origin(&headers, &policy),
                 Err(ApiError::BrowserOriginNotAllowed)
             ));
         }
+
+        Ok(())
     }
 
     #[test]
-    fn server_requests_need_no_public_host_and_browser_origins_remain_restricted() {
+    fn server_requests_need_no_public_host_and_browser_origins_remain_restricted()
+    -> anyhow::Result<()> {
         let policy = OriginPolicy {
             allowed_origins: Arc::new(HashSet::from(["https://panel.example.com:443".to_string()])),
         };
         let mut headers = HeaderMap::new();
-        headers.insert("host", "evil.example.com".parse().unwrap());
+        headers.insert("host", "evil.example.com".parse()?);
 
         assert!(validate_request_origin(&headers, &policy).is_ok());
 
-        headers.insert("origin", "https://panel.example.com".parse().unwrap());
+        headers.insert("origin", "https://panel.example.com".parse()?);
         assert!(validate_request_origin(&headers, &policy).is_ok());
 
-        headers.insert("origin", "https://evil.example.com".parse().unwrap());
+        headers.insert("origin", "https://evil.example.com".parse()?);
         assert!(matches!(
             validate_request_origin(&headers, &policy),
             Err(ApiError::BrowserOriginNotAllowed)
         ));
+
+        Ok(())
     }
 
     #[test]

@@ -351,30 +351,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_installs_the_copy_as_the_data_directory() {
-        let root = tempfile::tempdir().unwrap();
+    async fn restore_installs_the_copy_as_the_data_directory() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
         let tree = root.path().join(RESTORE_TARGET);
-        std::fs::create_dir_all(tree.join("metadata")).unwrap();
+        std::fs::create_dir_all(tree.join("metadata"))?;
         std::fs::write(
             tree.join("metadata/default.sql"),
             b"ATTACH DATABASE default",
-        )
-        .unwrap();
+        )?;
         let recipe = RestoreRecipeRef::new(RESTORE_RECIPE_ID, RESTORE_RECIPE_VERSION);
         let ctx = RestoreContext {
             recipe: &recipe,
             extracted_root: root.path(),
             restore_target: Path::new(RESTORE_TARGET),
         };
-        ClickhouseFreezeStrategy
-            .prepare_restore(&ctx)
-            .await
-            .unwrap();
+        ClickhouseFreezeStrategy.prepare_restore(&ctx).await?;
         assert!(root.path().join("metadata/default.sql").is_file());
         assert!(!tree.exists());
 
-        let empty = tempfile::tempdir().unwrap();
-        std::fs::create_dir(empty.path().join(RESTORE_TARGET)).unwrap();
+        let empty = tempfile::tempdir()?;
+        std::fs::create_dir(empty.path().join(RESTORE_TARGET))?;
         let ctx = RestoreContext {
             recipe: &recipe,
             extracted_root: empty.path(),
@@ -386,5 +382,7 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        Ok(())
     }
 }

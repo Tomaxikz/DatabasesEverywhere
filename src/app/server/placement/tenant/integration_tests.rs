@@ -1011,7 +1011,7 @@ impl SharedPool {
             pool.docker
                 .log_policy_is_current(protocol, &runtime_id)
                 .await
-                .unwrap(),
+                .expect("log policy is current should succeed"),
             "the real runtime must retain only the configured bounded console history"
         );
         secure_pool(&pool.docker, &pool.runtime)

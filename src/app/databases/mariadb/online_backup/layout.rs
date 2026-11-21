@@ -119,53 +119,59 @@ mod tests {
         "backup_type = full-prepared\nfrom_lsn = 0\nto_lsn = 47321\nlast_lsn = 47321\n";
 
     fn prepared_tree(root: &Path) {
-        fs::create_dir_all(root.join("mysql")).unwrap();
-        fs::create_dir_all(root.join("app")).unwrap();
-        fs::write(root.join("ibdata1"), b"x").unwrap();
-        fs::write(root.join("app/orders.ibd"), b"x").unwrap();
-        fs::write(root.join("mariadb_backup_checkpoints"), PREPARED).unwrap();
+        fs::create_dir_all(root.join("mysql")).expect("create dir all should succeed");
+        fs::create_dir_all(root.join("app")).expect("create dir all should succeed");
+        fs::write(root.join("ibdata1"), b"x").expect("write should succeed");
+        fs::write(root.join("app/orders.ibd"), b"x").expect("write should succeed");
+        fs::write(root.join("mariadb_backup_checkpoints"), PREPARED).expect("write should succeed");
     }
 
     #[test]
-    fn prepared_full_backups_are_accepted() {
-        let temp = tempfile::tempdir().unwrap();
+    fn prepared_full_backups_are_accepted() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         prepared_tree(temp.path());
-        let checkpoints = check_prepared(temp.path()).unwrap();
+        let checkpoints = check_prepared(temp.path()).map_err(anyhow::Error::msg)?;
         assert_eq!(checkpoints.file_name, "mariadb_backup_checkpoints");
         assert_eq!((checkpoints.from_lsn, checkpoints.to_lsn), (0, 47321));
+
+        Ok(())
     }
 
     #[test]
-    fn unprepared_incremental_or_linked_trees_are_refused() {
+    fn unprepared_incremental_or_linked_trees_are_refused() -> anyhow::Result<()> {
         for text in [
             PREPARED.replace("full-prepared", "full-backuped"),
             PREPARED.replace("from_lsn = 0", "from_lsn = 12"),
             "backup_type = full-prepared\n".to_string(),
         ] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = tempfile::tempdir()?;
             prepared_tree(temp.path());
-            fs::write(temp.path().join("mariadb_backup_checkpoints"), text).unwrap();
+            fs::write(temp.path().join("mariadb_backup_checkpoints"), text)?;
             assert!(check_prepared(temp.path()).is_err());
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         prepared_tree(temp.path());
-        fs::write(temp.path().join("app/remote.isl"), b"/srv/remote.ibd").unwrap();
+        fs::write(temp.path().join("app/remote.isl"), b"/srv/remote.ibd")?;
         assert!(check_prepared(temp.path()).is_err());
         assert!(refuse_external_tablespaces(temp.path()).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn restore_moves_the_tree_to_the_volume_root() {
-        let temp = tempfile::tempdir().unwrap();
+    fn restore_moves_the_tree_to_the_volume_root() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         prepared_tree(&temp.path().join(RESTORE_TARGET));
-        install_prepared(temp.path()).unwrap();
+        install_prepared(temp.path()).map_err(anyhow::Error::msg)?;
         assert!(temp.path().join("ibdata1").is_file());
         assert!(temp.path().join("app/orders.ibd").is_file());
         assert!(!temp.path().join(RESTORE_TARGET).exists());
 
-        let stray = tempfile::tempdir().unwrap();
+        let stray = tempfile::tempdir()?;
         prepared_tree(&stray.path().join(RESTORE_TARGET));
-        fs::write(stray.path().join("ibdata1"), b"x").unwrap();
+        fs::write(stray.path().join("ibdata1"), b"x")?;
         assert!(install_prepared(stray.path()).is_err());
+
+        Ok(())
     }
 }

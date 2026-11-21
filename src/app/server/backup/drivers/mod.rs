@@ -120,7 +120,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn publication_resources_round_trip_through_the_journal() {
+    fn publication_resources_round_trip_through_the_journal() -> anyhow::Result<()> {
         for resource in [
             PublicationResource::KopiaSourcePath("/b/.staging/i/.x.bundle".to_string()),
             PublicationResource::S3MultipartUpload {
@@ -130,7 +130,7 @@ mod tests {
         ] {
             let (kind, locator, detail) = resource.journal_parts();
             assert_eq!(
-                PublicationResource::from_journal(kind, locator, detail).unwrap(),
+                PublicationResource::from_journal(kind, locator, detail)?,
                 resource
             );
         }
@@ -142,5 +142,7 @@ mod tests {
         ] {
             assert!(PublicationResource::from_journal(kind, locator, detail).is_err());
         }
+
+        Ok(())
     }
 }

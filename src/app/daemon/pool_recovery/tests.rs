@@ -17,34 +17,36 @@ fn runtime() -> EngineRuntime {
 }
 
 #[tokio::test]
-async fn configured_volume_scan_budget_supports_more_than_4096_entries() {
-    let dir = tempfile::tempdir().unwrap();
+async fn configured_volume_scan_budget_supports_more_than_4096_entries() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     let mut config = Config::default();
     config.paths.data = dir.path().to_string_lossy().into_owned();
     let volumes = std::path::PathBuf::from(config.paths.volumes_root());
-    std::fs::create_dir_all(&volumes).unwrap();
+    std::fs::create_dir_all(&volumes)?;
     for index in 0..4097 {
-        std::fs::create_dir(volumes.join(format!("inst_{index}"))).unwrap();
+        std::fs::create_dir(volumes.join(format!("inst_{index}")))?;
     }
     let workspace = volumes.join(format!(
         ".dbe-restore-tenant_recover-{}",
         uuid::Uuid::new_v4()
     ));
-    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&workspace)?;
     assert!(
         retained_recovery_targets(&config)
             .await
-            .unwrap_err()
+            .expect_err("retained recovery targets should return an error")
             .to_string()
             .contains("recovery_volume_entries")
     );
     config.daemon.limits.recovery_volume_entries = 5000;
-    let blocked = retained_recovery_targets(&config).await.unwrap();
+    let blocked = retained_recovery_targets(&config).await?;
     assert!(blocked.contains("tenant_recover"));
     assert!(
         workspace.is_dir(),
         "recovery inventory must not remove rollback data"
     );
+
+    Ok(())
 }
 
 #[test]
@@ -163,15 +165,21 @@ fn tenant_recovery_requires_exact_reserved_identity_and_stopped_intent() {
 
 async fn fixture() -> (AppState, tempfile::TempDir, sqlx::SqlitePool, EngineRuntime) {
     let (state, dir) = crate::subsystems::test_support::database(Config::default()).await;
-    let db = crate::storage::sqlite::connect(dir.path()).await.unwrap();
+    let db = crate::storage::sqlite::connect(dir.path())
+        .await
+        .expect("path should succeed");
     let mut pool = runtime();
     let metadata = tenant(&pool);
     pool.status = EngineRuntimeStatus::Running;
-    state.placements.save(&pool).await.unwrap();
+    state
+        .placements
+        .save(&pool)
+        .await
+        .expect("save should succeed");
     state
         .placements
         .reserve(ReserveTenant {
-            owner: pool.owner.clone().unwrap(),
+            owner: pool.owner.clone().expect("expected a value from clone"),
             instance_id: &metadata.instance_id,
             runtime_id: &pool.runtime_id,
             database: &metadata.database.name,
@@ -179,40 +187,49 @@ async fn fixture() -> (AppState, tempfile::TempDir, sqlx::SqlitePool, EngineRunt
             limits: &metadata.limits,
         })
         .await
-        .unwrap();
+        .expect("reserve should succeed");
     state
         .placements
         .mark_provisioned(&metadata.instance_id)
         .await
-        .unwrap();
-    state.manager.upsert_fenced(metadata).await.unwrap();
+        .expect("mark provisioned should succeed");
+    state
+        .manager
+        .upsert_fenced(metadata)
+        .await
+        .expect("upsert fenced should succeed");
     pool = state
         .placements
         .get(&pool.runtime_id)
         .await
-        .unwrap()
-        .unwrap();
+        .expect("get should succeed")
+        .expect("expected a value from expect");
     pool.status = EngineRuntimeStatus::Quarantined;
-    state.placements.save(&pool).await.unwrap();
+    state
+        .placements
+        .save(&pool)
+        .await
+        .expect("save should succeed");
     (state, dir, db, pool)
 }
 
 #[tokio::test]
-async fn deliberately_stopped_pool_is_not_a_recovery_candidate() {
+async fn deliberately_stopped_pool_is_not_a_recovery_candidate() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (state, _dir, _db, mut pool) = fixture().await;
     pool.status = EngineRuntimeStatus::Stopped;
     pool.desired_state = DesiredInstanceState::Stopped;
-    state.placements.save(&pool).await.unwrap();
-    let summary = recover_dead_pools(&state).await.unwrap();
+    state.placements.save(&pool).await?;
+    let summary = recover_dead_pools(&state).await?;
     assert_eq!(summary.candidates, 0);
     assert_eq!(summary.attempted, 0);
     assert_eq!(
         state
             .placements
             .get(&pool.runtime_id)
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get should provide a value")?
             .status,
         EngineRuntimeStatus::Stopped
     );
@@ -220,37 +237,37 @@ async fn deliberately_stopped_pool_is_not_a_recovery_candidate() {
         state
             .manager
             .get_persisted("tenant_recover")
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get persisted should provide a value")?
             .status,
         InstanceStatus::Quarantined
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn successful_publication_keeps_tenants_stopped_and_preserves_credentials() {
+async fn successful_publication_keeps_tenants_stopped_and_preserves_credentials()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (state, _dir, _db, mut pool) = fixture().await;
     pool.status = EngineRuntimeStatus::Running;
-    publish_recovery(&state, pool.clone(), &["tenant_recover".into()])
-        .await
-        .unwrap();
+    publish_recovery(&state, pool.clone(), &["tenant_recover".into()]).await?;
     assert_eq!(
         state
             .placements
             .get(&pool.runtime_id)
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get should provide a value")?
             .status,
         EngineRuntimeStatus::Running
     );
     let metadata = state
         .manager
         .get_persisted("tenant_recover")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .context("get persisted should provide a value")?;
     assert_eq!(metadata.status, InstanceStatus::Stopped);
     assert_eq!(metadata.desired_state, DesiredInstanceState::Stopped);
     assert_eq!(
@@ -258,21 +275,29 @@ async fn successful_publication_keeps_tenants_stopped_and_preserves_credentials(
         Some("test-tenant-password")
     );
     assert_eq!(
-        state.instances.get("tenant_recover").await.unwrap().status,
+        state
+            .instances
+            .get("tenant_recover")
+            .await
+            .context("get should provide a value")?
+            .status,
         InstanceStatus::Stopped
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn failed_tenant_publication_does_not_release_pool_quarantine() {
+async fn failed_tenant_publication_does_not_release_pool_quarantine() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (state, _dir, db, mut pool) = fixture().await;
     sqlx::query(
         "CREATE TRIGGER reject_recovery BEFORE UPDATE ON instance_metadata
         WHEN NEW.status = 'stopped' BEGIN SELECT RAISE(ABORT, 'test write failure'); END",
     )
     .execute(&db)
-    .await
-    .unwrap();
+    .await?;
     pool.status = EngineRuntimeStatus::Running;
     assert!(
         publish_recovery(&state, pool.clone(), &["tenant_recover".into()])
@@ -283,9 +308,8 @@ async fn failed_tenant_publication_does_not_release_pool_quarantine() {
         state
             .placements
             .get(&pool.runtime_id)
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get should provide a value")?
             .status,
         EngineRuntimeStatus::Quarantined
     );
@@ -293,62 +317,59 @@ async fn failed_tenant_publication_does_not_release_pool_quarantine() {
         state
             .manager
             .get_persisted("tenant_recover")
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get persisted should provide a value")?
             .status,
         InstanceStatus::Quarantined
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn retained_restore_manifests_and_workspaces_block_recovery() {
-    let dir = tempfile::tempdir().unwrap();
+async fn retained_restore_manifests_and_workspaces_block_recovery() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     let mut config = Config::default();
     config.paths.data = dir.path().to_string_lossy().into_owned();
     let tmp = std::path::PathBuf::from(config.paths.tmp_root());
     let volumes = std::path::PathBuf::from(config.paths.volumes_root());
-    tokio::fs::create_dir_all(tmp.join("import-export"))
-        .await
-        .unwrap();
-    tokio::fs::create_dir_all(&volumes).await.unwrap();
+    tokio::fs::create_dir_all(tmp.join("import-export")).await?;
+    tokio::fs::create_dir_all(&volumes).await?;
     let uuid = uuid::Uuid::new_v4();
     let path = tmp
         .join("import-export")
         .join(format!(".dbe-import-recovery-{uuid}.json"));
-    crate::io::files::atomic_write_private(&path, br#"{"instance_id":"tenant_recover"}"#).unwrap();
-    tokio::fs::create_dir(volumes.join(format!(".dbe-restore-pool_recover-{uuid}")))
-        .await
-        .unwrap();
-    let blocked = retained_recovery_targets(&config).await.unwrap();
+    crate::io::files::atomic_write_private(&path, br#"{"instance_id":"tenant_recover"}"#)?;
+    tokio::fs::create_dir(volumes.join(format!(".dbe-restore-pool_recover-{uuid}"))).await?;
+    let blocked = retained_recovery_targets(&config).await?;
     assert!(blocked.contains("tenant_recover"));
     assert!(blocked.contains("pool_recover"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn separate_secret_and_import_incidents_remain_blocked() {
+async fn separate_secret_and_import_incidents_remain_blocked() -> anyhow::Result<()> {
     let (state, _dir, db, _pool) = fixture().await;
     let id = "tenant_recover";
-    assert!(!state.placements.tenant_recovery_blocked(id).await.unwrap());
-    assert!(
-        state
-            .placements
-            .tenant_recovery_blocked("missing")
-            .await
-            .unwrap()
-    );
+    assert!(!state.placements.tenant_recovery_blocked(id).await?);
+    assert!(state.placements.tenant_recovery_blocked("missing").await?);
     sqlx::query("UPDATE instance_metadata SET protected_secret_recovery_required = 1 WHERE instance_id = ?1")
-        .bind(id).execute(&db).await.unwrap();
-    assert!(state.placements.tenant_recovery_blocked(id).await.unwrap());
+        .bind(id).execute(&db).await?;
+    assert!(state.placements.tenant_recovery_blocked(id).await?);
     sqlx::query("UPDATE instance_metadata SET protected_secret_recovery_required = 0 WHERE instance_id = ?1")
-        .bind(id).execute(&db).await.unwrap();
+        .bind(id).execute(&db).await?;
     sqlx::query("INSERT INTO import_export_jobs(job_id, instance_id, action, status, created_at, updated_at)
-        VALUES ('failed', ?1, 'import', 'failed', 'now', 'now')").bind(id).execute(&db).await.unwrap();
-    assert!(state.placements.tenant_recovery_blocked(id).await.unwrap());
+        VALUES ('failed', ?1, 'import', 'failed', 'now', 'now')").bind(id).execute(&db).await?;
+    assert!(state.placements.tenant_recovery_blocked(id).await?);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn automatic_scan_finds_all_dead_pools_without_bypassing_ownership() {
+async fn automatic_scan_finds_all_dead_pools_without_bypassing_ownership() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (state, dir, _db, pool) = fixture().await;
     let mut other = runtime();
     other.runtime_id = "pool_failed".into();
@@ -357,18 +378,16 @@ async fn automatic_scan_finds_all_dead_pools_without_bypassing_ownership() {
     ));
     other.status = EngineRuntimeStatus::Failed;
     other.desired_state = DesiredInstanceState::Running;
-    state.placements.save(&other).await.unwrap();
+    state.placements.save(&other).await?;
     let mut data = (*state).clone();
     let mut config = (**state.config).clone();
     config.paths.data = dir.path().to_string_lossy().into_owned();
     config.token_id = "wrong-panel".into();
     config.daemon.recover_shared_pools = vec![pool.runtime_id.clone()];
-    tokio::fs::create_dir_all(config.paths.volumes_root())
-        .await
-        .unwrap();
-    data.config = std::sync::Arc::new(crate::config::RuntimeConfig::new(config).unwrap());
+    tokio::fs::create_dir_all(config.paths.volumes_root()).await?;
+    data.config = std::sync::Arc::new(crate::config::RuntimeConfig::new(config)?);
     let state = AppState::new(data);
-    let summary = recover_dead_pools(&state).await.unwrap();
+    let summary = recover_dead_pools(&state).await?;
     // Even a legacy selector naming just one pool no longer limits discovery.
     assert_eq!(summary.candidates, 2);
     assert_eq!(summary.refused, 2);
@@ -378,9 +397,8 @@ async fn automatic_scan_finds_all_dead_pools_without_bypassing_ownership() {
             state
                 .placements
                 .get(&expected.runtime_id)
-                .await
-                .unwrap()
-                .unwrap()
+                .await?
+                .context("get should provide a value")?
                 .status,
             expected.status
         );
@@ -389,9 +407,8 @@ async fn automatic_scan_finds_all_dead_pools_without_bypassing_ownership() {
         state
             .placements
             .get(&other.runtime_id)
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get should provide a value")?
             .desired_state,
         DesiredInstanceState::Stopped
     );
@@ -399,12 +416,13 @@ async fn automatic_scan_finds_all_dead_pools_without_bypassing_ownership() {
         state
             .manager
             .get_persisted("tenant_recover")
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get persisted should provide a value")?
             .status,
         InstanceStatus::Quarantined
     );
+
+    Ok(())
 }
 
 #[test]
@@ -461,15 +479,17 @@ fn failed_pool_retry_preserves_known_tenant_intent() {
 }
 
 #[tokio::test]
-async fn failed_pool_publication_keeps_tenants_fenced_and_durable_pool_quarantined() {
+async fn failed_pool_publication_keeps_tenants_fenced_and_durable_pool_quarantined()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (state, _dir, db, mut pool) = fixture().await;
     sqlx::query(
         "CREATE TRIGGER reject_pool_recovery BEFORE UPDATE ON engine_runtimes
         WHEN NEW.status = 'running' BEGIN SELECT RAISE(ABORT, 'test pool write failure'); END",
     )
     .execute(&db)
-    .await
-    .unwrap();
+    .await?;
     pool.status = EngineRuntimeStatus::Running;
     assert!(
         publish_recovery(&state, pool.clone(), &["tenant_recover".into()])
@@ -480,19 +500,19 @@ async fn failed_pool_publication_keeps_tenants_fenced_and_durable_pool_quarantin
         state
             .placements
             .get(&pool.runtime_id)
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get should provide a value")?
             .status,
         EngineRuntimeStatus::Quarantined
     );
     let metadata = state
         .manager
         .get_persisted("tenant_recover")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .context("get persisted should provide a value")?;
     assert_eq!(metadata.status, InstanceStatus::Stopped);
     assert_eq!(metadata.desired_state, DesiredInstanceState::Stopped);
     assert!(state.instances.routes_fenced("tenant_recover").await);
+
+    Ok(())
 }

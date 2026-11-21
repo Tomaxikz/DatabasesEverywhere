@@ -15,9 +15,10 @@ fn reads_an_exact_environment_key_and_preserves_equals_in_the_value() {
 }
 
 #[test]
-fn protected_environment_lookup_rejects_missing_and_duplicate_values_without_leaking_them() {
+fn protected_environment_lookup_rejects_missing_and_duplicate_values_without_leaking_them()
+-> anyhow::Result<()> {
     let missing = unique_environment_value(&[], "POSTGRES_PASSWORD", "inst_pg")
-        .unwrap_err()
+        .expect_err("unique environment value should return an error")
         .to_string();
     assert!(missing.contains("POSTGRES_PASSWORD"));
     assert!(!missing.contains("secret"));
@@ -30,7 +31,7 @@ fn protected_environment_lookup_rejects_missing_and_duplicate_values_without_lea
         "POSTGRES_PASSWORD",
         "inst_pg",
     )
-    .unwrap_err()
+    .expect_err("to string should return an error")
     .to_string();
     assert!(duplicate.contains("duplicate POSTGRES_PASSWORD"));
     assert!(!duplicate.contains("first-secret"));
@@ -41,8 +42,9 @@ fn protected_environment_lookup_rejects_missing_and_duplicate_values_without_lea
             &["POSTGRES_PASSWORD=value=with=equals".to_string()],
             "POSTGRES_PASSWORD",
             "inst_pg",
-        )
-        .unwrap(),
+        )?,
         "value=with=equals"
     );
+
+    Ok(())
 }

@@ -245,7 +245,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_instance_placement_is_dedicated_to_its_instance_id() {
+    fn legacy_instance_placement_is_dedicated_to_its_instance_id() -> anyhow::Result<()> {
         let value = serde_json::json!({
             "schema_version": 1,
             "instance_id": "legacy-instance",
@@ -259,14 +259,16 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         });
-        let metadata: InstanceMetadata = serde_json::from_value(value).unwrap();
+        let metadata: InstanceMetadata = serde_json::from_value(value)?;
 
         assert_eq!(metadata.deployment_mode, DeploymentMode::Dedicated);
         assert_eq!(metadata.runtime_id(), "legacy-instance");
+
+        Ok(())
     }
 
     #[test]
-    fn debug_redacts_credentials_and_route_keys() {
+    fn debug_redacts_credentials_and_route_keys() -> anyhow::Result<()> {
         let value = serde_json::json!({
             "schema_version": 1,
             "instance_id": "shared-tenant",
@@ -288,7 +290,7 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         });
-        let metadata: InstanceMetadata = serde_json::from_value(value).unwrap();
+        let metadata: InstanceMetadata = serde_json::from_value(value)?;
         let debug = format!("{metadata:?}");
 
         for secret in [
@@ -302,6 +304,8 @@ mod tests {
             assert!(!debug.contains(secret), "debug output leaked {secret}");
         }
         assert!(debug.contains("<redacted>"));
+
+        Ok(())
     }
 }
 

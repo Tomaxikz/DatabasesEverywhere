@@ -112,7 +112,8 @@ fn accepts_bounded_tenant_only_dump_shapes() {
 #[test]
 fn rejects_engine_level_database_creation() {
     for protocol in [Protocol::Mysql, Protocol::Mariadb, Protocol::Clickhouse] {
-        let error = validate(protocol, "CREATE DATABASE tenant_db;").unwrap_err();
+        let error = validate(protocol, "CREATE DATABASE tenant_db;")
+            .expect_err("validate should return an error");
         assert_eq!(
             error.issue(),
             Some(SharedSqlIssue::PrivilegedStatement),
@@ -155,7 +156,12 @@ fn rejects_cross_database_and_system_namespaces() {
             SharedSqlIssue::CrossDatabase,
         ),
     ] {
-        assert_eq!(validate(protocol, sql).unwrap_err().issue(), Some(issue));
+        assert_eq!(
+            validate(protocol, sql)
+                .expect_err("validate should return an error")
+                .issue(),
+            Some(issue)
+        );
     }
 }
 
@@ -254,7 +260,9 @@ fn rejects_privilege_code_and_external_access_corpus() {
         ),
     ] {
         assert_eq!(
-            validate(protocol, sql).unwrap_err().issue(),
+            validate(protocol, sql)
+                .expect_err("validate should return an error")
+                .issue(),
             Some(issue),
             "{sql}"
         );
@@ -262,7 +270,7 @@ fn rejects_privilege_code_and_external_access_corpus() {
 }
 
 #[test]
-fn rejects_client_commands_and_executable_comments() {
+fn rejects_client_commands_and_executable_comments() -> anyhow::Result<()> {
     for sql in [
         "\\connect other\nCREATE TABLE public.x(id int);",
         "/*!40101 SET GLOBAL sql_mode='' */;",
@@ -272,6 +280,7 @@ fn rejects_client_commands_and_executable_comments() {
     validate(
         Protocol::Mysql,
         "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;",
-    )
-    .unwrap();
+    )?;
+
+    Ok(())
 }

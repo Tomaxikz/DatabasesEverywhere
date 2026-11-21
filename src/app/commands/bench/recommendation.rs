@@ -248,7 +248,7 @@ mod tests {
         });
         assert!(
             verify_benchmark_daemon(&config, &wrong_node)
-                .unwrap_err()
+                .expect_err("verify benchmark daemon should return an error")
                 .contains("does not match")
         );
         let wrong_token = serde_json::json!({
@@ -257,7 +257,7 @@ mod tests {
         });
         assert!(
             verify_benchmark_daemon(&config, &wrong_token)
-                .unwrap_err()
+                .expect_err("verify benchmark daemon should return an error")
                 .contains("token_id")
         );
     }

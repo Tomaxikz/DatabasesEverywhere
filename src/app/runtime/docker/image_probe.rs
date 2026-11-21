@@ -215,9 +215,11 @@ fn probe_body(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     #[test]
-    fn version_probes_never_mount_customer_or_host_data() {
+    fn version_probes_never_mount_customer_or_host_data() -> anyhow::Result<()> {
         for protocol in Protocol::ALL {
             let body = probe_body(
                 protocol,
@@ -226,11 +228,15 @@ mod tests {
                 crate::config::DaemonEngine::Docker,
                 Some("test-node"),
             );
-            let host = body.host_config.unwrap();
+            let host = body.host_config.context(
+                "version probes never mount customer or host data should provide a value",
+            )?;
             assert_eq!(host.network_mode.as_deref(), Some("none"));
             assert_eq!(host.readonly_rootfs, Some(true));
             assert!(host.mounts.is_none() && host.binds.is_none());
             assert_eq!(host.pids_limit, Some(32));
         }
+
+        Ok(())
     }
 }

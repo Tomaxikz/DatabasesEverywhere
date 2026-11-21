@@ -413,6 +413,8 @@ async fn rename_new(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::databases::protocol::Protocol;
     use crate::server::backup::{
@@ -420,17 +422,15 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn local_driver_round_trips_a_bundle_and_catalog() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn local_driver_round_trips_a_bundle_and_catalog() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("backups");
         let driver = LocalBackupDriver::new(root.clone());
-        driver.preflight().await.unwrap();
+        driver.preflight().await?;
         let backup_id = new_backup_id(BackupLayout::Physical);
-        let bundle = BackupBundle::create(&root, "inst_one", &backup_id)
-            .await
-            .unwrap();
-        tokio::fs::write(&bundle.archive, b"archive").await.unwrap();
-        bundle.write_catalog(br#"{"objects":[]}"#).await.unwrap();
+        let bundle = BackupBundle::create(&root, "inst_one", &backup_id).await?;
+        tokio::fs::write(&bundle.archive, b"archive").await?;
+        bundle.write_catalog(br#"{"objects":[]}"#).await?;
         let manifest = build_manifest(
             backup_id.clone(),
             "inst_one".to_string(),
@@ -440,45 +440,37 @@ mod tests {
             true,
             test_details(BackupLayout::Physical),
         )
-        .await
-        .unwrap();
-        bundle.write_metadata(&manifest).await.unwrap();
+        .await?;
+        bundle.write_metadata(&manifest).await?;
 
-        driver.commit(&bundle, &manifest).await.unwrap();
+        driver.commit(&bundle, &manifest).await?;
 
-        let listed = driver.list("inst_one").await.unwrap();
+        let listed = driver.list("inst_one").await?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].sha256, manifest.sha256);
         assert_eq!(
             driver
                 .read_catalog("inst_one", &backup_id, 1024)
-                .await
-                .unwrap()
-                .unwrap(),
+                .await?
+                .context("read catalog should provide a value")?,
             br#"{"objects":[]}"#
         );
-        assert!(
-            !driver
-                .materialize("inst_one", &backup_id)
-                .await
-                .unwrap()
-                .temporary
-        );
-        driver.delete("inst_one", &backup_id).await.unwrap();
-        assert!(driver.list("inst_one").await.unwrap().is_empty());
+        assert!(!driver.materialize("inst_one", &backup_id).await?.temporary);
+        driver.delete("inst_one", &backup_id).await?;
+        assert!(driver.list("inst_one").await?.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn local_driver_rejects_a_tampered_managed_archive() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn local_driver_rejects_a_tampered_managed_archive() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("backups");
         let driver = LocalBackupDriver::new(root.clone());
-        driver.preflight().await.unwrap();
+        driver.preflight().await?;
         let backup_id = new_backup_id(BackupLayout::Physical);
-        let bundle = BackupBundle::create(&root, "inst_one", &backup_id)
-            .await
-            .unwrap();
-        tokio::fs::write(&bundle.archive, b"archive").await.unwrap();
+        let bundle = BackupBundle::create(&root, "inst_one", &backup_id).await?;
+        tokio::fs::write(&bundle.archive, b"archive").await?;
         let manifest = build_manifest(
             backup_id.clone(),
             "inst_one".to_string(),
@@ -488,33 +480,30 @@ mod tests {
             false,
             test_details(BackupLayout::Physical),
         )
-        .await
-        .unwrap();
-        bundle.write_metadata(&manifest).await.unwrap();
-        driver.commit(&bundle, &manifest).await.unwrap();
+        .await?;
+        bundle.write_metadata(&manifest).await?;
+        driver.commit(&bundle, &manifest).await?;
 
-        tokio::fs::write(root.join("inst_one").join(&backup_id), b"changed")
-            .await
-            .unwrap();
+        tokio::fs::write(root.join("inst_one").join(&backup_id), b"changed").await?;
         let error = driver
             .materialize("inst_one", &backup_id)
             .await
-            .unwrap_err();
+            .expect_err("materialize should return an error");
         assert!(matches!(error, BackupStoreError::Corrupt(_)));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn local_driver_skips_but_never_reinterprets_future_formats() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn local_driver_skips_but_never_reinterprets_future_formats() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("backups");
         let driver = LocalBackupDriver::new(root.clone());
-        driver.preflight().await.unwrap();
+        driver.preflight().await?;
         let instance_root = root.join("inst_one");
-        prepare_private_dir(&instance_root, "test").await.unwrap();
+        prepare_private_dir(&instance_root, "test").await?;
         let backup_id = "future.physical.tar.gz";
-        tokio::fs::write(instance_root.join(backup_id), b"archive")
-            .await
-            .unwrap();
+        tokio::fs::write(instance_root.join(backup_id), b"archive").await?;
         let future = serde_json::json!({
             "schema_version": 3,
             "backup_id": backup_id,
@@ -523,12 +512,11 @@ mod tests {
         });
         crate::io::files::atomic_write_private(
             &instance_root.join(metadata_file_name(backup_id)),
-            &serde_json::to_vec(&future).unwrap(),
-        )
-        .unwrap();
+            &serde_json::to_vec(&future)?,
+        )?;
 
-        assert!(driver.list("inst_one").await.unwrap().is_empty());
-        let inventory = driver.inventory("inst_one").await.unwrap();
+        assert!(driver.list("inst_one").await?.is_empty());
+        let inventory = driver.inventory("inst_one").await?;
         assert_eq!(inventory.unsupported.len(), 1);
         assert_eq!(inventory.unsupported[0].backup_id, backup_id);
         assert!(inventory.unsupported[0].diagnostic.contains("schema 3"));
@@ -541,48 +529,32 @@ mod tests {
             Err(BackupStoreError::UnsupportedFormat(_))
         ));
         // Only an explicit delete removes it.
-        driver.delete("inst_one", backup_id).await.unwrap();
-        assert!(
-            driver
-                .inventory("inst_one")
-                .await
-                .unwrap()
-                .unsupported
-                .is_empty()
-        );
+        driver.delete("inst_one", backup_id).await?;
+        assert!(driver.inventory("inst_one").await?.unsupported.is_empty());
         assert!(!instance_root.join(metadata_file_name(backup_id)).exists());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn local_purge_removes_partial_publications_idempotently() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn local_purge_removes_partial_publications_idempotently() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("backups");
         let driver = LocalBackupDriver::new(root.clone());
-        driver.preflight().await.unwrap();
+        driver.preflight().await?;
         driver
             .purge_unpublished("inst_one", "partial.physical.tar.gz")
-            .await
-            .unwrap();
+            .await?;
         let instance_root = root.join("inst_one");
-        prepare_private_dir(&instance_root, "test").await.unwrap();
+        prepare_private_dir(&instance_root, "test").await?;
         let backup_id = "partial.physical.tar.gz";
         // A crash between the metadata and archive renames leaves sidecars.
         for name in [metadata_file_name(backup_id), catalog_file_name(backup_id)] {
-            tokio::fs::write(instance_root.join(name), b"partial")
-                .await
-                .unwrap();
+            tokio::fs::write(instance_root.join(name), b"partial").await?;
         }
-        tokio::fs::write(instance_root.join("other.physical.tar.gz"), b"keep")
-            .await
-            .unwrap();
-        driver
-            .purge_unpublished("inst_one", backup_id)
-            .await
-            .unwrap();
-        driver
-            .purge_unpublished("inst_one", backup_id)
-            .await
-            .unwrap();
+        tokio::fs::write(instance_root.join("other.physical.tar.gz"), b"keep").await?;
+        driver.purge_unpublished("inst_one", backup_id).await?;
+        driver.purge_unpublished("inst_one", backup_id).await?;
         assert!(!instance_root.join(metadata_file_name(backup_id)).exists());
         assert!(!instance_root.join(catalog_file_name(backup_id)).exists());
         assert!(instance_root.join("other.physical.tar.gz").exists());
@@ -592,5 +564,7 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        Ok(())
     }
 }

@@ -343,19 +343,21 @@ mod tests {
     }
 
     fn schema(key: &str, value: &str) -> SchemaRecord {
-        SchemaRecord::new(key, value).unwrap()
+        SchemaRecord::new(key, value).expect("schema should succeed")
     }
 
     fn data(key: &str, values: &[&[u8]]) -> DataRecord {
         let mut digest = MultisetAccumulator::new();
         for value in values {
-            digest.add(challenge(), key.as_bytes(), value).unwrap();
+            digest
+                .add(challenge(), key.as_bytes(), value)
+                .expect("as bytes should succeed");
         }
-        DataRecord::new(key, digest.finish()).unwrap()
+        DataRecord::new(key, digest.finish()).expect("finish should succeed")
     }
 
     #[test]
-    fn manifest_is_independent_of_object_and_row_order() {
+    fn manifest_is_independent_of_object_and_row_order() -> anyhow::Result<()> {
         let first = CollectedManifest {
             schema: vec![schema("table/b", "two"), schema("table/a", "one")],
             data: vec![data("table/a", &[b"one", b"two", b"one"])],
@@ -365,13 +367,16 @@ mod tests {
             data: vec![data("table/a", &[b"one", b"one", b"two"])],
         };
         assert_eq!(
-            finish(Protocol::Postgres, challenge(), first).unwrap(),
-            finish(Protocol::Postgres, challenge(), second).unwrap()
+            finish(Protocol::Postgres, challenge(), first)?,
+            finish(Protocol::Postgres, challenge(), second)?
         );
+
+        Ok(())
     }
 
     #[test]
-    fn duplicate_rows_do_not_cancel_and_same_count_value_changes_are_detected() {
+    fn duplicate_rows_do_not_cancel_and_same_count_value_changes_are_detected() -> anyhow::Result<()>
+    {
         let duplicate = finish(
             Protocol::Postgres,
             challenge(),
@@ -379,8 +384,7 @@ mod tests {
                 schema: vec![schema("table/a", "ddl")],
                 data: vec![data("table/a", &[b"same", b"same"])],
             },
-        )
-        .unwrap();
+        )?;
         let changed = finish(
             Protocol::Postgres,
             challenge(),
@@ -388,15 +392,16 @@ mod tests {
                 schema: vec![schema("table/a", "ddl")],
                 data: vec![data("table/a", &[b"same", b"other"])],
             },
-        )
-        .unwrap();
+        )?;
         assert_eq!(duplicate.row_count, changed.row_count);
         assert_ne!(duplicate.data_sha256, changed.data_sha256);
         assert_ne!(duplicate.fingerprint_sha256, changed.fingerprint_sha256);
+
+        Ok(())
     }
 
     #[test]
-    fn ddl_and_index_definition_changes_are_detected() {
+    fn ddl_and_index_definition_changes_are_detected() -> anyhow::Result<()> {
         let before = finish(
             Protocol::Mysql,
             challenge(),
@@ -404,8 +409,7 @@ mod tests {
                 schema: vec![schema("table/a", "INDEX i (a)")],
                 data: vec![],
             },
-        )
-        .unwrap();
+        )?;
         let after = finish(
             Protocol::Mysql,
             challenge(),
@@ -413,16 +417,19 @@ mod tests {
                 schema: vec![schema("table/a", "UNIQUE INDEX i (a,b)")],
                 data: vec![],
             },
-        )
-        .unwrap();
+        )?;
         assert_ne!(before.schema_sha256, after.schema_sha256);
         assert_ne!(before.fingerprint_sha256, after.fingerprint_sha256);
+
+        Ok(())
     }
 
     #[test]
-    fn signed_database_words_preserve_all_64_bits() {
-        assert_eq!(parse_word("-9223372036854775808").unwrap(), 1_u64 << 63);
-        assert_eq!(parse_word("18446744073709551615").unwrap(), u64::MAX);
+    fn signed_database_words_preserve_all_64_bits() -> anyhow::Result<()> {
+        assert_eq!(parse_word("-9223372036854775808")?, 1_u64 << 63);
+        assert_eq!(parse_word("18446744073709551615")?, u64::MAX);
         assert!(parse_word("-9223372036854775809").is_err());
+
+        Ok(())
     }
 }

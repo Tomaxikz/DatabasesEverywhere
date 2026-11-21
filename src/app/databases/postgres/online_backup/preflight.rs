@@ -576,6 +576,8 @@ const KEY_REPEATED: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     fn ready_text() -> String {
@@ -604,12 +606,12 @@ mod tests {
     }
 
     fn decide_text(text: &str, space: Option<&DiskSpace>) -> Result<CapturePlan, Gate> {
-        let report = parse_report(text).unwrap();
+        let report = parse_report(text).expect("parse report should succeed");
         decide(&report, DeploymentMode::Dedicated, space)
     }
 
     fn estimate_of_ready() -> u64 {
-        capture_estimate(1000, 2000).unwrap()
+        capture_estimate(1000, 2000).expect("expected a value from capture_estimate")
     }
 
     #[test]
@@ -628,8 +630,9 @@ mod tests {
     }
 
     #[test]
-    fn certified_majors_pass_and_neighbors_do_not() {
-        let plan = decide_text(&ready_text(), None).unwrap();
+    fn certified_majors_pass_and_neighbors_do_not() -> anyhow::Result<()> {
+        let plan =
+            decide_text(&ready_text(), None).map_err(|error| anyhow::anyhow!("{error:?}"))?;
         assert_eq!(plan.restore_target, PathBuf::from("18/docker"));
         assert_eq!(plan.server_version, "18.4");
         let mut text = ready_text().replace("180004", "140020");
@@ -643,6 +646,8 @@ mod tests {
             };
             assert!(reason.contains(major), "{reason}");
         }
+
+        Ok(())
     }
 
     #[test]
@@ -670,10 +675,10 @@ mod tests {
     }
 
     #[test]
-    fn layouts_roles_and_hba_rules_fail_closed() {
+    fn layouts_roles_and_hba_rules_fail_closed() -> anyhow::Result<()> {
         assert!(matches!(
             decide(
-                &parse_report(&ready_text()).unwrap(),
+                &parse_report(&ready_text()).map_err(anyhow::Error::msg)?,
                 DeploymentMode::Shared,
                 None
             ),
@@ -740,6 +745,8 @@ mod tests {
             decide_text(&denied, None),
             Err(Gate::Unsupported(reason)) if reason.contains("rejected")
         ));
+
+        Ok(())
     }
 
     #[test]
@@ -798,13 +805,13 @@ mod tests {
     }
 
     #[test]
-    fn exclusions_record_limits_without_control_characters() {
+    fn exclusions_record_limits_without_control_characters() -> anyhow::Result<()> {
         let mut text = ready_text();
         text = text.replace(
             "inventory_blocked=0",
             "unlogged=app|public.session\nextension=app|postgis|3.4.0\ninventory_blocked=0",
         );
-        let plan = decide_text(&text, None).unwrap();
+        let plan = decide_text(&text, None).map_err(|error| anyhow::anyhow!("{error:?}"))?;
         assert!(
             plan.exclusions
                 .iter()
@@ -838,14 +845,16 @@ mod tests {
             "inventory_blocked=0",
             &format!("{many}\ninventory_blocked=0"),
         );
-        let plan = decide_text(&crowded, None).unwrap();
+        let plan = decide_text(&crowded, None).map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let unlogged = plan
             .exclusions
             .iter()
             .find(|line| line.starts_with("unlogged relations"))
-            .unwrap();
+            .context("expected a value from find")?;
         assert!(unlogged.contains("showing"), "{unlogged}");
         assert!(unlogged.contains("30"), "{unlogged}");
+
+        Ok(())
     }
 
     #[test]

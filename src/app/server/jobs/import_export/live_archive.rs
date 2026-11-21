@@ -259,36 +259,41 @@ mod tests {
     use flate2::read::GzDecoder;
 
     fn entries(artifact: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut archive = tar::Archive::new(GzDecoder::new(File::open(artifact).unwrap()));
+        let mut archive = tar::Archive::new(GzDecoder::new(
+            File::open(artifact).expect("open should succeed"),
+        ));
         archive
             .entries()
-            .unwrap()
+            .expect("entries should succeed")
             .map(|entry| {
-                let mut entry = entry.unwrap();
-                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                let mut entry = entry.expect("entries should succeed");
+                let path = entry
+                    .path()
+                    .expect("path should succeed")
+                    .to_string_lossy()
+                    .into_owned();
                 let mut contents = Vec::new();
-                entry.read_to_end(&mut contents).unwrap();
+                entry
+                    .read_to_end(&mut contents)
+                    .expect("read to end should succeed");
                 (path, contents)
             })
             .collect()
     }
 
     #[test]
-    fn packages_a_capture_below_its_restore_target() {
-        let temp = tempfile::tempdir().unwrap();
+    fn packages_a_capture_below_its_restore_target() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let capture = temp.path().join("capture/data");
-        std::fs::create_dir_all(capture.join("base")).unwrap();
-        std::fs::write(capture.join("base/1"), b"page").unwrap();
-        std::fs::write(capture.join("backup_label"), b"label").unwrap();
+        std::fs::create_dir_all(capture.join("base"))?;
+        std::fs::write(capture.join("base/1"), b"page")?;
+        std::fs::write(capture.join("backup_label"), b"label")?;
         let artifact = temp.path().join("out/archive.tar.gz");
 
-        let mut archive =
-            StagedDataArchive::create("inst_live", &capture, &artifact, u64::MAX).unwrap();
-        archive
-            .append_directory_chain(Path::new("pgdata"), &capture)
-            .unwrap();
-        archive.append_tree(&capture, Path::new("pgdata")).unwrap();
-        archive.finish().unwrap();
+        let mut archive = StagedDataArchive::create("inst_live", &capture, &artifact, u64::MAX)?;
+        archive.append_directory_chain(Path::new("pgdata"), &capture)?;
+        archive.append_tree(&capture, Path::new("pgdata"))?;
+        archive.finish()?;
 
         let entries = entries(&artifact);
         let names = entries
@@ -301,22 +306,26 @@ mod tests {
         assert!(entries.iter().any(|(name, contents)| {
             name == "inst_live/pgdata/backup_label" && contents == b"label"
         }));
+
+        Ok(())
     }
 
     #[test]
-    fn abandoned_archive_is_removed() {
-        let temp = tempfile::tempdir().unwrap();
+    fn abandoned_archive_is_removed() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let capture = temp.path().join("capture");
-        std::fs::create_dir_all(&capture).unwrap();
+        std::fs::create_dir_all(&capture)?;
         let artifact = temp.path().join("out/archive.tar.gz");
-        let archive = StagedDataArchive::create("inst", &capture, &artifact, u64::MAX).unwrap();
+        let archive = StagedDataArchive::create("inst", &capture, &artifact, u64::MAX)?;
         assert!(artifact.exists());
         drop(archive);
         assert!(!artifact.exists());
+
+        Ok(())
     }
 
     #[test]
-    fn shrinking_or_growing_files_fail_instead_of_being_padded() {
+    fn shrinking_or_growing_files_fail_instead_of_being_padded() -> anyhow::Result<()> {
         let mut shrank = ExactReader {
             inner: &b"ab"[..],
             remaining: 4,
@@ -324,7 +333,9 @@ mod tests {
             source: PathBuf::from("file"),
         };
         let mut output = Vec::new();
-        let error = shrank.read_to_end(&mut output).unwrap_err();
+        let error = shrank
+            .read_to_end(&mut output)
+            .expect_err("read to end should return an error");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let mut grew = ExactReader {
@@ -334,19 +345,23 @@ mod tests {
             source: PathBuf::from("file"),
         };
         let mut output = Vec::new();
-        grew.read_to_end(&mut output).unwrap();
+        grew.read_to_end(&mut output)?;
         assert_eq!(output, b"ab");
         assert!(grew.ensure_at_end().is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn refuses_symlinks_in_staging() {
-        let temp = tempfile::tempdir().unwrap();
+    fn refuses_symlinks_in_staging() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let capture = temp.path().join("capture");
-        std::fs::create_dir_all(&capture).unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", capture.join("link")).unwrap();
+        std::fs::create_dir_all(&capture)?;
+        std::os::unix::fs::symlink("/etc/passwd", capture.join("link"))?;
         let artifact = temp.path().join("out/archive.tar.gz");
-        let mut archive = StagedDataArchive::create("inst", &capture, &artifact, u64::MAX).unwrap();
+        let mut archive = StagedDataArchive::create("inst", &capture, &artifact, u64::MAX)?;
         assert!(archive.append_tree(&capture, Path::new("data")).is_err());
+
+        Ok(())
     }
 }

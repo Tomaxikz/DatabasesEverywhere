@@ -177,6 +177,7 @@ fn is_container_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     const ID: &str = "4f1c0a3e9b7d2c6a8e5f1b3d7c9a2e4f6b8d0c1a3e5f7b9d2c4a6e8f0b1d3c5a";
@@ -190,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn paths_under_a_mount_go_to_its_host_side() {
+    fn paths_under_a_mount_go_to_its_host_side() -> anyhow::Result<()> {
         let paths = paths();
         assert_eq!(
             paths.to_host(Path::new("/var/lib/dbev/metadata")),
@@ -211,7 +212,7 @@ mod tests {
         assert_eq!(
             paths
                 .to_container(Path::new("/mnt/big/volumes/abc"))
-                .unwrap(),
+                .context("to container should provide a value")?,
             Path::new("/var/lib/dbev/volumes/abc")
         );
         assert_eq!(paths.to_container(Path::new("/var/lib/docker/x")), None);
@@ -222,9 +223,13 @@ mod tests {
             Path::new("/var/lib/dbev")
         );
         assert_eq!(
-            paths.to_container(Path::new("/var/lib/dbev")).unwrap(),
+            paths
+                .to_container(Path::new("/var/lib/dbev"))
+                .context("to container should provide a value")?,
             Path::new("/var/lib/dbev")
         );
+
+        Ok(())
     }
 
     #[test]

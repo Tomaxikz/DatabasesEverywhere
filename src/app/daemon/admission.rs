@@ -224,45 +224,58 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for AdmittedApiStream<S> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use std::{net::IpAddr, sync::Arc};
 
     use super::ApiConnectionLimiter;
 
     #[test]
-    fn acceptor_uses_configured_limits() {
+    fn acceptor_uses_configured_limits() -> anyhow::Result<()> {
         let limits = crate::config::RuntimeLimits {
             api_connections: 2,
             api_connections_per_peer: 1,
             ..Default::default()
         };
         let acceptor = super::ApiConnectionAcceptor::new((), &limits);
-        let first_ip = "192.0.2.10".parse().unwrap();
-        let first = acceptor.limiter.try_acquire(first_ip).unwrap();
+        let first_ip = "192.0.2.10".parse()?;
+        let first = acceptor
+            .limiter
+            .try_acquire(first_ip)
+            .context("expected a value from try_acquire")?;
         assert!(acceptor.limiter.try_acquire(first_ip).is_none());
         let _second = acceptor
             .limiter
-            .try_acquire("192.0.2.11".parse().unwrap())
-            .unwrap();
+            .try_acquire("192.0.2.11".parse()?)
+            .context("expected a value from try_acquire")?;
         assert!(
             acceptor
                 .limiter
-                .try_acquire("192.0.2.12".parse().unwrap())
+                .try_acquire("192.0.2.12".parse()?)
                 .is_none()
         );
         drop(first);
         assert!(acceptor.limiter.try_acquire(first_ip).is_some());
+
+        Ok(())
     }
 
     #[test]
-    fn enforces_and_releases_peer_and_global_capacity() {
+    fn enforces_and_releases_peer_and_global_capacity() -> anyhow::Result<()> {
         let limiter = Arc::new(ApiConnectionLimiter::new(3, 2));
-        let first_ip: IpAddr = "192.0.2.10".parse().unwrap();
-        let second_ip: IpAddr = "192.0.2.11".parse().unwrap();
+        let first_ip: IpAddr = "192.0.2.10".parse()?;
+        let second_ip: IpAddr = "192.0.2.11".parse()?;
 
-        let first = limiter.try_acquire(first_ip).unwrap();
-        let second = limiter.try_acquire(first_ip).unwrap();
+        let first = limiter
+            .try_acquire(first_ip)
+            .context("expected a value from try_acquire")?;
+        let second = limiter
+            .try_acquire(first_ip)
+            .context("expected a value from try_acquire")?;
         assert!(limiter.try_acquire(first_ip).is_none());
-        let other_peer = limiter.try_acquire(second_ip).unwrap();
+        let other_peer = limiter
+            .try_acquire(second_ip)
+            .context("expected a value from try_acquire")?;
 
         drop(first);
         assert!(limiter.try_acquire(first_ip).is_some());
@@ -270,28 +283,40 @@ mod tests {
         drop(other_peer);
 
         let limiter = Arc::new(ApiConnectionLimiter::new(2, 2));
-        let first = limiter.try_acquire("192.0.2.10".parse().unwrap()).unwrap();
-        let _second = limiter.try_acquire("192.0.2.11".parse().unwrap()).unwrap();
+        let first = limiter
+            .try_acquire("192.0.2.10".parse()?)
+            .context("expected a value from try_acquire")?;
+        let _second = limiter
+            .try_acquire("192.0.2.11".parse()?)
+            .context("expected a value from try_acquire")?;
 
-        assert!(limiter.try_acquire("192.0.2.12".parse().unwrap()).is_none());
+        assert!(limiter.try_acquire("192.0.2.12".parse()?).is_none());
         drop(first);
-        assert!(limiter.try_acquire("192.0.2.12".parse().unwrap()).is_some());
+        assert!(limiter.try_acquire("192.0.2.12".parse()?).is_some());
+
+        Ok(())
     }
 
     #[test]
-    fn normalizes_ipv4_and_ipv6_peer_buckets() {
+    fn normalizes_ipv4_and_ipv6_peer_buckets() -> anyhow::Result<()> {
         let limiter = Arc::new(ApiConnectionLimiter::new(2, 1));
-        let ipv4: IpAddr = "192.0.2.10".parse().unwrap();
-        let mapped: IpAddr = "::ffff:192.0.2.10".parse().unwrap();
-        let _permit = limiter.try_acquire(ipv4).unwrap();
+        let ipv4: IpAddr = "192.0.2.10".parse()?;
+        let mapped: IpAddr = "::ffff:192.0.2.10".parse()?;
+        let _permit = limiter
+            .try_acquire(ipv4)
+            .context("expected a value from try_acquire")?;
         assert!(limiter.try_acquire(mapped).is_none());
 
         let limiter = Arc::new(ApiConnectionLimiter::new(3, 1));
-        let first: IpAddr = "2001:db8:1234:5678::1".parse().unwrap();
-        let same_prefix: IpAddr = "2001:db8:1234:5678:ffff::2".parse().unwrap();
-        let other_prefix: IpAddr = "2001:db8:1234:5679::1".parse().unwrap();
-        let _first = limiter.try_acquire(first).unwrap();
+        let first: IpAddr = "2001:db8:1234:5678::1".parse()?;
+        let same_prefix: IpAddr = "2001:db8:1234:5678:ffff::2".parse()?;
+        let other_prefix: IpAddr = "2001:db8:1234:5679::1".parse()?;
+        let _first = limiter
+            .try_acquire(first)
+            .context("expected a value from try_acquire")?;
         assert!(limiter.try_acquire(same_prefix).is_none());
         assert!(limiter.try_acquire(other_prefix).is_some());
+
+        Ok(())
     }
 }

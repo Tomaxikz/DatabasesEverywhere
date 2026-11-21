@@ -149,7 +149,7 @@ async fn serve(
     engine: Arc<Mutex<Engine>>,
 ) -> Result<Response<Body>, Infallible> {
     let path = request.uri().path();
-    let mut engine = engine.lock().unwrap();
+    let mut engine = engine.lock().expect("lock should succeed");
     if path.ends_with("/stop") || path.ends_with("/kill") {
         if path.ends_with("/stop") {
             engine.stops += 1;
@@ -161,10 +161,13 @@ async fn serve(
                 .status(500)
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"message":"engine unavailable"}"#))
-                .unwrap());
+                .expect("body should succeed"));
         }
         engine.running = false;
-        return Ok(Response::builder().status(204).body(Body::empty()).unwrap());
+        return Ok(Response::builder()
+            .status(204)
+            .body(Body::empty())
+            .expect("empty should succeed"));
     }
     assert!(path.ends_with("/json"), "unexpected request {path}");
     let labels = std::collections::HashMap::from([
@@ -179,7 +182,7 @@ async fn serve(
     Ok(Response::builder()
         .header("Content-Type", "application/json")
         .body(Body::from(value.to_string()))
-        .unwrap())
+        .expect("to string should succeed"))
 }
 
 struct Fixture {
@@ -199,14 +202,20 @@ impl Drop for Fixture {
 
 async fn fixture(refuses_stop: bool) -> Fixture {
     let (state, dir) = crate::subsystems::test_support::database(Config::default()).await;
-    let db = crate::storage::sqlite::connect(dir.path()).await.unwrap();
+    let db = crate::storage::sqlite::connect(dir.path())
+        .await
+        .expect("path should succeed");
     let mut runtime =
         crate::server::placement::test_support::runtime(ID, Protocol::Postgres, "postgres:18.4");
     runtime.limits.disk_mib = 64 * 1024;
     runtime.backend = BackendEndpoint::UnixSocket {
         socket_path: "/run/dbev/pool_failure/postgres.sock".into(),
     };
-    state.placements.save(&runtime).await.unwrap();
+    state
+        .placements
+        .save(&runtime)
+        .await
+        .expect("save should succeed");
     let mut metadata = crate::server::test_support::metadata("tenant_failure", Protocol::Postgres);
     metadata.owner = runtime.owner.clone();
     metadata.deployment_mode = DeploymentMode::Shared;
@@ -215,7 +224,7 @@ async fn fixture(refuses_stop: bool) -> Fixture {
     state
         .placements
         .reserve(ReserveTenant {
-            owner: runtime.owner.clone().unwrap(),
+            owner: runtime.owner.clone().expect("expected a value from clone"),
             instance_id: &metadata.instance_id,
             runtime_id: ID,
             database: &metadata.database.name,
@@ -223,16 +232,25 @@ async fn fixture(refuses_stop: bool) -> Fixture {
             limits: &metadata.limits,
         })
         .await
-        .unwrap();
+        .expect("reserve should succeed");
     state
         .placements
         .mark_provisioned(&metadata.instance_id)
         .await
-        .unwrap();
-    state.manager.upsert(metadata).await.unwrap();
-    runtime = state.placements.get(ID).await.unwrap().unwrap();
+        .expect("mark provisioned should succeed");
+    state
+        .manager
+        .upsert(metadata)
+        .await
+        .expect("upsert should succeed");
+    runtime = state
+        .placements
+        .get(ID)
+        .await
+        .expect("get should succeed")
+        .expect("expected a value from expect");
     let socket = dir.path().join("engine.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = UnixListener::bind(&socket).expect("bind should succeed");
     let engine = Arc::new(Mutex::new(Engine {
         running: true,
         refuses_stop,
@@ -244,7 +262,7 @@ async fn fixture(refuses_stop: bool) -> Fixture {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let (stream, _) = accepted.unwrap();
+                    let (stream, _) = accepted.expect("fixture should succeed");
                     let engine = server_engine.clone();
                     connections.spawn(async move {
                         let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), service_fn(move |r| serve(r, engine.clone()))).await;
@@ -262,7 +280,7 @@ async fn fixture(refuses_stop: bool) -> Fixture {
         },
         false,
     )
-    .unwrap()
+    .expect("default should succeed")
     .with_node_id("test-node");
     Fixture {
         state: AppState::new(data),
@@ -275,7 +293,10 @@ async fn fixture(refuses_stop: bool) -> Fixture {
 }
 
 #[tokio::test]
-async fn confirmed_start_failure_stays_down_until_explicit_or_boot_recovery() {
+async fn confirmed_start_failure_stays_down_until_explicit_or_boot_recovery() -> anyhow::Result<()>
+{
+    use anyhow::Context as _;
+
     let mut f = fixture(false).await;
     handle(
         &f.state,
@@ -283,41 +304,49 @@ async fn confirmed_start_failure_stays_down_until_explicit_or_boot_recovery() {
         Phase::Readiness,
         &readiness_error(),
     )
-    .await
-    .unwrap();
-    let stored = f.state.placements.get(ID).await.unwrap().unwrap();
+    .await?;
+    let stored = f
+        .state
+        .placements
+        .get(ID)
+        .await?
+        .context("get should provide a value")?;
     assert!(
         crate::storage::quarantine::list(&f.db, None, true, None, 100)
-            .await
-            .unwrap()
+            .await?
             .is_empty()
     );
     assert_eq!(stored.status, EngineRuntimeStatus::Failed);
     assert_eq!(stored.desired_state, DesiredInstanceState::Stopped);
-    assert!(!f.engine.lock().unwrap().running);
+    assert!(
+        !f.engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+            .running
+    );
     let tenant = f
         .state
         .manager
         .get_persisted("tenant_failure")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .context("get persisted should provide a value")?;
     assert_eq!(tenant.status, InstanceStatus::Failed);
     assert_eq!(tenant.desired_state, DesiredInstanceState::Running);
     assert!(f.state.instances.routes_fenced("tenant_failure").await);
-    assert_eq!(f.state.placements.reservations(ID).await.unwrap().len(), 1);
+    assert_eq!(f.state.placements.reservations(ID).await?.len(), 1);
     // A later stop event or boot reconciliation preserves the failure label.
-    assert!(
-        super::super::honor_stop(&f.state, &mut f.runtime)
-            .await
-            .unwrap()
-    );
+    assert!(super::super::honor_stop(&f.state, &mut f.runtime).await?);
     assert_eq!(f.runtime.status, EngineRuntimeStatus::Failed);
     assert!(super::super::shared_boot_action(f.runtime.status, f.runtime.desired_state).is_none());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn uncertain_stop_escalates_to_quarantine_instead_of_claiming_stopped() {
+async fn uncertain_stop_escalates_to_quarantine_instead_of_claiming_stopped() -> anyhow::Result<()>
+{
+    use anyhow::Context as _;
+
     let mut f = fixture(true).await;
     assert!(
         handle(
@@ -330,24 +359,32 @@ async fn uncertain_stop_escalates_to_quarantine_instead_of_claiming_stopped() {
         .is_err()
     );
     assert_eq!(
-        f.state.placements.get(ID).await.unwrap().unwrap().status,
+        f.state
+            .placements
+            .get(ID)
+            .await?
+            .context("get should provide a value")?
+            .status,
         EngineRuntimeStatus::Quarantined
     );
     assert_eq!(
         f.state
             .manager
             .get_persisted("tenant_failure")
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get persisted should provide a value")?
             .status,
         InstanceStatus::Quarantined
     );
     assert!(f.state.instances.routes_fenced("tenant_failure").await);
-    assert!(f.engine.lock().unwrap().kills > 0);
-    let causes = crate::storage::quarantine::list(&f.db, None, false, None, 100)
-        .await
-        .unwrap();
+    assert!(
+        f.engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+            .kills
+            > 0
+    );
+    let causes = crate::storage::quarantine::list(&f.db, None, false, None, 100).await?;
     assert_eq!(causes.len(), 2);
     assert!(
         causes
@@ -355,13 +392,20 @@ async fn uncertain_stop_escalates_to_quarantine_instead_of_claiming_stopped() {
             .all(|cause| cause.code == "shutdown_unconfirmed"
                 && cause.recovery_class == "validated_retry")
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn oom_with_wrapper_exit_one_keeps_pool_down_and_reports_the_cause() {
+async fn oom_with_wrapper_exit_one_keeps_pool_down_and_reports_the_cause() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let f = fixture(false).await;
     {
-        let mut engine = f.engine.lock().unwrap();
+        let mut engine = f
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?;
         engine.running = false;
         engine.oom_killed = true;
     }
@@ -369,8 +413,7 @@ async fn oom_with_wrapper_exit_one_keeps_pool_down_and_reports_the_cause() {
         .state
         .docker
         .inspect_instance(Protocol::Postgres, ID)
-        .await
-        .unwrap();
+        .await?;
     assert!(inspection.oom_killed);
     assert_eq!(inspection.memory_limit_bytes, Some(1073741824));
     super::super::reconcile_shared_event(
@@ -382,27 +425,33 @@ async fn oom_with_wrapper_exit_one_keeps_pool_down_and_reports_the_cause() {
             action: crate::runtime::docker::ManagedContainerAction::Exited { exit_code: Some(1) },
         },
     )
-    .await
-    .unwrap();
-    let pool = f.state.placements.get(ID).await.unwrap().unwrap();
+    .await?;
+    let pool = f
+        .state
+        .placements
+        .get(ID)
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(pool.status, EngineRuntimeStatus::Failed);
     assert_eq!(pool.desired_state, DesiredInstanceState::Stopped);
     assert!(f.state.instances.routes_fenced("tenant_failure").await);
-    let reports = crate::subsystems::monitoring::resources::pool_reports(&f.state, &[pool])
-        .await
-        .unwrap();
-    let json = serde_json::to_value(reports).unwrap();
+    let reports = crate::subsystems::monitoring::resources::pool_reports(&f.state, &[pool]).await?;
+    let json = serde_json::to_value(reports)?;
     assert_eq!(json[0]["diagnostic"]["code"], "pool_oom_killed");
     assert!(
         json[0]["diagnostic"]["message"]
             .as_str()
-            .unwrap()
+            .context("as str should provide a value")?
             .contains("1024 MiB")
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn credential_or_incomplete_image_failures_remain_quarantined() {
+async fn credential_or_incomplete_image_failures_remain_quarantined() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let mut f = fixture(false).await;
     handle(
         &f.state,
@@ -410,57 +459,74 @@ async fn credential_or_incomplete_image_failures_remain_quarantined() {
         Phase::PoolSecurity,
         &anyhow::anyhow!("credentials unverified"),
     )
-    .await
-    .unwrap();
+    .await?;
     assert_eq!(
-        f.state.placements.get(ID).await.unwrap().unwrap().status,
+        f.state
+            .placements
+            .get(ID)
+            .await?
+            .context("get should provide a value")?
+            .status,
         EngineRuntimeStatus::Quarantined
     );
     let mut f = fixture(false).await;
     f.runtime.pending_image = Some("new-image".into());
-    f.state.placements.save(&f.runtime).await.unwrap();
+    f.state.placements.save(&f.runtime).await?;
     handle(
         &f.state,
         &mut f.runtime,
         Phase::Readiness,
         &readiness_error(),
     )
-    .await
-    .unwrap();
+    .await?;
     assert_eq!(
-        f.state.placements.get(ID).await.unwrap().unwrap().status,
+        f.state
+            .placements
+            .get(ID)
+            .await?
+            .context("get should provide a value")?
+            .status,
         EngineRuntimeStatus::Quarantined
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn failure_to_persist_failed_state_escalates_without_deleting_metadata() {
+async fn failure_to_persist_failed_state_escalates_without_deleting_metadata() -> anyhow::Result<()>
+{
+    use anyhow::Context as _;
+
     let mut f = fixture(false).await;
     sqlx::query(
         "CREATE TRIGGER reject_failed BEFORE UPDATE ON engine_runtimes WHEN NEW.status = 'failed'
         BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END",
     )
     .execute(&f.db)
-    .await
-    .unwrap();
+    .await?;
     handle(
         &f.state,
         &mut f.runtime,
         Phase::Readiness,
         &readiness_error(),
     )
-    .await
-    .unwrap();
+    .await?;
     assert_eq!(
-        f.state.placements.get(ID).await.unwrap().unwrap().status,
+        f.state
+            .placements
+            .get(ID)
+            .await?
+            .context("get should provide a value")?
+            .status,
         EngineRuntimeStatus::Quarantined
     );
     assert!(
         f.state
             .manager
             .get_persisted("tenant_failure")
-            .await
-            .unwrap()
+            .await?
             .is_some()
     );
+
+    Ok(())
 }

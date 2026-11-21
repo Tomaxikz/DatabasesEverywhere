@@ -793,30 +793,34 @@ mod tests {
     }
 
     #[test]
-    fn completed_upload_verification_checks_size_and_digest() {
-        let directory = tempfile::tempdir().unwrap();
+    fn completed_upload_verification_checks_size_and_digest() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("upload");
-        std::fs::write(&path, b"dump").unwrap();
+        std::fs::write(&path, b"dump")?;
         let digest = hex::encode(Sha256::digest(b"dump"));
-        assert!(verify_completed_upload(&path, 4, &digest).unwrap());
-        assert!(!verify_completed_upload(&path, 3, &digest).unwrap());
-        assert!(!verify_completed_upload(&path, 4, &"0".repeat(64)).unwrap());
+        assert!(verify_completed_upload(&path, 4, &digest)?);
+        assert!(!verify_completed_upload(&path, 3, &digest)?);
+        assert!(!verify_completed_upload(&path, 4, &"0".repeat(64))?);
+
+        Ok(())
     }
 
     #[test]
-    fn completed_upload_verification_rejects_links() {
+    fn completed_upload_verification_rejects_links() -> anyhow::Result<()> {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let source = directory.path().join("source");
         let symlink_path = directory.path().join("symlink");
         let hardlink_path = directory.path().join("hardlink");
-        std::fs::write(&source, b"dump").unwrap();
-        symlink(&source, &symlink_path).unwrap();
-        std::fs::hard_link(&source, &hardlink_path).unwrap();
+        std::fs::write(&source, b"dump")?;
+        symlink(&source, &symlink_path)?;
+        std::fs::hard_link(&source, &hardlink_path)?;
         let digest = hex::encode(Sha256::digest(b"dump"));
 
         assert!(verify_completed_upload(&symlink_path, 4, &digest).is_err());
         assert!(verify_completed_upload(&hardlink_path, 4, &digest).is_err());
+
+        Ok(())
     }
 }

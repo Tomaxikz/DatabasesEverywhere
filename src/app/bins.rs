@@ -367,93 +367,97 @@ fn verify_digest(bytes: &[u8], label: &str, expected_sha256: &str) -> Result<(),
 
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use std::os::unix::fs::symlink;
 
     #[tokio::test]
-    async fn installs_hash_verified_helper_in_private_directory() {
-        let root = tempfile::tempdir().unwrap();
+    async fn installs_hash_verified_helper_in_private_directory() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
 
-        let path = get_fusequota_bin_path(root.path()).await.unwrap();
+        let path = get_fusequota_bin_path(root.path()).await?;
 
         assert_eq!(path.parent(), Some(root.path().join("bin").as_path()));
-        let directory_mode = fs::metadata(path.parent().unwrap())
-            .unwrap()
+        let directory_mode = fs::metadata(path.parent().context("expected a value from parent")?)?
             .permissions()
             .mode()
             & 0o777;
-        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&path)?.permissions().mode() & 0o777;
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o500);
-        verify_digest(&fs::read(path).unwrap(), "test helper", FUSEQUOTA_SHA256).unwrap();
+        verify_digest(&fs::read(path)?, "test helper", FUSEQUOTA_SHA256)?;
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn installs_static_socket_bridge_for_unprivileged_container_users() {
-        let root = tempfile::tempdir().unwrap();
+    async fn installs_static_socket_bridge_for_unprivileged_container_users() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
 
-        let path = get_socket_bridge_bin_path(root.path()).await.unwrap();
+        let path = get_socket_bridge_bin_path(root.path()).await?;
 
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
             Some(SOCKET_BRIDGE_FILENAME)
         );
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o555
-        );
-        verify_digest(
-            &fs::read(path).unwrap(),
-            "test socket bridge",
-            SOCKET_BRIDGE_SHA256,
-        )
-        .unwrap();
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o555);
+        verify_digest(&fs::read(path)?, "test socket bridge", SOCKET_BRIDGE_SHA256)?;
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn installed_static_socket_bridge_executes_healthcheck() {
-        let root = tempfile::tempdir().unwrap();
-        let helper = get_socket_bridge_bin_path(root.path()).await.unwrap();
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let target = listener.local_addr().unwrap();
+    async fn installed_static_socket_bridge_executes_healthcheck() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let helper = get_socket_bridge_bin_path(root.path()).await?;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let target = listener.local_addr()?;
 
         let status = tokio::process::Command::new(helper)
             .arg("__socket-bridge-healthcheck")
             .arg(target.to_string())
             .status()
-            .await
-            .unwrap();
+            .await?;
 
         assert!(status.success());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_preexisting_helper_symlink() {
-        let root = tempfile::tempdir().unwrap();
+    async fn rejects_preexisting_helper_symlink() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
         let directory = root.path().join("bin");
-        fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         symlink(
             "/bin/true",
             directory.join(format!("fusequota-{FUSEQUOTA_VERSION}")),
-        )
-        .unwrap();
+        )?;
 
         assert!(get_fusequota_bin_path(root.path()).await.is_err());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_tampered_preexisting_helper() {
-        let root = tempfile::tempdir().unwrap();
+    async fn rejects_tampered_preexisting_helper() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
         let directory = root.path().join("bin");
-        fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         let path = directory.join(format!("fusequota-{FUSEQUOTA_VERSION}"));
-        fs::write(&path, b"not the embedded helper").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::write(&path, b"not the embedded helper")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500))?;
 
-        let error = get_fusequota_bin_path(root.path()).await.unwrap_err();
+        let error = get_fusequota_bin_path(root.path())
+            .await
+            .expect_err("path should return an error");
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+
+        Ok(())
     }
 }

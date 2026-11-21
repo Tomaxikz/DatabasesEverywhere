@@ -182,7 +182,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creation_uses_one_protected_password_and_explicit_local_grants() {
+    fn creation_uses_one_protected_password_and_explicit_local_grants() -> anyhow::Result<()> {
         for (database, username) in [("tenant_a", "user_a"), ("db`quoted", "user`quoted")] {
             let sql = create_tenant_sql(database, username);
 
@@ -216,10 +216,12 @@ mod tests {
             assert!(sql.contains("CREATE VIEW"));
             assert!(sql.contains("DROP VIEW"));
             assert!(sql.contains(&shared_grant_sql(database, username)));
-            let (before, after) = password_sql_fragments(&sql).unwrap();
+            let (before, after) = password_sql_fragments(&sql)?;
             assert!(!before.contains(PASSWORD_SQL_PLACEHOLDER));
             assert!(!after.contains(PASSWORD_SQL_PLACEHOLDER));
         }
+
+        Ok(())
     }
 
     #[test]
@@ -329,16 +331,18 @@ mod tests {
     }
 
     #[test]
-    fn password_reset_changes_only_the_selected_account() {
+    fn password_reset_changes_only_the_selected_account() -> anyhow::Result<()> {
         let sql = reset_tenant_password_sql("tenant_user");
         assert_eq!(
             sql,
             "ALTER USER `tenant_user` IDENTIFIED WITH sha256_password BY __DBEV_CLICKHOUSE_PASSWORD_LITERAL__;"
         );
         assert_eq!(
-            password_sql_fragments(&sql).unwrap().0,
+            password_sql_fragments(&sql)?.0,
             "ALTER USER `tenant_user` IDENTIFIED WITH sha256_password BY "
         );
+
+        Ok(())
     }
 
     #[test]

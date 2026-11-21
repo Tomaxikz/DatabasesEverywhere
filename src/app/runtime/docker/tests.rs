@@ -27,34 +27,42 @@ use crate::{
 };
 
 #[test]
-fn create_body_does_not_publish_backend_ports_by_default() {
+fn create_body_does_not_publish_backend_ports_by_default() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let rootless_podman = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
     );
     for runtime in [test_runtime(), rootless_podman] {
-        let body = runtime.create_body(&postgres_spec()).unwrap();
-        let host_config = body.host_config.unwrap();
+        let body = runtime.create_body(&postgres_spec())?;
+        let host_config = body.host_config.context(
+            "create body does not publish backend ports by default should provide a value",
+        )?;
 
         assert!(host_config.port_bindings.is_none());
         assert!(body.exposed_ports.is_none());
         assert_eq!(host_config.network_mode, Some("none".to_string()));
         assert_eq!(body.stop_timeout, Some(30));
     }
+
+    Ok(())
 }
 
 #[test]
-fn every_database_uses_one_bounded_console_history_without_log_binds() {
+fn every_database_uses_one_bounded_console_history_without_log_binds() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     use crate::config::DaemonEngine;
     for engine in [DaemonEngine::Docker, DaemonEngine::Podman] {
         let runtime = test_runtime_with_engine(engine, "auto");
         for protocol in Protocol::ALL {
             let mut spec = postgres_spec();
             spec.protocol = protocol;
-            let body = runtime.create_body(&spec).unwrap();
-            let host = body.host_config.unwrap();
+            let body = runtime.create_body(&spec)?;
+            let host = body.host_config.context("expected body.host config")?;
             assert_eq!(host.restart_policy, Some(startup::no_restarts()));
-            let logs = host.log_config.unwrap();
+            let logs = host.log_config.context("expected host.log config")?;
             assert_eq!(
                 logs.typ.as_deref(),
                 Some(if engine == DaemonEngine::Docker {
@@ -63,7 +71,7 @@ fn every_database_uses_one_bounded_console_history_without_log_binds() {
                     "k8s-file"
                 })
             );
-            let options = logs.config.unwrap();
+            let options = logs.config.context("expected logs.config")?;
             assert_eq!(options.get("max-size").map(String::as_str), Some("5m"));
             if engine == DaemonEngine::Docker {
                 assert_eq!(options.get("max-file").map(String::as_str), Some("1"));
@@ -71,52 +79,71 @@ fn every_database_uses_one_bounded_console_history_without_log_binds() {
             }
             assert_eq!(
                 body.labels
-                    .unwrap()
+                    .context("every database uses one bounded console history without log binds should provide a value")?
                     .get("dbev.console-policy")
                     .map(String::as_str),
                 Some("1")
             );
-            assert!(!host.mounts.unwrap().iter().any(|mount| matches!(
+            assert!(!host.mounts.expect("every database uses one bounded console history without log binds should provide a value").iter().any(|mount| matches!(
                 mount.target.as_deref(),
                 Some("/logs" | "/var/log/clickhouse-server")
             )));
         }
     }
+
+    Ok(())
 }
 
 #[test]
-fn clickhouse_uses_a_loopback_resolvable_hostname_with_network_disabled() {
+fn clickhouse_uses_a_loopback_resolvable_hostname_with_network_disabled() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let runtime = test_runtime();
     let mut spec = postgres_spec();
     spec.protocol = Protocol::Clickhouse;
 
-    let body = runtime.create_body(&spec).unwrap();
+    let body = runtime.create_body(&spec)?;
 
     assert_eq!(body.hostname.as_deref(), Some("localhost"));
     assert_eq!(
-        body.host_config.unwrap().network_mode.as_deref(),
+        body.host_config.context("clickhouse uses a loopback resolvable hostname with network disabled should provide a value")?.network_mode.as_deref(),
         Some("none")
     );
+
+    Ok(())
 }
 
 #[test]
-fn create_body_includes_limits_labels_and_security() {
+fn create_body_includes_limits_labels_and_security() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let runtime = test_runtime().with_node_id("node-test");
     let mut spec = postgres_spec();
     spec.pids_limit = Some(4096);
-    let body = runtime.create_body(&spec).unwrap();
-    let host_config = body.host_config.unwrap();
-    let labels = body.labels.unwrap();
+    let body = runtime.create_body(&spec)?;
+    let host_config = body
+        .host_config
+        .context("create body includes limits labels and security should provide a value")?;
+    let labels = body
+        .labels
+        .context("create body includes limits labels and security should provide a value")?;
 
     assert_eq!(host_config.pids_limit, Some(4096));
-    assert!(host_config.mounts.as_ref().unwrap().iter().any(|mount| {
-        mount.target.as_deref() == Some("/var/lib/postgresql")
-            && mount
-                .source
-                .as_deref()
-                .unwrap_or_default()
-                .ends_with("/data")
-    }));
+    assert!(
+        host_config
+            .mounts
+            .as_ref()
+            .expect("create body includes limits labels and security should provide a value")
+            .iter()
+            .any(|mount| {
+                mount.target.as_deref() == Some("/var/lib/postgresql")
+                    && mount
+                        .source
+                        .as_deref()
+                        .unwrap_or_default()
+                        .ends_with("/data")
+            })
+    );
     assert_eq!(host_config.nano_cpus, Some(1_000_000_000));
     assert_eq!(host_config.memory, Some(512 * 1024 * 1024));
     assert_eq!(
@@ -137,10 +164,12 @@ fn create_body_includes_limits_labels_and_security() {
         host_config.security_opt,
         Some(vec!["no-new-privileges".to_string()])
     );
+
+    Ok(())
 }
 
 #[test]
-fn create_body_disables_permanent_healthchecks_for_every_engine() {
+fn create_body_disables_permanent_healthchecks_for_every_engine() -> anyhow::Result<()> {
     let docker = test_runtime();
     let runtime = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
@@ -148,31 +177,35 @@ fn create_body_disables_permanent_healthchecks_for_every_engine() {
     );
 
     for body in [
-        docker.create_body(&postgres_spec()).unwrap(),
-        runtime.create_body(&postgres_spec()).unwrap(),
+        docker.create_body(&postgres_spec())?,
+        runtime.create_body(&postgres_spec())?,
     ] {
         assert_eq!(
             body.healthcheck.and_then(|healthcheck| healthcheck.test),
             Some(vec!["NONE".to_string()])
         );
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn create_preflight_creates_missing_managed_mount_dirs() {
-    let temp = tempfile::tempdir().unwrap();
+async fn create_preflight_creates_missing_managed_mount_dirs() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let mut spec = postgres_spec();
     spec.data_path = temp.path().join("volumes").join("inst_abc");
 
-    ensure_bind_mount_sources(&spec).await.unwrap();
+    ensure_bind_mount_sources(&spec).await?;
 
     assert!(spec.data_path.is_dir());
     assert!(!temp.path().join("logs").exists());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn create_preflight_rejects_missing_read_only_file_mount() {
-    let temp = tempfile::tempdir().unwrap();
+async fn create_preflight_rejects_missing_read_only_file_mount() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let mut spec = postgres_spec();
     spec.data_path = temp.path().join("volumes").join("inst_abc");
     spec.extra_mounts.push(DockerMount {
@@ -181,13 +214,19 @@ async fn create_preflight_rejects_missing_read_only_file_mount() {
         read_only: true,
     });
 
-    let error = ensure_bind_mount_sources(&spec).await.unwrap_err();
+    let error = ensure_bind_mount_sources(&spec)
+        .await
+        .expect_err("ensure bind mount sources should return an error");
 
     assert!(matches!(error, DockerError::MountSourceIo { .. }));
+
+    Ok(())
 }
 
 #[test]
-fn rootless_podman_sets_user_and_keep_id_per_protocol() {
+fn rootless_podman_sets_user_and_keep_id_per_protocol() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let runtime = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
@@ -204,9 +243,14 @@ fn rootless_podman_sets_user_and_keep_id_per_protocol() {
         );
         let mut spec = postgres_spec();
         spec.protocol = protocol;
-        let body = runtime.create_body(&spec).unwrap();
+        let body = runtime.create_body(&spec)?;
         assert_eq!(
-            body.host_config.unwrap().userns_mode.as_deref(),
+            body.host_config
+                .context(
+                    "rootless podman sets user and keep id per protocol should provide a value"
+                )?
+                .userns_mode
+                .as_deref(),
             Some("keep-id:uid=999,gid=999")
         );
     }
@@ -223,12 +267,19 @@ fn rootless_podman_sets_user_and_keep_id_per_protocol() {
         );
         let mut spec = postgres_spec();
         spec.protocol = protocol;
-        let body = runtime.create_body(&spec).unwrap();
+        let body = runtime.create_body(&spec)?;
         assert_eq!(
-            body.host_config.unwrap().userns_mode.as_deref(),
+            body.host_config
+                .context(
+                    "rootless podman sets user and keep id per protocol should provide a value"
+                )?
+                .userns_mode
+                .as_deref(),
             Some("host")
         );
     }
+
+    Ok(())
 }
 
 #[test]
@@ -239,14 +290,14 @@ fn unsafe_instance_id_is_rejected() {
 
     let error = runtime
         .container_name(spec.protocol, &spec.instance_id)
-        .unwrap_err();
+        .expect_err("container name should return an error");
 
     assert!(matches!(error, DockerError::InvalidId(_)));
 }
 
 #[test]
-fn limit_conversion_uses_docker_api_units_and_rejects_overflow() {
-    let body = DockerRuntime::update_limits_body(2.0, 2048).unwrap();
+fn limit_conversion_uses_docker_api_units_and_rejects_overflow() -> anyhow::Result<()> {
+    let body = DockerRuntime::update_limits_body(2.0, 2048)?;
 
     assert_eq!(body.nano_cpus, Some(2_000_000_000));
     assert_eq!(body.memory, Some(2048 * 1024 * 1024));
@@ -256,10 +307,12 @@ fn limit_conversion_uses_docker_api_units_and_rejects_overflow() {
     assert_eq!(cpu_to_nano(f64::NAN), None);
     assert_eq!(cpu_to_nano(f64::INFINITY), None);
 
-    let memory_error = DockerRuntime::update_limits_body(1.0, 1_u64 << 44).unwrap_err();
+    let memory_error = DockerRuntime::update_limits_body(1.0, 1_u64 << 44)
+        .expect_err("update limits body should return an error");
     assert!(matches!(memory_error, DockerError::ResourceLimit(_)));
 
-    let cpu_error = DockerRuntime::update_limits_body(f64::INFINITY, 1024).unwrap_err();
+    let cpu_error = DockerRuntime::update_limits_body(f64::INFINITY, 1024)
+        .expect_err("update limits body should return an error");
     assert!(matches!(cpu_error, DockerError::ResourceLimit(_)));
 
     const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -270,25 +323,29 @@ fn limit_conversion_uses_docker_api_units_and_rejects_overflow() {
         Some((largest_mib * BYTES_PER_MIB) as i64)
     );
     assert_eq!(mib_to_bytes(largest_mib + 1), None);
+
+    Ok(())
 }
 
 #[test]
-fn transfer_archive_preserves_private_numeric_ownership() {
-    let bytes = transfer_tar_header("dump.sql", 12, 1001, 1002).unwrap();
+fn transfer_archive_preserves_private_numeric_ownership() -> anyhow::Result<()> {
+    let bytes = transfer_tar_header("dump.sql", 12, 1001, 1002)?;
     let header = tar::Header::from_byte_slice(&bytes);
 
-    assert_eq!(header.path().unwrap(), std::path::Path::new("dump.sql"));
-    assert_eq!(header.size().unwrap(), 12);
-    assert_eq!(header.mode().unwrap(), 0o600);
-    assert_eq!(header.uid().unwrap(), 1001);
-    assert_eq!(header.gid().unwrap(), 1002);
+    assert_eq!(header.path()?, std::path::Path::new("dump.sql"));
+    assert_eq!(header.size()?, 12);
+    assert_eq!(header.mode()?, 0o600);
+    assert_eq!(header.uid()?, 1001);
+    assert_eq!(header.gid()?, 1002);
     assert_eq!(numeric_container_user("1001:1002"), Some((1001, 1002)));
     assert_eq!(numeric_container_user("1001"), Some((1001, 1001)));
     assert_eq!(numeric_container_user("postgres"), None);
+
+    Ok(())
 }
 
 #[test]
-fn managed_container_verification_requires_the_exact_ownership_tuple() {
+fn managed_container_verification_requires_the_exact_ownership_tuple() -> anyhow::Result<()> {
     let container = "dbe-postgres-inst_test";
     let mut labels = HashMap::from([
         (MANAGED_LABEL.to_string(), "true".to_string()),
@@ -302,13 +359,12 @@ fn managed_container_verification_requires_the_exact_ownership_tuple() {
         Protocol::Postgres,
         "inst_test",
         Some("node-a"),
-    )
-    .unwrap();
+    )?;
 
     labels.insert(PROTOCOL_LABEL.to_string(), "redis".to_string());
     let error =
         verify_managed_instance_labels(&labels, container, Protocol::Postgres, "inst_test", None)
-            .unwrap_err();
+            .expect_err("verify managed instance labels should return an error");
     assert!(matches!(
         error,
         DockerError::UntrustedContainerNameCollision { .. }
@@ -334,12 +390,14 @@ fn managed_container_verification_requires_the_exact_ownership_tuple() {
         "inst_test",
         Some("node-a"),
     )
-    .unwrap_err();
+    .expect_err("verify managed instance labels should return an error");
 
     assert!(matches!(
         error,
         DockerError::UntrustedContainerNameCollision { .. }
     ));
+
+    Ok(())
 }
 
 #[test]
@@ -367,50 +425,59 @@ fn destructive_managed_container_selection_is_scoped_to_one_node() {
 }
 
 #[test]
-fn container_download_does_not_delete_an_existing_target() {
-    let temp = tempfile::tempdir().unwrap();
+fn container_download_does_not_delete_an_existing_target() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let target = temp.path().join("dump.sql");
-    std::fs::write(&target, b"existing").unwrap();
+    std::fs::write(&target, b"existing")?;
     let archive = single_file_archive("dump.sql", b"replacement");
 
     assert!(extract_one_file(std::io::Cursor::new(archive), "dump.sql", &target).is_err());
-    assert_eq!(std::fs::read(target).unwrap(), b"existing");
+    assert_eq!(std::fs::read(target)?, b"existing");
+
+    Ok(())
 }
 
 #[test]
-fn container_download_creates_a_private_regular_file() {
+fn container_download_creates_a_private_regular_file() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir()?;
     let target = temp.path().join("dump.sql");
     let archive = single_file_archive("dump.sql", b"contents");
 
-    extract_one_file(std::io::Cursor::new(archive), "dump.sql", &target).unwrap();
+    extract_one_file(std::io::Cursor::new(archive), "dump.sql", &target)?;
 
-    assert_eq!(std::fs::read(&target).unwrap(), b"contents");
+    assert_eq!(std::fs::read(&target)?, b"contents");
     assert_eq!(
-        std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+        std::fs::metadata(target)?.permissions().mode() & 0o777,
         0o600
     );
+
+    Ok(())
 }
 
 #[test]
-fn container_download_rejects_entries_over_the_byte_limit_without_partial_output() {
-    let temp = tempfile::tempdir().unwrap();
+fn container_download_rejects_entries_over_the_byte_limit_without_partial_output()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let target = temp.path().join("dump.sql");
     let archive = single_file_archive("dump.sql", b"too-large");
 
     let error = extract_one_file_with_limit(std::io::Cursor::new(archive), "dump.sql", &target, 4)
-        .unwrap_err();
+        .expect_err("extract one file with limit should return an error");
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("4-byte limit"));
     assert!(!target.exists());
+
+    Ok(())
 }
 
 #[test]
-fn container_download_deadline_removes_partial_output() {
-    let temp = tempfile::tempdir().unwrap();
+fn container_download_deadline_removes_partial_output() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let temp = tempfile::tempdir()?;
     let target = temp.path().join("dump.sql");
     let archive = single_file_archive("dump.sql", b"contents");
 
@@ -419,23 +486,35 @@ fn container_download_deadline_removes_partial_output() {
         "dump.sql",
         &target,
         MAX_CONTAINER_TRANSFER_BYTES,
-        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .context("expected a value from checked_sub")?,
     )
-    .unwrap_err();
+    .expect_err("from secs should return an error");
 
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(!target.exists());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn container_download_stream_emits_timeout_at_deadline() {
+async fn container_download_stream_emits_timeout_at_deadline() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let source = futures::stream::pending::<Result<Bytes, IoError>>();
     let mut stream = Box::pin(stream_with_deadline(source, tokio::time::Instant::now()));
 
-    let error = stream.next().await.unwrap().unwrap_err();
+    let error = stream
+        .next()
+        .await
+        .context("expected a value from next")?
+        .expect_err("next should return an error");
 
     assert_eq!(error.kind(), ErrorKind::TimedOut);
     assert!(stream.next().await.is_none());
+
+    Ok(())
 }
 
 #[test]
@@ -464,8 +543,10 @@ fn single_file_archive(path: &str, contents: &[u8]) -> Vec<u8> {
         header.set_mode(0o600);
         header.set_size(contents.len() as u64);
         header.set_cksum();
-        archive.append_data(&mut header, path, contents).unwrap();
-        archive.finish().unwrap();
+        archive
+            .append_data(&mut header, path, contents)
+            .expect("append data should succeed");
+        archive.finish().expect("finish should succeed");
     }
     bytes
 }
@@ -511,8 +592,8 @@ fn postgres_spec() -> DockerInstanceSpec {
 }
 
 #[test]
-fn a_missing_podman_socket_is_reported_with_the_unit_that_provides_it() {
-    let directory = tempfile::tempdir().unwrap();
+fn a_missing_podman_socket_is_reported_with_the_unit_that_provides_it() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let expect_unit = |socket_path: String, unit: &str| {
         let config = crate::config::DaemonConfig {
             engine: crate::config::DaemonEngine::Podman,
@@ -545,4 +626,6 @@ fn a_missing_podman_socket_is_reported_with_the_unit_that_provides_it() {
         DockerRuntime::new(&docker, false),
         Err(DockerError::PodmanSocketMissing { .. })
     ));
+
+    Ok(())
 }

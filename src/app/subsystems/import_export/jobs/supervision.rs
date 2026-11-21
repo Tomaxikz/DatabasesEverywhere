@@ -665,11 +665,13 @@ mod tests {
     use tokio::sync::Notify;
 
     #[tokio::test]
-    async fn panic_recovery_keeps_the_instance_fenced_and_admission_active() {
+    async fn panic_recovery_keeps_the_instance_fenced_and_admission_active() -> anyhow::Result<()> {
         let locks = InstanceLocks::default();
         let follower_locks = locks.clone();
         let jobs = ImportExportJobs::default();
-        let admission = jobs.try_admit("panic-fence").unwrap();
+        let admission = jobs
+            .try_admit("panic-fence")
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let recovery_started = Arc::new(Notify::new());
         let release_recovery = Arc::new(Notify::new());
         let supervisor = {
@@ -679,7 +681,7 @@ mod tests {
                 let _admission = admission;
                 let _operation = locks.lock("panic-fence").await;
                 let worker = tokio::spawn(async { panic!("injected worker panic") });
-                assert!(worker.await.unwrap_err().is_panic());
+                assert!(worker.await.expect_err("panic recovery keeps the instance fenced and admission active should return an error").is_panic());
                 recovery_started.notify_one();
                 release_recovery.notified().await;
             })
@@ -693,8 +695,10 @@ mod tests {
         assert!(!follower.is_finished());
 
         release_recovery.notify_one();
-        supervisor.await.unwrap();
-        follower.await.unwrap();
+        supervisor.await?;
+        follower.await?;
         assert!(jobs.wait_for_drain(Duration::from_secs(1)).await);
+
+        Ok(())
     }
 }

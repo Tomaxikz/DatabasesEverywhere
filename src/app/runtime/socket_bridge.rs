@@ -68,7 +68,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_bridges_before_emitting_strict_supervisor_arguments() {
+    fn validates_bridges_before_emitting_strict_supervisor_arguments() -> anyhow::Result<()> {
         let bridge = SocketBridge {
             socket_path: "/run/dbev/native.sock".to_string(),
             target: loopback_target(9000),
@@ -93,7 +93,9 @@ mod tests {
         }));
         assert!(!is_valid_bridge(&SocketBridge {
             socket_path: "/run/dbev/native.sock".to_string(),
-            target: "0.0.0.0:9000".parse().unwrap(),
+            target: "0.0.0.0:9000".parse()?,
         }));
+
+        Ok(())
     }
 }

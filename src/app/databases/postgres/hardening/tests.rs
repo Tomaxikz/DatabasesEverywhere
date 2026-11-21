@@ -5,7 +5,9 @@ use crate::{
 };
 
 #[test]
-fn migration_replaces_all_local_authentication_with_scram() {
+fn migration_replaces_all_local_authentication_with_scram() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let script = hardening_script("tenant_user");
 
     assert!(script.contains("local all all scram-sha-256"));
@@ -37,15 +39,27 @@ fn migration_replaces_all_local_authentication_with_scram() {
     assert!(script.contains("mv -f \"$hba_tmp\" \"$hba_file\""));
     assert!(script.contains("case \"$replication_ownership\" in"));
     assert!(script.contains("dbe-managed-replication-v1"));
-    let probe = script.find("replication_ownership=$(admin_psql").unwrap();
-    let decision = script.find("case \"$replication_ownership\" in").unwrap();
-    let confirmed_probe = script.find("confirmed=$(admin_psql").unwrap();
+    let probe = script
+        .find("replication_ownership=$(admin_psql")
+        .context("expected a value from find")?;
+    let decision = script
+        .find("case \"$replication_ownership\" in")
+        .context("expected a value from find")?;
+    let confirmed_probe = script
+        .find("confirmed=$(admin_psql")
+        .context("expected a value from find")?;
     assert!(probe < decision && decision < confirmed_probe);
 
     let candidate = shell_case_arm(&script, "candidate");
-    let begin = candidate.find("BEGIN;").unwrap();
-    let create = candidate.find("CREATE ROLE").unwrap();
-    let commit = candidate.find("COMMIT;").unwrap();
+    let begin = candidate
+        .find("BEGIN;")
+        .context("expected a value from find")?;
+    let create = candidate
+        .find("CREATE ROLE")
+        .context("expected a value from find")?;
+    let commit = candidate
+        .find("COMMIT;")
+        .context("expected a value from find")?;
     assert!(begin < create && create < commit);
     assert!(candidate.contains("COMMENT ON ROLE"));
     assert!(candidate.contains("replication_password"));
@@ -70,8 +84,10 @@ fn migration_replaces_all_local_authentication_with_scram() {
 
     let skipped = script
         .find("if [ \"$replication_capture_blocked\" != true ]")
-        .unwrap();
-    let confirmed = script.find("confirmed=$(admin_psql").unwrap();
+        .context("expected a value from find")?;
+    let confirmed = script
+        .find("confirmed=$(admin_psql")
+        .context("expected a value from find")?;
     assert!(skipped < confirmed);
     assert!(foreign_replication_role_diagnostic().contains("rename or drop"));
 
@@ -80,6 +96,8 @@ fn migration_replaces_all_local_authentication_with_scram() {
     assert!(owned.contains("replication_auth_failed"));
     assert!(owned.contains("ALTER ROLE"));
     assert!(owned.contains("COMMENT ON ROLE"));
+
+    Ok(())
 }
 
 fn shell_case_arm<'a>(script: &'a str, label: &str) -> &'a str {

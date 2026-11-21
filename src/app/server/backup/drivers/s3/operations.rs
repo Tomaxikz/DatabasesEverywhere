@@ -314,14 +314,14 @@ mod tests {
     }
 
     #[test]
-    fn only_journaled_uploads_of_owned_keys_are_aborted() {
+    fn only_journaled_uploads_of_owned_keys_are_aborted() -> anyhow::Result<()> {
         let upload = |key: &str| PublicationResource::S3MultipartUpload {
             key: key.to_string(),
             upload_id: "id".to_string(),
         };
         let owned = ["p/a", "p/a.catalog.json"];
         assert_eq!(
-            journaled_uploads(&[upload("p/a")], &owned).unwrap(),
+            journaled_uploads(&[upload("p/a")], &owned)?,
             vec![("p/a", "id")]
         );
         assert!(journaled_uploads(&[upload("p/other")], &owned).is_err());
@@ -332,5 +332,7 @@ mod tests {
             )
             .is_err()
         );
+
+        Ok(())
     }
 }

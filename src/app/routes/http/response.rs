@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_error_responses_contain_only_an_opaque_error_id() {
+    async fn server_error_responses_contain_only_an_opaque_error_id() -> anyhow::Result<()> {
         for error in [
             ApiError::Runtime(
                 "docker failed; recent logs: password=hunter2 /var/lib/private".to_string(),
@@ -376,12 +376,9 @@ mod tests {
             },
         ] {
             let response = error.into_response();
-            let error_id = response.headers()[ERROR_ID_HEADER]
-                .to_str()
-                .unwrap()
-                .to_string();
-            let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let error_id = response.headers()[ERROR_ID_HEADER].to_str()?.to_string();
+            let body = to_bytes(response.into_body(), 16 * 1024).await?;
+            let body: serde_json::Value = serde_json::from_slice(&body)?;
 
             assert_eq!(body["error"], "internal server error");
             assert_eq!(body["code"], "internal_error");
@@ -389,24 +386,27 @@ mod tests {
             assert!(!body.to_string().contains("hunter2"));
             assert!(!body.to_string().contains("/var/lib/private"));
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn optional_json_rejects_a_declared_body_without_content_type() {
+    async fn optional_json_rejects_a_declared_body_without_content_type() -> anyhow::Result<()> {
         let request = Request::builder()
             .header(header::CONTENT_LENGTH, "2")
-            .body(Body::from("{}"))
-            .unwrap();
+            .body(Body::from("{}"))?;
 
         let error = ApiOptionalJson::<serde_json::Value>::from_request(request, &())
             .await
-            .unwrap_err();
+            .expect_err("from request should return an error");
 
         assert_eq!(error.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn json_shape_errors_use_the_documented_422_status() {
+    async fn json_shape_errors_use_the_documented_422_status() -> anyhow::Result<()> {
         #[derive(Debug, serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct RequestBody {
@@ -416,13 +416,14 @@ mod tests {
 
         let request = Request::builder()
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"unknown":"shared"}"#))
-            .unwrap();
+            .body(Body::from(r#"{"unknown":"shared"}"#))?;
         let error = ApiJson::<RequestBody>::from_request(request, &())
             .await
-            .unwrap_err();
+            .expect_err("from request should return an error");
 
         assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        Ok(())
     }
 
     #[test]

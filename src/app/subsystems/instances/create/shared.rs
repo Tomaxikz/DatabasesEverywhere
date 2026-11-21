@@ -608,7 +608,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lost_create_ack_only_adopts_exact_metadata_and_secrets() {
+    fn lost_create_ack_only_adopts_exact_metadata_and_secrets() -> anyhow::Result<()> {
         let mut expected: InstanceMetadata = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "instance_id": "tenant-a",
@@ -629,8 +629,7 @@ mod tests {
             },
             "created_at": "2026-08-27T00:00:00Z",
             "updated_at": "2026-08-27T00:00:00Z"
-        }))
-        .unwrap();
+        }))?;
         expected.tenant_password = Some("tenant-secret".to_string());
         let mut stored = expected.clone();
         assert!(same_created_tenant(&stored, &expected));
@@ -640,5 +639,7 @@ mod tests {
         stored = expected.clone();
         stored.public.port += 1;
         assert!(!same_created_tenant(&stored, &expected));
+
+        Ok(())
     }
 }

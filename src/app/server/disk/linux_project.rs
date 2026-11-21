@@ -183,7 +183,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requires_a_project_quota_mount_option_alias() {
+    fn requires_a_project_quota_mount_option_alias() -> anyhow::Result<()> {
         for (fstype, option, enabled) in [
             ("ext4", "errors=remount-ro", false),
             ("ext4", "prjquota", true),
@@ -198,13 +198,17 @@ mod tests {
             );
 
             if enabled {
-                result.unwrap();
+                result?;
             } else {
                 assert!(matches!(
-                    result.unwrap_err(),
+                    result.expect_err(
+                        "requires a project quota mount option alias should return an error"
+                    ),
                     DiskLimitError::ProjectQuotaNotEnabled { .. }
                 ));
             }
         }
+
+        Ok(())
     }
 }

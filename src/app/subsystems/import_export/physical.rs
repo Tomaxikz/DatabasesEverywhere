@@ -751,15 +751,15 @@ mod transaction_tests {
     use super::*;
 
     #[tokio::test]
-    async fn restored_resp_acl_uses_current_credentials_and_preserves_data() {
+    async fn restored_resp_acl_uses_current_credentials_and_preserves_data() -> anyhow::Result<()> {
         for protocol in [Protocol::Redis, Protocol::Valkey] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir()?;
             let mut metadata = crate::server::test_support::metadata("tenant", protocol);
             metadata.tenant_password = Some("current-credential".to_string());
-            std::fs::write(dir.path().join("users.acl"), b"archived credential").unwrap();
-            std::fs::write(dir.path().join("dump.rdb"), b"database contents").unwrap();
-            restore_credentials(&metadata, dir.path()).await.unwrap();
-            let acl = std::fs::read_to_string(dir.path().join("users.acl")).unwrap();
+            std::fs::write(dir.path().join("users.acl"), b"archived credential")?;
+            std::fs::write(dir.path().join("dump.rdb"), b"database contents")?;
+            restore_credentials(&metadata, dir.path()).await?;
+            let acl = std::fs::read_to_string(dir.path().join("users.acl"))?;
             assert!(!acl.contains("archived credential"));
             assert!(
                 acl.contains(&crate::gateway::protocols::redis::password_route_sha256(
@@ -767,12 +767,14 @@ mod transaction_tests {
                 ))
             );
             assert_eq!(
-                std::fs::read(dir.path().join("dump.rdb")).unwrap(),
+                std::fs::read(dir.path().join("dump.rdb"))?,
                 b"database contents"
             );
             metadata.tenant_password = None;
             assert!(restore_credentials(&metadata, dir.path()).await.is_err());
         }
+
+        Ok(())
     }
 
     #[test]
@@ -808,49 +810,40 @@ mod transaction_tests {
     }
 
     #[tokio::test]
-    async fn pending_replacement_rolls_previous_data_back_into_place() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn pending_replacement_rolls_previous_data_back_into_place() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let data_dir = temp.path().join("data");
         let workspace = temp.path().join("restore-workspace");
         let backup_dir = workspace.join("previous-data");
-        tokio::fs::create_dir_all(&data_dir).await.unwrap();
-        tokio::fs::create_dir_all(&backup_dir).await.unwrap();
-        tokio::fs::write(data_dir.join("new.rdb"), b"rejected")
-            .await
-            .unwrap();
-        tokio::fs::write(backup_dir.join("old.rdb"), b"healthy")
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&data_dir).await?;
+        tokio::fs::create_dir_all(&backup_dir).await?;
+        tokio::fs::write(data_dir.join("new.rdb"), b"rejected").await?;
+        tokio::fs::write(backup_dir.join("old.rdb"), b"healthy").await?;
         let replacement = PendingDataReplacement {
             data_dir: data_dir.clone(),
             workspace: workspace.clone(),
             backup_dir,
         };
 
-        replacement.rollback().await.unwrap();
+        replacement.rollback().await?;
 
-        assert_eq!(
-            tokio::fs::read(data_dir.join("old.rdb")).await.unwrap(),
-            b"healthy"
-        );
+        assert_eq!(tokio::fs::read(data_dir.join("old.rdb")).await?, b"healthy");
         assert!(!data_dir.join("new.rdb").exists());
         assert!(!workspace.exists());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn pending_replacement_deletes_previous_data_only_on_commit() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn pending_replacement_deletes_previous_data_only_on_commit() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let data_dir = temp.path().join("data");
         let workspace = temp.path().join("restore-workspace");
         let backup_dir = workspace.join("previous-data");
-        tokio::fs::create_dir_all(&data_dir).await.unwrap();
-        tokio::fs::create_dir_all(&backup_dir).await.unwrap();
-        tokio::fs::write(data_dir.join("new.rdb"), b"validated")
-            .await
-            .unwrap();
-        tokio::fs::write(backup_dir.join("old.rdb"), b"healthy")
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&data_dir).await?;
+        tokio::fs::create_dir_all(&backup_dir).await?;
+        tokio::fs::write(data_dir.join("new.rdb"), b"validated").await?;
+        tokio::fs::write(backup_dir.join("old.rdb"), b"healthy").await?;
         let replacement = PendingDataReplacement {
             data_dir: data_dir.clone(),
             workspace: workspace.clone(),
@@ -861,9 +854,11 @@ mod transaction_tests {
         replacement.commit().await;
 
         assert_eq!(
-            tokio::fs::read(data_dir.join("new.rdb")).await.unwrap(),
+            tokio::fs::read(data_dir.join("new.rdb")).await?,
             b"validated"
         );
         assert!(!workspace.exists());
+
+        Ok(())
     }
 }

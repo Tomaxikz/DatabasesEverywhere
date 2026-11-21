@@ -196,26 +196,36 @@ mod tests {
     ];
 
     #[test]
-    fn default_servers_with_headroom_are_captured() {
-        let inventory = parse_report(&report("redis_version", "8.8.0", &DEFAULTS)).unwrap();
+    fn default_servers_with_headroom_are_captured() -> anyhow::Result<()> {
+        let inventory = parse_report(&report("redis_version", "8.8.0", &DEFAULTS))
+            .map_err(anyhow::Error::msg)?;
         assert_eq!(inventory.server_version, "8.8.0");
         assert_eq!(inventory.cli_version, "8.8.0");
-        inventory.decide(1024).unwrap();
+        inventory.decide(1024)?;
         assert!(matches!(
             inventory.decide(199),
             Err(StrategyError::Failed(_))
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn valkey_reports_its_own_version() {
+    fn valkey_reports_its_own_version() -> anyhow::Result<()> {
         let mut text = report("redis_version", "7.2.4", &DEFAULTS);
         text = text.replace("os:Linux", "valkey_version:9.1.1");
-        assert_eq!(parse_report(&text).unwrap().server_version, "9.1.1");
+        assert_eq!(
+            parse_report(&text)
+                .map_err(anyhow::Error::msg)?
+                .server_version,
+            "9.1.1"
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn unsafe_settings_and_old_servers_are_unsupported() {
+    fn unsafe_settings_and_old_servers_are_unsupported() -> anyhow::Result<()> {
         for (key, value) in [
             ("repl-diskless-sync", "no"),
             ("rdbchecksum", "no"),
@@ -226,27 +236,35 @@ mod tests {
                 .iter()
                 .map(|&(name, default)| (name, if name == key { value } else { default }))
                 .collect();
-            let inventory = parse_report(&report("redis_version", "8.8.0", &config)).unwrap();
+            let inventory = parse_report(&report("redis_version", "8.8.0", &config))
+                .map_err(anyhow::Error::msg)?;
             assert!(
                 matches!(inventory.decide(1024), Err(StrategyError::Unsupported(_))),
                 "{key}"
             );
         }
-        let old = parse_report(&report("redis_version", "6.2.14", &DEFAULTS)).unwrap();
+        let old = parse_report(&report("redis_version", "6.2.14", &DEFAULTS))
+            .map_err(anyhow::Error::msg)?;
         assert!(matches!(
             old.decide(1024),
             Err(StrategyError::Unsupported(_))
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn incomplete_reports_are_rejected() {
+    fn incomplete_reports_are_rejected() -> anyhow::Result<()> {
         assert!(parse_report(&report("redis_version", "8.8.0", &DEFAULTS[..3])).is_err());
         assert!(parse_report("[cli]\nredis-cli 8.8.0\n").is_err());
         let loading = report("redis_version", "8.8.0", &DEFAULTS).replace("loading:0", "loading:1");
         assert!(matches!(
-            parse_report(&loading).unwrap().decide(1024),
+            parse_report(&loading)
+                .map_err(anyhow::Error::msg)?
+                .decide(1024),
             Err(StrategyError::Failed(_))
         ));
+
+        Ok(())
     }
 }

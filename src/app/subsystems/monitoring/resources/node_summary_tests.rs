@@ -48,16 +48,18 @@ fn generic_disk_sampler_excludes_shared_pool_roots() {
 }
 
 #[test]
-fn parses_host_cpu_and_calculates_non_idle_percentage() {
-    let previous =
-        parse_host_cpu("cpu  100 0 50 850 0 0 0 0 0 0\ncpu0 50 0 25 425\ncpu1 50 0 25 425\nctxt 0\nbtime 0\nprocesses 0\n")
-            .unwrap();
-    let current =
-        parse_host_cpu("cpu  150 0 100 950 0 0 0 0 0 0\ncpu0 75 0 50 475\ncpu1 75 0 50 475\nctxt 0\nbtime 0\nprocesses 0\n")
-            .unwrap();
+fn parses_host_cpu_and_calculates_non_idle_percentage() -> anyhow::Result<()> {
+    let previous = parse_host_cpu(
+        "cpu  100 0 50 850 0 0 0 0 0 0\ncpu0 50 0 25 425\ncpu1 50 0 25 425\nctxt 0\nbtime 0\nprocesses 0\n",
+    )?;
+    let current = parse_host_cpu(
+        "cpu  150 0 100 950 0 0 0 0 0 0\ncpu0 75 0 50 475\ncpu1 75 0 50 475\nctxt 0\nbtime 0\nprocesses 0\n",
+    )?;
 
     assert_eq!(current.cores, 2);
     assert_eq!(host_cpu_percent_between(previous, current), Some(50.0));
+
+    Ok(())
 }
 
 #[test]
@@ -147,7 +149,9 @@ fn local_cgroup_samples_match_the_engine_api_metrics() {
 }
 
 #[tokio::test]
-async fn polling_stats_workers_ignore_superseded_samples() {
+async fn polling_stats_workers_ignore_superseded_samples() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let cache = ResourceCache::default();
     let first_worker = cache.begin_runtime_stats_worker("inst_stats").await;
     let second_worker = cache.begin_runtime_stats_worker("inst_stats").await;
@@ -182,9 +186,14 @@ async fn polling_stats_workers_ignore_superseded_samples() {
             .store_runtime_stats("inst_stats", second_worker, Some(11.0), memory_usage_bytes)
             .await
     );
-    let sample = cache.runtime_stats("inst_stats").await.unwrap();
+    let sample = cache
+        .runtime_stats("inst_stats")
+        .await
+        .context("expected a value from runtime_stats")?;
     assert_eq!(sample.cpu_usage_percent, Some(11.0));
     assert_eq!(sample.memory_usage_bytes, Some(512));
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -295,7 +304,7 @@ async fn disk_invalidation_preserves_live_runtime_and_network_metrics() {
 }
 
 #[tokio::test]
-async fn scanner_snapshot_bypasses_the_fallback_disk_traversal() {
+async fn scanner_snapshot_bypasses_the_fallback_disk_traversal() -> anyhow::Result<()> {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -324,43 +333,52 @@ async fn scanner_snapshot_bypasses_the_fallback_disk_traversal() {
         Err::<u64, String>("fallback traversal must not run".to_string())
     })
     .await
-    .unwrap();
+    .map_err(anyhow::Error::msg)?;
 
     assert_eq!(used, 654);
     assert!(!fallback_called.load(Ordering::SeqCst));
+
+    Ok(())
 }
 
 #[test]
-fn parses_mem_available_as_scheduler_safe_host_memory() {
+fn parses_mem_available_as_scheduler_safe_host_memory() -> anyhow::Result<()> {
     let sample = parse_host_memory(
         "MemTotal:       1000 kB\nMemFree:         100 kB\nMemAvailable:    400 kB\n",
-    )
-    .unwrap();
+    )?;
 
     assert_eq!(sample.total_bytes, 1_024_000);
     assert_eq!(sample.available_bytes, 409_600);
     assert_eq!(sample.used_bytes, 614_400);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn host_disk_sample_uses_the_target_filesystem() {
-    let directory = tempfile::tempdir().unwrap();
-    let sample = read_host_disk(directory.path().to_str().unwrap())
-        .await
-        .unwrap();
+async fn host_disk_sample_uses_the_target_filesystem() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let directory = tempfile::tempdir()?;
+    let sample = read_host_disk(
+        directory
+            .path()
+            .to_str()
+            .context("expected a value from to_str")?,
+    )
+    .await?;
 
     assert!(sample.total_bytes > 0);
     assert!(sample.used_bytes <= sample.total_bytes);
     assert!(sample.available_bytes <= sample.total_bytes);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn capacity_measurement_ignores_a_stale_dashboard_disk_sample() {
-    let directory = tempfile::tempdir().unwrap();
+async fn capacity_measurement_ignores_a_stale_dashboard_disk_sample() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let data = directory.path().join("data.bin");
-    tokio::fs::write(&data, vec![0_u8; 7 * 1024 * 1024])
-        .await
-        .unwrap();
+    tokio::fs::write(&data, vec![0_u8; 7 * 1024 * 1024]).await?;
     let cache = ResourceCache::default();
     cache
         .store_disk_usage(
@@ -379,10 +397,12 @@ async fn capacity_measurement_ignores_a_stale_dashboard_disk_sample() {
             directory.path().to_path_buf(),
         )
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
 
     assert!(measured.used_bytes >= 7 * 1024 * 1024);
     assert!(measured.used_bytes < 8 * 1024 * 1024);
+
+    Ok(())
 }
 
 #[test]
@@ -568,7 +588,9 @@ fn shared_runtime(runtime_id: &str, protocol: Protocol) -> crate::server::placem
 }
 
 #[test]
-fn admin_shared_reports_separate_tenant_and_pool_usage() {
+fn admin_shared_reports_separate_tenant_and_pool_usage() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let stats = CachedRuntimeStats {
         cpu_usage_percent: Some(25.0),
         memory_usage_bytes: Some(1_024),
@@ -585,22 +607,25 @@ fn admin_shared_reports_separate_tenant_and_pool_usage() {
             memory_limit_bytes: mib_to_bytes(16_384),
         }),
         ResourceView::Admin,
-    )
-    .unwrap();
+    )?;
 
     assert_eq!(usage.cpu_usage_percent, None);
     assert_eq!(usage.memory_usage_bytes, None);
     assert_eq!(usage.memory_limit_bytes, None);
-    let pool = usage.pool.unwrap();
+    let pool = usage
+        .pool
+        .context("admin shared reports separate tenant and pool usage should provide a value")?;
     assert_eq!(pool.runtime_id, "mysql_pool_one");
     assert_eq!(pool.cpu_limit_cores, 8.0);
     assert_eq!(pool.cpu_usage_percent, Some(25.0));
     assert_eq!(pool.memory_limit_bytes, mib_to_bytes(16_384));
     assert_eq!(pool.memory_usage_bytes, Some(1_024));
+
+    Ok(())
 }
 
 #[test]
-fn dedicated_reports_keep_the_existing_runtime_usage_fields() {
+fn dedicated_reports_keep_the_existing_runtime_usage_fields() -> anyhow::Result<()> {
     let stats = CachedRuntimeStats {
         cpu_usage_percent: Some(11.0),
         memory_usage_bytes: Some(384),
@@ -614,13 +639,14 @@ fn dedicated_reports_keep_the_existing_runtime_usage_fields() {
         Some(&stats),
         None,
         ResourceView::Tenant,
-    )
-    .unwrap();
+    )?;
 
     assert_eq!(usage.cpu_usage_percent, Some(11.0));
     assert_eq!(usage.memory_usage_bytes, Some(384));
     assert_eq!(usage.memory_limit_bytes, Some(mib_to_bytes(512)));
     assert!(usage.pool.is_none());
+
+    Ok(())
 }
 
 #[test]
@@ -644,7 +670,7 @@ fn shared_report_missing_pool_capacity_returns_an_error() {
 }
 
 #[test]
-fn tenant_shared_reports_omit_physical_pool_usage() {
+fn tenant_shared_reports_omit_physical_pool_usage() -> anyhow::Result<()> {
     let stats = CachedRuntimeStats {
         cpu_usage_percent: Some(25.0),
         memory_usage_bytes: Some(1_024),
@@ -658,13 +684,14 @@ fn tenant_shared_reports_omit_physical_pool_usage() {
         Some(&stats),
         None,
         ResourceView::Tenant,
-    )
-    .unwrap();
+    )?;
 
     assert_eq!(usage.cpu_usage_percent, None);
     assert_eq!(usage.memory_usage_bytes, None);
     assert_eq!(usage.memory_limit_bytes, None);
     assert!(usage.pool.is_none());
+
+    Ok(())
 }
 
 #[test]

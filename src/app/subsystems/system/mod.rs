@@ -752,9 +752,12 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_recommendation_distinguishes_admission_from_execution_waiters() {
+    fn scheduler_recommendation_distinguishes_admission_from_execution_waiters()
+    -> anyhow::Result<()> {
         let jobs = crate::server::jobs::import_export::ImportExportJobs::default();
-        let _admitted = jobs.try_admit("inst-waiting-on-lock").unwrap();
+        let _admitted = jobs
+            .try_admit("inst-waiting-on-lock")
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let scheduler = jobs.scheduler_snapshot();
         let estimate = crate::server::jobs::import_export::JobResourceCost::estimate(
             crate::server::jobs::import_export::JobEstimateInput {
@@ -774,9 +777,11 @@ mod tests {
             max_queued_jobs: 1024,
             max_queued_jobs_per_instance: 32,
         };
-        let json = serde_json::to_value(response).unwrap();
+        let json = serde_json::to_value(response)?;
         assert_eq!(json["admitted_jobs"].as_u64(), Some(1));
         assert_eq!(json["scheduler"]["active_jobs"].as_u64(), Some(0));
         assert_eq!(json["scheduler"]["waiting_jobs"].as_u64(), Some(0));
+
+        Ok(())
     }
 }

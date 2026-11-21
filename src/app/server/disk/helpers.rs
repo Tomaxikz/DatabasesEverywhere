@@ -193,39 +193,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_replacement_volume_keeps_the_replaced_directory_owner_and_mode() {
-        let root = tempfile::tempdir().unwrap();
+    fn a_replacement_volume_keeps_the_replaced_directory_owner_and_mode() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
         let data = root.path().join("data");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let owner = std::fs::metadata(&data).unwrap();
+        std::fs::create_dir(&data)?;
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o750))?;
+        let owner = std::fs::metadata(&data)?;
 
-        let replaced = remove_empty_data_directory(&data).unwrap();
+        let replaced = remove_empty_data_directory(&data)?;
         assert!(replaced.is_some());
         assert!(!data.exists());
 
         // Stands in for `btrfs subvolume create` / `zfs create`.
-        std::fs::create_dir(&data).unwrap();
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
-        restore_replaced_directory(&data, replaced).unwrap();
-        let restored = std::fs::metadata(&data).unwrap();
+        std::fs::create_dir(&data)?;
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700))?;
+        restore_replaced_directory(&data, replaced)?;
+        let restored = std::fs::metadata(&data)?;
         assert_eq!(restored.permissions().mode() & 0o7777, 0o750);
         assert_eq!((restored.uid(), restored.gid()), (owner.uid(), owner.gid()));
 
-        restore_replaced_directory(&data, None).unwrap();
+        restore_replaced_directory(&data, None)?;
         assert_eq!(
-            remove_empty_data_directory(&root.path().join("missing")).unwrap(),
+            remove_empty_data_directory(&root.path().join("missing"))?,
             None
         );
+
+        Ok(())
     }
 
     #[test]
-    fn a_data_directory_with_files_is_never_replaced() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("PG_VERSION"), b"18").unwrap();
+    fn a_data_directory_with_files_is_never_replaced() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("PG_VERSION"), b"18")?;
         assert!(matches!(
             remove_empty_data_directory(root.path()),
             Err(DiskLimitError::DataPathNotEmpty(_))
         ));
+
+        Ok(())
     }
 }

@@ -22,7 +22,9 @@ fn first_sample_only_sets_the_baseline() {
 }
 
 #[test]
-fn samples_gateway_and_optional_engine_metrics() {
+fn samples_gateway_and_optional_engine_metrics() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let counter = store.counter("tenant-a", "generation-a");
     for _ in 0..2 {
@@ -40,7 +42,10 @@ fn samples_gateway_and_optional_engine_metrics() {
     counter.observe_network(1_100, 2_250);
     counter.observe(Some(25), Some(4_096));
 
-    let bucket = store.sample(160).pop().unwrap();
+    let bucket = store
+        .sample(160)
+        .pop()
+        .context("expected a value from pop")?;
     assert_eq!(bucket.active_connections, 3);
     assert_eq!(bucket.opened_connections, 2);
     assert_eq!(bucket.rx_bytes, 100);
@@ -49,10 +54,14 @@ fn samples_gateway_and_optional_engine_metrics() {
     assert_eq!(bucket.rejected.write, 1);
     assert_eq!(bucket.cpu_time_micros, Some(25));
     assert_eq!(bucket.peak_query_memory_bytes, Some(4_096));
+
+    Ok(())
 }
 
 #[test]
-fn reset_rotates_epoch_and_emits_a_gap_without_spikes() {
+fn reset_rotates_epoch_and_emits_a_gap_without_spikes() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let counter = store.counter("tenant-a", "generation-a");
     counter.record(OperationKind::Read);
@@ -64,12 +73,15 @@ fn reset_rotates_epoch_and_emits_a_gap_without_spikes() {
     store.sample(0);
     let old_epoch = store
         .current("tenant-a", "generation-a", 0)
-        .unwrap()
+        .context("expected a value from current")?
         .stats_epoch;
 
     counter.reset();
     counter.record(OperationKind::Write);
-    let bucket = store.sample(60).pop().unwrap();
+    let bucket = store
+        .sample(60)
+        .pop()
+        .context("expected a value from pop")?;
     assert!(bucket.gap);
     assert!(!bucket.operations_observed);
     assert_eq!(bucket.accepted.total(), 0);
@@ -79,31 +91,48 @@ fn reset_rotates_epoch_and_emits_a_gap_without_spikes() {
     assert_ne!(bucket.stats_epoch, old_epoch);
 
     counter.record(OperationKind::Ddl);
-    let next = store.sample(120).pop().unwrap();
+    let next = store
+        .sample(120)
+        .pop()
+        .context("expected a value from pop")?;
     assert!(!next.gap);
     assert_eq!(next.accepted.ddl, 1);
+
+    Ok(())
 }
 
 #[test]
-fn unavailable_and_measured_zero_serialize_differently() {
+fn unavailable_and_measured_zero_serialize_differently() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     store.counter("unavailable", "generation-a");
     store
         .counter("measured", "generation-a")
         .observe(Some(0), Some(0));
 
-    let unavailable =
-        serde_json::to_value(store.current("unavailable", "generation-a", 1).unwrap()).unwrap();
-    let measured =
-        serde_json::to_value(store.current("measured", "generation-a", 1).unwrap()).unwrap();
+    let unavailable = serde_json::to_value(
+        store
+            .current("unavailable", "generation-a", 1)
+            .context("expected a value from current")?,
+    )?;
+    let measured = serde_json::to_value(
+        store
+            .current("measured", "generation-a", 1)
+            .context("expected a value from current")?,
+    )?;
     assert_eq!(unavailable["cpu_time_micros"], json!(null));
     assert_eq!(unavailable["peak_query_memory_bytes"], json!(null));
     assert_eq!(measured["cpu_time_micros"], json!(0));
     assert_eq!(measured["peak_query_memory_bytes"], json!(0));
+
+    Ok(())
 }
 
 #[test]
-fn counter_hot_path_is_shared_without_store_locking() {
+fn counter_hot_path_is_shared_without_store_locking() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let first = store.counter("tenant-a", "generation-a");
     let second = store.counter("tenant-a", "generation-a");
@@ -111,16 +140,22 @@ fn counter_hot_path_is_shared_without_store_locking() {
     second.record(OperationKind::Other);
     second.reject();
 
-    let current = store.current("tenant-a", "generation-a", 10).unwrap();
+    let current = store
+        .current("tenant-a", "generation-a", 10)
+        .context("expected a value from current")?;
     assert_eq!(current.opened_connections, 1);
     assert_eq!(current.active_connections, 1);
     assert_eq!(current.accepted.other, 1);
     assert_eq!(current.rejected.other, 1);
     assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+    Ok(())
 }
 
 #[test]
-fn recreated_instance_gets_a_fresh_counter_generation() {
+fn recreated_instance_gets_a_fresh_counter_generation() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let deleted = store.counter("tenant-a", "generation-a");
     deleted.connection_opened();
@@ -128,7 +163,9 @@ fn recreated_instance_gets_a_fresh_counter_generation() {
     let recreated = store.counter("tenant-a", "generation-b");
     recreated.record(OperationKind::Write);
     assert!(!std::sync::Arc::ptr_eq(&deleted, &recreated));
-    let replacement = store.current("tenant-a", "generation-b", 10).unwrap();
+    let replacement = store
+        .current("tenant-a", "generation-b", 10)
+        .context("expected a value from current")?;
     let replacement_epoch = replacement.stats_epoch.clone();
     assert_eq!(replacement.active_connections, 0);
     assert_eq!(replacement.accepted.write, 1);
@@ -139,7 +176,9 @@ fn recreated_instance_gets_a_fresh_counter_generation() {
     assert!(std::sync::Arc::ptr_eq(&deleted, &late));
     late.record(OperationKind::Read);
     deleted.connection_closed();
-    let replacement = store.current("tenant-a", "generation-b", 11).unwrap();
+    let replacement = store
+        .current("tenant-a", "generation-b", 11)
+        .context("expected a value from current")?;
     assert_eq!(replacement.stats_epoch, replacement_epoch);
     assert_eq!(replacement.active_connections, 0);
     assert_eq!(replacement.accepted.write, 1);
@@ -147,22 +186,30 @@ fn recreated_instance_gets_a_fresh_counter_generation() {
 
     store.retain_generations(&[("tenant-a".to_string(), "generation-b".to_string())]);
     assert!(store.current("tenant-a", "generation-a", 12).is_none());
+
+    Ok(())
 }
 
 #[test]
-fn aggregate_collectors_add_counts_without_per_query_loops() {
+fn aggregate_collectors_add_counts_without_per_query_loops() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let counter = store.counter("tenant-a", "generation-a");
     counter.accept_many(OperationKind::Read, 50_000);
     counter.reject_many(OperationKind::Ddl, 3);
 
-    let current = store.current("tenant-a", "generation-a", 10).unwrap();
+    let current = store
+        .current("tenant-a", "generation-a", 10)
+        .context("expected a value from current")?;
     assert_eq!(current.accepted.read, 50_000);
     assert_eq!(current.rejected.ddl, 3);
+
+    Ok(())
 }
 
 #[test]
-fn complete_engine_samples_are_published_atomically() {
+fn complete_engine_samples_are_published_atomically() -> anyhow::Result<()> {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -203,17 +250,23 @@ fn complete_engine_samples_are_published_atomically() {
             assert!(snapshot.accepted.read > 0);
         }
     }
-    writer.join().unwrap();
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("test thread panicked"))?;
+
+    Ok(())
 }
 
 #[test]
-fn successful_zero_operation_sample_is_distinct_from_unavailable() {
+fn successful_zero_operation_sample_is_distinct_from_unavailable() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let counter = store.counter("tenant-a", "generation-a");
     assert!(
         !store
             .current("tenant-a", "generation-a", 0)
-            .unwrap()
+            .context("current should provide a value")?
             .operations_measured
     );
 
@@ -221,7 +274,7 @@ fn successful_zero_operation_sample_is_distinct_from_unavailable() {
     assert!(
         store
             .current("tenant-a", "generation-a", 1)
-            .unwrap()
+            .context("current should provide a value")?
             .operations_measured
     );
 
@@ -229,26 +282,37 @@ fn successful_zero_operation_sample_is_distinct_from_unavailable() {
     assert!(
         !store
             .current("tenant-a", "generation-a", 2)
-            .unwrap()
+            .context("current should provide a value")?
             .operations_measured
     );
+
+    Ok(())
 }
 
 #[test]
-fn idle_gateway_minutes_are_measured_zeroes() {
+fn idle_gateway_minutes_are_measured_zeroes() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let counter = store.counter("tenant-a", "generation-a");
     counter.mark_gateway_ops_available();
     store.sample(0);
 
-    let bucket = store.sample(60).pop().unwrap();
+    let bucket = store
+        .sample(60)
+        .pop()
+        .context("expected a value from pop")?;
     assert!(bucket.operations_observed);
     assert_eq!(bucket.accepted.total(), 0);
     assert_eq!(bucket.rejected.total(), 0);
+
+    Ok(())
 }
 
 #[test]
-fn temporary_engine_unavailability_hides_but_keeps_totals() {
+fn temporary_engine_unavailability_hides_but_keeps_totals() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let counter = store.counter("tenant-a", "generation-a");
     counter.observe(Some(25), Some(4096));
@@ -258,42 +322,53 @@ fn temporary_engine_unavailability_hides_but_keeps_totals() {
     });
 
     counter.set_engine_availability(false, false, Some(false));
-    let unavailable = store.current("tenant-a", "generation-a", 1).unwrap();
+    let unavailable = store
+        .current("tenant-a", "generation-a", 1)
+        .context("expected a value from current")?;
     assert_eq!(unavailable.cpu_time_micros, None);
     assert_eq!(unavailable.peak_query_memory_bytes, None);
     assert!(
         !store
             .current("tenant-a", "generation-a", 1)
-            .unwrap()
+            .context("current should provide a value")?
             .operations_measured
     );
 
     counter.set_engine_availability(true, true, Some(true));
-    let restored = store.current("tenant-a", "generation-a", 2).unwrap();
+    let restored = store
+        .current("tenant-a", "generation-a", 2)
+        .context("expected a value from current")?;
     assert_eq!(restored.cpu_time_micros, Some(25));
     assert_eq!(restored.peak_query_memory_bytes, Some(4096));
     assert_eq!(restored.accepted.read, 2);
     assert!(
         store
             .current("tenant-a", "generation-a", 2)
-            .unwrap()
+            .context("current should provide a value")?
             .operations_measured
     );
+
+    Ok(())
 }
 
 #[test]
-fn availability_transitions_emit_gaps_without_replaying_cpu_totals() {
+fn availability_transitions_emit_gaps_without_replaying_cpu_totals() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let counter = store.counter("tenant-a", "generation-a");
     counter.observe(Some(25), Some(4096));
     store.sample(0);
     let epoch = store
         .current("tenant-a", "generation-a", 0)
-        .unwrap()
+        .context("expected a value from current")?
         .stats_epoch;
 
     counter.set_engine_availability(false, false, None);
-    let unavailable = store.sample(60).pop().unwrap();
+    let unavailable = store
+        .sample(60)
+        .pop()
+        .context("expected a value from pop")?;
     assert!(unavailable.gap);
     assert_ne!(unavailable.stats_epoch, epoch);
     assert_eq!(unavailable.cpu_time_micros, None);
@@ -307,7 +382,10 @@ fn availability_transitions_emit_gaps_without_replaying_cpu_totals() {
         operations_available: None,
         discontinuity: false,
     });
-    let recovered = store.sample(120).pop().unwrap();
+    let recovered = store
+        .sample(120)
+        .pop()
+        .context("expected a value from pop")?;
     assert!(recovered.gap);
     assert_ne!(recovered.stats_epoch, unavailable.stats_epoch);
 
@@ -320,54 +398,82 @@ fn availability_transitions_emit_gaps_without_replaying_cpu_totals() {
         operations_available: None,
         discontinuity: false,
     });
-    let stable = store.sample(180).pop().unwrap();
+    let stable = store
+        .sample(180)
+        .pop()
+        .context("expected a value from pop")?;
     assert!(!stable.gap);
     assert_eq!(stable.stats_epoch, recovered.stats_epoch);
     assert_eq!(stable.cpu_time_micros, Some(5));
     assert_eq!(stable.peak_query_memory_bytes, Some(1024));
+
+    Ok(())
 }
 
 #[test]
-fn live_epoch_rotates_as_soon_as_continuity_changes() {
+fn live_epoch_rotates_as_soon_as_continuity_changes() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let counter = store.counter("tenant-a", "generation-a");
     counter.observe(Some(25), Some(4096));
     store.sample(0);
     let old_epoch = store
         .current("tenant-a", "generation-a", 0)
-        .unwrap()
+        .context("expected a value from current")?
         .stats_epoch;
 
     counter.set_engine_availability(false, false, None);
     let live_epoch = store
         .current("tenant-a", "generation-a", 30)
-        .unwrap()
+        .context("expected a value from current")?
         .stats_epoch;
     assert_ne!(live_epoch, old_epoch);
 
-    let gap = store.sample(60).pop().unwrap();
+    let gap = store
+        .sample(60)
+        .pop()
+        .context("expected a value from pop")?;
     assert!(gap.gap);
     assert_eq!(gap.stats_epoch, live_epoch);
+
+    Ok(())
 }
 
 #[test]
-fn memory_peak_is_none_in_buckets_without_an_observation() {
+fn memory_peak_is_none_in_buckets_without_an_observation() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = ActivityStore::default();
     let counter = store.counter("tenant-a", "generation-a");
     counter.observe(Some(0), Some(4096));
     store.sample(0);
 
     assert_eq!(
-        store.sample(60).pop().unwrap().peak_query_memory_bytes,
+        store
+            .sample(60)
+            .pop()
+            .context("pop should provide a value")?
+            .peak_query_memory_bytes,
         None
     );
     counter.observe(None, Some(1024));
     assert_eq!(
-        store.sample(120).pop().unwrap().peak_query_memory_bytes,
+        store
+            .sample(120)
+            .pop()
+            .context("pop should provide a value")?
+            .peak_query_memory_bytes,
         Some(1024)
     );
     assert_eq!(
-        store.sample(180).pop().unwrap().peak_query_memory_bytes,
+        store
+            .sample(180)
+            .pop()
+            .context("pop should provide a value")?
+            .peak_query_memory_bytes,
         None
     );
+
+    Ok(())
 }

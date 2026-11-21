@@ -425,10 +425,12 @@ mod tests {
     }
 
     #[test]
-    fn built_in_formats_restore_without_a_recipe_step() {
-        assert!(recipe_for(&stored(None)).unwrap().is_none());
+    fn built_in_formats_restore_without_a_recipe_step() -> anyhow::Result<()> {
+        assert!(recipe_for(&stored(None))?.is_none());
         let offline = crate::server::backup::test_details(BackupLayout::Physical);
-        assert!(recipe_for(&stored(Some(offline))).unwrap().is_none());
+        assert!(recipe_for(&stored(Some(offline)))?.is_none());
+
+        Ok(())
     }
 
     #[test]

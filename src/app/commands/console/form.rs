@@ -432,9 +432,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_build_a_valid_dedicated_request_tagged_for_the_cli() {
+    fn defaults_build_a_valid_dedicated_request_tagged_for_the_cli() -> anyhow::Result<()> {
         let form = CreateForm::new(vec![Protocol::Postgres, Protocol::Redis], "db.example.com");
-        let request = form.request().unwrap();
+        let request = form.request().map_err(anyhow::Error::msg)?;
         assert_eq!(request.protocol, Protocol::Postgres);
         assert_eq!(request.deployment_mode, "dedicated");
         assert_eq!(request.project_id, CLI_PROJECT_ID);
@@ -442,24 +442,32 @@ mod tests {
         assert_eq!(request.limits.cpu_cores, Some(1.0));
         assert_eq!(request.password.len(), GENERATED_PASSWORD_LEN);
         assert!(request.instance_id.starts_with("cli_postgres_"));
+
+        Ok(())
     }
 
     #[test]
-    fn shared_placement_needs_a_server_and_drops_cpu_and_memory() {
+    fn shared_placement_needs_a_server_and_drops_cpu_and_memory() -> anyhow::Result<()> {
         let mut form = CreateForm::new(vec![Protocol::Postgres], "db.example.com");
         focus(&mut form, Field::Mode);
         press(&mut form, KeyCode::Right);
         assert!(form.visible().contains(&Field::ServerId));
         assert!(!form.visible().contains(&Field::CpuCores));
-        assert!(form.request().unwrap_err().contains("Server ID"));
+        assert!(
+            form.request()
+                .expect_err("request should return an error")
+                .contains("Server ID")
+        );
         focus(&mut form, Field::ServerId);
         for character in "srv-1".chars() {
             press(&mut form, KeyCode::Char(character));
         }
-        let request = form.request().unwrap();
+        let request = form.request().map_err(anyhow::Error::msg)?;
         assert_eq!(request.deployment_mode, "shared");
         assert_eq!(request.server_id.as_deref(), Some("srv-1"));
         assert_eq!(request.limits.cpu_cores, None);
+
+        Ok(())
     }
 
     #[test]
@@ -479,14 +487,22 @@ mod tests {
         press(&mut form, KeyCode::Backspace);
         press(&mut form, KeyCode::Backspace);
         press(&mut form, KeyCode::Char('9'));
-        assert!(form.request().unwrap_err().starts_with("Database"));
+        assert!(
+            form.request()
+                .expect_err("request should return an error")
+                .starts_with("Database")
+        );
 
         let mut form = CreateForm::new(vec![Protocol::Mysql], "db.example.com");
         focus(&mut form, Field::PublicPort);
         for character in "70000".chars() {
             press(&mut form, KeyCode::Char(character));
         }
-        assert!(form.request().unwrap_err().contains("port"));
+        assert!(
+            form.request()
+                .expect_err("request should return an error")
+                .contains("port")
+        );
     }
 
     #[test]

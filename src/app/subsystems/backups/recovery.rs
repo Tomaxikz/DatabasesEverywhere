@@ -364,6 +364,8 @@ fn is_job_staging(staging_root: &Path, instance_id: &str, path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::super::{
         online::JournalRegistrar,
         strategy::{
@@ -476,7 +478,10 @@ mod tests {
                 if self.fail_cleanup {
                     return Err(StrategyError::Failed("runtime unavailable".to_string()));
                 }
-                self.cleaned.lock().unwrap().push(resource.name.clone());
+                self.cleaned
+                    .lock()
+                    .expect("lock should succeed")
+                    .push(resource.name.clone());
                 Ok(())
             })
         }
@@ -488,8 +493,10 @@ mod tests {
             server::{manager::InstanceManager, state::InstanceStore},
             storage::repositories::InstanceRepository,
         };
-        let dir = tempfile::tempdir().unwrap();
-        let pool = crate::storage::sqlite::connect(dir.path()).await.unwrap();
+        let dir = tempfile::tempdir().expect("tempdir should succeed");
+        let pool = crate::storage::sqlite::connect(dir.path())
+            .await
+            .expect("path should succeed");
         let store = InstanceStore::default();
         let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool.clone()));
         let mut config = crate::config::Config::default();
@@ -523,7 +530,7 @@ mod tests {
                 updated_at: now.clone(),
             })
             .await
-            .unwrap();
+            .expect("to string should succeed");
         state
             .backup_jobs
             .transition(
@@ -533,11 +540,11 @@ mod tests {
                 &now,
             )
             .await
-            .unwrap();
+            .expect("to string should succeed");
     }
 
     #[tokio::test]
-    async fn registrar_journals_only_job_tagged_resources() {
+    async fn registrar_journals_only_job_tagged_resources() -> anyhow::Result<()> {
         let (_dir, state) = journal_state().await;
         let job = identity();
         admit_capturing(&state, &job).await;
@@ -550,32 +557,30 @@ mod tests {
             name: format!("{}_slot", job.resource_tag()),
             survives_restart: false,
         };
-        registrar.register(&owned).await.unwrap();
+        registrar.register(&owned).await?;
         let foreign = OwnedResource {
             name: "pg_basebackup_123".to_string(),
             ..owned.clone()
         };
         assert!(registrar.register(&foreign).await.is_err());
         let job_id = job.job_id.to_string();
-        let journaled = state
-            .backup_jobs
-            .unreleased_resources(&job_id)
-            .await
-            .unwrap();
+        let journaled = state.backup_jobs.unreleased_resources(&job_id).await?;
         assert_eq!(journaled.len(), 1);
-        registrar.released(&owned).await.unwrap();
+        registrar.released(&owned).await?;
         assert!(
             state
                 .backup_jobs
                 .unreleased_resources(&job_id)
-                .await
-                .unwrap()
+                .await?
                 .is_empty()
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cleanup_releases_gone_resources_and_cleans_only_provable_survivors() {
+    async fn cleanup_releases_gone_resources_and_cleans_only_provable_survivors()
+    -> anyhow::Result<()> {
         let (_dir, state) = journal_state().await;
         let job = identity();
         admit_capturing(&state, &job).await;
@@ -601,8 +606,7 @@ mod tests {
             state
                 .backup_jobs
                 .register_resource(&job_id, record, &now)
-                .await
-                .unwrap();
+                .await?;
         }
         let metadata = crate::server::test_support::metadata(
             "inst_one",
@@ -613,24 +617,30 @@ mod tests {
             fail_cleanup: true,
             cleaned: Default::default(),
         };
-        let remaining = cleanup_job_resources(&state, Some(&metadata), &failing, &job, false)
-            .await
-            .unwrap();
+        let remaining =
+            cleanup_job_resources(&state, Some(&metadata), &failing, &job, false).await?;
         assert_eq!(remaining, vec![foreign.clone(), slot.clone()]);
 
         let strategy = FakeStrategy {
             fail_cleanup: false,
             cleaned: Default::default(),
         };
-        let remaining = cleanup_job_resources(&state, Some(&metadata), &strategy, &job, false)
-            .await
-            .unwrap();
+        let remaining =
+            cleanup_job_resources(&state, Some(&metadata), &strategy, &job, false).await?;
         assert_eq!(remaining, vec![foreign]);
-        assert_eq!(*strategy.cleaned.lock().unwrap(), vec![slot.name]);
+        assert_eq!(
+            *strategy
+                .cleaned
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?,
+            vec![slot.name]
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn an_unconfirmed_helper_keeps_the_job_pending_and_journaled() {
+    async fn an_unconfirmed_helper_keeps_the_job_pending_and_journaled() -> anyhow::Result<()> {
         let (_dir, state) = journal_state().await;
         let job = identity();
         admit_capturing(&state, &job).await;
@@ -643,21 +653,20 @@ mod tests {
         state
             .backup_jobs
             .register_resource(&job_id, &helper, &now_rfc3339())
-            .await
-            .unwrap();
+            .await?;
         // The offline test runtime cannot confirm removal, so nothing is
         // released and the job blocks further online backups.
-        let record = state.backup_jobs.get(&job_id).await.unwrap().unwrap();
+        let record = state
+            .backup_jobs
+            .get(&job_id)
+            .await?
+            .context("get should provide a value")?;
         assert_eq!(
-            recover_job(&state, &record).await.unwrap(),
+            recover_job(&state, &record).await?,
             BackupJobState::CleanupPending
         );
         assert_eq!(
-            state
-                .backup_jobs
-                .unreleased_resources(&job_id)
-                .await
-                .unwrap(),
+            state.backup_jobs.unreleased_resources(&job_id).await?,
             vec![helper]
         );
         assert!(
@@ -665,15 +674,15 @@ mod tests {
                 .await
                 .is_err_and(|error| matches!(error, ApiError::Conflict(_)))
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unsettled_publications_are_removed_or_kept_pending() {
+    async fn unsettled_publications_are_removed_or_kept_pending() -> anyhow::Result<()> {
         let (_dir, state) = journal_state().await;
-        let storage = crate::subsystems::backups::storage::backup_storage(&state).unwrap();
-        publication::begin(&state, &storage, "inst_gone", "a.physical.tar.gz", None)
-            .await
-            .unwrap();
+        let storage = crate::subsystems::backups::storage::backup_storage(&state)?;
+        publication::begin(&state, &storage, "inst_gone", "a.physical.tar.gz", None).await?;
         // A publication journaled against another storage target is never
         // cleaned against the current one.
         state
@@ -689,27 +698,24 @@ mod tests {
                 created_at: now_rfc3339(),
                 updated_at: now_rfc3339(),
             })
-            .await
-            .unwrap();
-        let resolutions = publication::recover(&state, None, false).await.unwrap();
+            .await?;
+        let resolutions = publication::recover(&state, None, false).await?;
         assert_eq!(resolutions.len(), 2);
         assert_eq!(resolutions[0], Resolution::Removed);
         assert!(
             matches!(&resolutions[1], Resolution::Pending(reason) if reason.contains("storage changed"))
         );
-        let left = state
-            .backup_jobs
-            .unsettled_publications(None)
-            .await
-            .unwrap();
+        let left = state.backup_jobs.unsettled_publications(None).await?;
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].backup_id, "b.physical.tar.gz");
         assert!(
             left[0]
                 .error
                 .as_deref()
-                .unwrap()
+                .context("as deref should provide a value")?
                 .contains("storage changed")
         );
+
+        Ok(())
     }
 }

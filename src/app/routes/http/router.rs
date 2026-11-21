@@ -126,6 +126,8 @@ async fn track_mutating_request(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
@@ -143,7 +145,8 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn public_host_is_panel_owned_while_browser_origin_remains_restricted() {
+    async fn public_host_is_panel_owned_while_browser_origin_remains_restricted()
+    -> anyhow::Result<()> {
         let response = build_router(test_state().await)
             .oneshot(
                 Request::builder()
@@ -151,11 +154,10 @@ mod tests {
                     .header(header::HOST, "any-public-address.example.com")
                     .header(header::ORIGIN, "https://panel.example.com")
                     .header(header::AUTHORIZATION, "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
             .await
-            .unwrap();
+            .expect("expected a value from oneshot");
         assert_eq!(response.status(), StatusCode::OK);
 
         let response = build_router(test_state().await)
@@ -165,17 +167,18 @@ mod tests {
                     .header(header::HOST, "panel.example.com")
                     .header(header::ORIGIN, "http://panel.example.com")
                     .header(header::AUTHORIZATION, "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
             .await
-            .unwrap();
+            .expect("expected a value from oneshot");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(json_body(response).await["code"], "host_not_allowed");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn heartbeat_is_independent_of_gateway_readiness() {
+    async fn heartbeat_is_independent_of_gateway_readiness() -> anyhow::Result<()> {
         let state = test_state().await;
         state
             .gateway_supervisor
@@ -186,21 +189,23 @@ mod tests {
                     .uri("/api/heartbeat")
                     .header(header::HOST, "panel.example.com")
                     .header(header::AUTHORIZATION, "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
             .await
-            .unwrap();
+            .expect("expected a value from oneshot");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             json_body(response).await,
             serde_json::json!({ "status": "ok" })
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn system_reports_api_readiness_separately_from_database_gateways() {
+    async fn system_reports_api_readiness_separately_from_database_gateways() -> anyhow::Result<()>
+    {
         let state = test_state().await;
         state
             .gateway_supervisor
@@ -211,11 +216,10 @@ mod tests {
                     .uri("/api/system")
                     .header(header::HOST, "panel.example.com")
                     .header(header::AUTHORIZATION, "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
             .await
-            .unwrap();
+            .expect("expected a value from oneshot");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
@@ -223,10 +227,12 @@ mod tests {
         assert_eq!(body["gateways"]["status"], "failed");
         assert_eq!(body["api_rate_limit_per_minute"], 600);
         assert_eq!(body["api_rate_limit_scope"], "credential_and_peer_ip");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn authentication_precedes_json_deserialization() {
+    async fn authentication_precedes_json_deserialization() -> anyhow::Result<()> {
         for uri in [
             "/api/admin/images/pull",
             "/api/instances/inst-one/deployment-migrations",
@@ -238,19 +244,20 @@ mod tests {
                         .uri(uri)
                         .header(header::HOST, "panel.example.com")
                         .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from("{"))
-                        .unwrap(),
+                        .body(Body::from("{"))?,
                 )
                 .await
-                .unwrap();
+                .expect("expected a value from oneshot");
 
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
             assert_eq!(json_body(response).await["code"], "unauthorized", "{uri}");
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn extractor_rejections_use_the_api_error_envelope() {
+    async fn extractor_rejections_use_the_api_error_envelope() -> anyhow::Result<()> {
         let response = build_router(test_state().await)
             .oneshot(
                 Request::builder()
@@ -259,18 +266,19 @@ mod tests {
                     .header(header::HOST, "panel.example.com")
                     .header(header::AUTHORIZATION, "Bearer secret")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{"))
-                    .unwrap(),
+                    .body(Body::from("{"))?,
             )
             .await
-            .unwrap();
+            .expect("expected a value from oneshot");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(response).await["code"], "bad_request");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn import_upload_stream_bypasses_json_limit_and_deletes_durably() {
+    async fn import_upload_stream_bypasses_json_limit_and_deletes_durably() -> anyhow::Result<()> {
         use sha2::{Digest, Sha256};
 
         let (state, _directory) = upload_test_state().await;
@@ -287,35 +295,32 @@ mod tests {
                     .header(header::CONTENT_LENGTH, content.len())
                     .header("x-dbev-filename", "dump.postgres.sql")
                     .header("x-dbev-sha256", digest)
-                    .body(Body::from(content))
-                    .unwrap(),
+                    .body(Body::from(content))?,
             )
             .await
-            .unwrap();
+            .expect("expected a value from oneshot");
 
         assert_eq!(response.status(), StatusCode::CREATED);
         let upload_id = json_body(response).await["upload_id"]
             .as_str()
-            .unwrap()
+            .context("expected a string")?
             .to_string();
         let upload = state
             .import_uploads
             .repo()
             .get("inst_upload", &upload_id)
-            .await
-            .unwrap()
-            .unwrap();
+            .await?
+            .context("get should provide a value")?;
         assert_eq!(
             upload.state,
             crate::storage::import_uploads::ImportUploadState::Ready
         );
         let upload_path =
-            crate::server::paths::InstancePaths::new(&state.config.paths, "inst_upload")
-                .unwrap()
+            crate::server::paths::InstancePaths::new(&state.config.paths, "inst_upload")?
                 .imports
                 .join(".uploads")
                 .join(&upload.stored_filename);
-        assert_eq!(tokio::fs::metadata(upload_path).await.unwrap().len(), 64);
+        assert_eq!(tokio::fs::metadata(upload_path).await?.len(), 64);
 
         let response = build_router(state.clone())
             .oneshot(
@@ -326,25 +331,25 @@ mod tests {
                     ))
                     .header(header::HOST, "panel.example.com")
                     .header(header::AUTHORIZATION, "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
             .await
-            .unwrap();
+            .expect("expected a value from oneshot");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
             state
                 .import_uploads
                 .repo()
                 .get("inst_upload", &upload_id)
-                .await
-                .unwrap()
+                .await?
                 .is_none()
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn ordinary_json_requests_still_obey_the_small_body_limit() {
+    async fn ordinary_json_requests_still_obey_the_small_body_limit() -> anyhow::Result<()> {
         let (state, _directory) = upload_test_state().await;
         let response = build_router(state)
             .oneshot(
@@ -356,23 +361,30 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{"protocol":"postgres","padding":"xxxxxxxxxxxxxxxx"}"#,
-                    ))
-                    .unwrap(),
+                    ))?,
             )
             .await
-            .unwrap();
+            .expect(
+                "ordinary json requests still obey the small body limit should provide a value",
+            );
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        Ok(())
     }
 
     async fn json_body(response: axum::response::Response) -> Value {
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("into body should succeed");
+        serde_json::from_slice(&bytes).expect("from slice should succeed")
     }
 
     async fn test_state() -> AppState {
-        let directory = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(directory.path()).await.unwrap();
+        let directory = tempfile::tempdir().expect("tempdir should succeed");
+        let pool = sqlite::connect(directory.path())
+            .await
+            .expect("path should succeed");
         let instances = InstanceStore::default();
         let manager =
             InstanceManager::new(instances.clone(), InstanceRepository::new(pool.clone()));
@@ -395,15 +407,17 @@ mod tests {
     }
 
     async fn upload_test_state() -> (AppState, tempfile::TempDir) {
-        let directory = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(directory.path()).await.unwrap();
+        let directory = tempfile::tempdir().expect("tempdir should succeed");
+        let pool = sqlite::connect(directory.path())
+            .await
+            .expect("path should succeed");
         let instances = InstanceStore::default();
         let manager =
             InstanceManager::new(instances.clone(), InstanceRepository::new(pool.clone()));
         manager
             .upsert(upload_test_metadata("inst_upload"))
             .await
-            .unwrap();
+            .expect("upload test metadata should succeed");
         let root = directory.path();
         let mut config = Config {
             remote: "https://panel.example.com".to_string(),

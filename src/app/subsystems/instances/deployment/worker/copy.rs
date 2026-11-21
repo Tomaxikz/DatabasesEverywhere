@@ -290,7 +290,8 @@ mod tests {
             manifest(4, 2, 49, "source"),
             manifest(4, 2, 50, "different"),
         ] {
-            let error = compare_manifests(&source, &target).unwrap_err();
+            let error = compare_manifests(&source, &target)
+                .expect_err("compare manifests should return an error");
             assert!(matches!(error, ApiError::Conflict(_)));
             assert!(error.to_string().contains("was not cut over"));
         }
@@ -309,7 +310,8 @@ mod tests {
         let before = manifest(4, 2, 50, "before");
         assert!(ensure_source_stable(&before, &before).is_ok());
         let after = manifest(4, 2, 50, "after");
-        let error = ensure_source_stable(&before, &after).unwrap_err();
+        let error = ensure_source_stable(&before, &after)
+            .expect_err("ensure source stable should return an error");
         assert!(matches!(error, ApiError::Conflict(_)));
         assert!(error.to_string().contains("changed during export"));
     }

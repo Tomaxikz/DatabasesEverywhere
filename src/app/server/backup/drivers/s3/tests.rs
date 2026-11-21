@@ -35,7 +35,8 @@ fn config() -> BackupS3Config {
         bucket: "bkt".to_string(),
         region: "eu-west-1".to_string(),
         access_key_id: "AKID".to_string(),
-        secret_access_key: serde_json::from_str::<SensitiveString>("\"secret\"").unwrap(),
+        secret_access_key: serde_json::from_str::<SensitiveString>("\"secret\"")
+            .expect("from str should succeed"),
         ..BackupS3Config::default()
     }
 }
@@ -48,7 +49,10 @@ impl PublicationJournal for RecordingJournal {
         &'a self,
         resource: &'a PublicationResource,
     ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
-        self.0.lock().unwrap().push(resource.clone());
+        self.0
+            .lock()
+            .expect("lock should succeed")
+            .push(resource.clone());
         Box::pin(async { Ok(()) })
     }
 }
@@ -62,10 +66,15 @@ pub(super) async fn bundle_with_archive(
     let backup_id = new_backup_id(BackupLayout::Physical);
     let bundle = BackupBundle::create(root, instance_id, &backup_id)
         .await
-        .unwrap();
-    tokio::fs::write(&bundle.archive, archive).await.unwrap();
+        .expect("create should succeed");
+    tokio::fs::write(&bundle.archive, archive)
+        .await
+        .expect("write should succeed");
     if catalog {
-        bundle.write_catalog(br#"{"objects":[]}"#).await.unwrap();
+        bundle
+            .write_catalog(br#"{"objects":[]}"#)
+            .await
+            .expect("write catalog should succeed");
     }
     let manifest = build_manifest(
         backup_id,
@@ -77,21 +86,18 @@ pub(super) async fn bundle_with_archive(
         test_details(BackupLayout::Physical),
     )
     .await
-    .unwrap();
+    .expect("test details should succeed");
     (bundle, manifest)
 }
 
 #[tokio::test]
-async fn round_trips_a_backup_with_its_catalog() {
-    let temp = tempfile::tempdir().unwrap();
+async fn round_trips_a_backup_with_its_catalog() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let (driver, store) = Fixture::start().await;
     let (bundle, manifest) = bundle_with_archive(temp.path(), "inst_one", b"archive", true).await;
     let id = manifest.backup_id.clone();
 
-    driver
-        .commit(&bundle, &manifest, &DiscardJournal)
-        .await
-        .unwrap();
+    driver.commit(&bundle, &manifest, &DiscardJournal).await?;
 
     assert_eq!(
         store.keys(),
@@ -101,31 +107,30 @@ async fn round_trips_a_backup_with_its_catalog() {
             format!("{PREFIX}{id}.metadata.json"),
         ]
     );
-    let listed = driver.list("inst_one").await.unwrap();
+    let listed = driver.list("inst_one").await?;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].sha256, manifest.sha256);
     assert_eq!(
-        driver.read_catalog("inst_one", &id, 1024).await.unwrap(),
+        driver.read_catalog("inst_one", &id, 1024).await?,
         Some(br#"{"objects":[]}"#.to_vec())
     );
     let destination = temp.path().join("restored");
-    driver
-        .materialize("inst_one", &id, &destination)
-        .await
-        .unwrap();
-    assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"archive");
+    driver.materialize("inst_one", &id, &destination).await?;
+    assert_eq!(tokio::fs::read(&destination).await?, b"archive");
 
-    driver.delete("inst_one", &id).await.unwrap();
+    driver.delete("inst_one", &id).await?;
     assert!(store.keys().is_empty());
     assert!(matches!(
         driver.find("inst_one", &id).await,
         Err(BackupStoreError::NotFound)
     ));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn commit_refuses_an_archive_that_does_not_match_its_manifest() {
-    let temp = tempfile::tempdir().unwrap();
+async fn commit_refuses_an_archive_that_does_not_match_its_manifest() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let (driver, store) = Fixture::start().await;
     let (bundle, mut manifest) =
         bundle_with_archive(temp.path(), "inst_one", b"archive", false).await;
@@ -134,15 +139,17 @@ async fn commit_refuses_an_archive_that_does_not_match_its_manifest() {
     let error = driver
         .commit(&bundle, &manifest, &DiscardJournal)
         .await
-        .unwrap_err();
+        .expect_err("commit should return an error");
 
     assert!(error.to_string().contains("SHA-256"), "{error}");
     assert!(store.keys().is_empty());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn large_archives_use_a_journaled_verified_multipart_upload() {
-    let temp = tempfile::tempdir().unwrap();
+async fn large_archives_use_a_journaled_verified_multipart_upload() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let (driver, store) = Fixture::start().await;
     let archive: Vec<u8> = (0..MULTIPART_THRESHOLD_BYTES + 1)
         .map(|index| (index % 251) as u8)
@@ -150,10 +157,14 @@ async fn large_archives_use_a_journaled_verified_multipart_upload() {
     let (bundle, manifest) = bundle_with_archive(temp.path(), "inst_one", &archive, false).await;
     let journal = RecordingJournal::default();
 
-    driver.commit(&bundle, &manifest, &journal).await.unwrap();
+    driver.commit(&bundle, &manifest, &journal).await?;
 
     let archive_key = format!("{PREFIX}{}", manifest.backup_id);
-    let recorded = journal.0.lock().unwrap().clone();
+    let recorded = journal
+        .0
+        .lock()
+        .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+        .clone();
     assert!(matches!(
         recorded.as_slice(),
         [PublicationResource::S3MultipartUpload { key, upload_id }]
@@ -172,31 +183,29 @@ async fn large_archives_use_a_journaled_verified_multipart_upload() {
             .keys()
             .contains(&format!("{PREFIX}{}", manifest.backup_id))
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn inventory_stays_inside_the_instance_prefix() {
-    let temp = tempfile::tempdir().unwrap();
+async fn inventory_stays_inside_the_instance_prefix() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let (driver, store) = Fixture::start().await;
     for instance in ["inst_one", "inst_one_b", "inst_two"] {
         let (bundle, manifest) = bundle_with_archive(temp.path(), instance, b"a", false).await;
-        driver
-            .commit(&bundle, &manifest, &DiscardJournal)
-            .await
-            .unwrap();
+        driver.commit(&bundle, &manifest, &DiscardJournal).await?;
     }
     // Newer metadata is listed opaquely; a stray object is never a backup.
     let mut newer: serde_json::Value =
-        serde_json::from_slice(&driver.get_bytes(&store.keys()[1], 1 << 20).await.unwrap())
-            .unwrap();
+        serde_json::from_slice(&driver.get_bytes(&store.keys()[1], 1 << 20).await?)?;
     newer["schema_version"] = 99.into();
     newer["backup_id"] = "zz-newer.physical.tar.gz".into();
     store.insert(
         format!("{PREFIX}zz-newer.physical.tar.gz.metadata.json"),
-        serde_json::to_vec(&newer).unwrap().into(),
+        serde_json::to_vec(&newer)?.into(),
     );
     store.insert(format!("{PREFIX}orphan"), "x".into());
-    let inventory = driver.inventory("inst_one").await.unwrap();
+    let inventory = driver.inventory("inst_one").await?;
 
     assert_eq!(inventory.backups.len(), 1);
     assert_eq!(inventory.backups[0].instance_id, "inst_one");
@@ -206,28 +215,26 @@ async fn inventory_stays_inside_the_instance_prefix() {
         "zz-newer.physical.tar.gz"
     );
 
-    assert_eq!(driver.delete_instance("inst_one").await.unwrap(), 2);
+    assert_eq!(driver.delete_instance("inst_one").await?, 2);
     let remaining = store.keys();
     assert!(remaining.iter().all(|key| !key.starts_with(PREFIX)));
     assert_eq!(remaining.len(), 4);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn purge_aborts_journaled_uploads_and_removes_every_object() {
-    let temp = tempfile::tempdir().unwrap();
+async fn purge_aborts_journaled_uploads_and_removes_every_object() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let (driver, store) = Fixture::start().await;
     let (bundle, manifest) = bundle_with_archive(temp.path(), "inst_one", b"a", false).await;
-    driver
-        .commit(&bundle, &manifest, &DiscardJournal)
-        .await
-        .unwrap();
+    driver.commit(&bundle, &manifest, &DiscardJournal).await?;
     let archive = format!("{PREFIX}{}", manifest.backup_id);
-    let upload_id = driver.client.create_multipart(&archive).await.unwrap();
+    let upload_id = driver.client.create_multipart(&archive).await?;
     driver
         .client
         .put_part(&archive, &upload_id, 1, "x".into())
-        .await
-        .unwrap();
+        .await?;
     let resources = [PublicationResource::S3MultipartUpload {
         key: archive.clone(),
         upload_id: upload_id.clone(),
@@ -235,46 +242,47 @@ async fn purge_aborts_journaled_uploads_and_removes_every_object() {
 
     driver
         .purge_unpublished("inst_one", &manifest.backup_id, &resources)
-        .await
-        .unwrap();
+        .await?;
 
     assert!(store.keys().is_empty());
-    assert!(
-        driver
-            .client
-            .upload_gone(&archive, &upload_id)
-            .await
-            .unwrap()
-    );
+    assert!(driver.client.upload_gone(&archive, &upload_id).await?);
     // With no upload left, a repeated purge only confirms absence.
     driver
         .purge_unpublished("inst_one", &manifest.backup_id, &[])
-        .await
-        .unwrap();
+        .await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn bounded_reads_refuse_oversized_objects() {
+async fn bounded_reads_refuse_oversized_objects() -> anyhow::Result<()> {
     let (driver, store) = Fixture::start().await;
     let key = format!("{PREFIX}big");
     store.insert(key.clone(), vec![0_u8; 16].into());
-    let error = driver.get_bytes(&key, 15).await.unwrap_err();
+    let error = driver
+        .get_bytes(&key, 15)
+        .await
+        .expect_err("get bytes should return an error");
 
     assert!(error.to_string().contains("exceeded its safety limit"));
-    assert_eq!(driver.get_bytes(&key, 16).await.unwrap().len(), 16);
+    assert_eq!(driver.get_bytes(&key, 16).await?.len(), 16);
+
+    Ok(())
 }
 
 #[test]
-fn keys_must_be_normalized_object_paths() {
-    assert_eq!(object_path(PREFIX).unwrap(), PREFIX.trim_end_matches('/'));
-    assert_eq!(object_path("a/b c+d").unwrap(), "a/b c+d");
+fn keys_must_be_normalized_object_paths() -> anyhow::Result<()> {
+    assert_eq!(object_path(PREFIX)?, PREFIX.trim_end_matches('/'));
+    assert_eq!(object_path("a/b c+d")?, "a/b c+d");
     for key in ["a//b", "a/../b", "/a", "a/\u{1}"] {
         assert!(object_path(key).is_err(), "{key}");
     }
+
+    Ok(())
 }
 
 #[test]
-fn config_maps_onto_identity_and_bucket_endpoints() {
+fn config_maps_onto_identity_and_bucket_endpoints() -> anyhow::Result<()> {
     let cases = [
         // (endpoint, path_style, identity base, bucket endpoint)
         (
@@ -314,35 +322,38 @@ fn config_maps_onto_identity_and_bucket_endpoints() {
             path_style,
             ..config()
         };
-        let base = endpoint_base(&config).unwrap();
+        let base = endpoint_base(&config)?;
         assert_eq!(base.as_str(), identity, "{endpoint}");
         assert_eq!(bucket_endpoint(&base, &config), bucket, "{endpoint}");
-        let driver = S3BackupDriver::new(config).unwrap();
+        let driver = S3BackupDriver::new(config)?;
         assert_eq!(driver.identity(), format!("s3:{identity}|bkt|dbev"));
     }
+
+    Ok(())
 }
 
 #[test]
-fn signed_requests_preserve_s3_key_and_query_encoding() {
+fn signed_requests_preserve_s3_key_and_query_encoding() -> anyhow::Result<()> {
     let config = BackupS3Config {
         endpoint: "http://minio:9000".to_string(),
         path_style: true,
         allow_http: true,
         ..config()
     };
-    let driver = S3BackupDriver::new(config).unwrap();
+    let driver = S3BackupDriver::new(config)?;
     let uploads = &driver.client;
     assert_eq!(
         uploads
-            .url("dbev/a b+c", &[("max-parts", "1"), ("uploadId", "x/y")])
-            .unwrap()
+            .url("dbev/a b+c", &[("max-parts", "1"), ("uploadId", "x/y")])?
             .as_str(),
         "http://minio:9000/bkt/dbev/a%20b%2Bc?max-parts=1&uploadId=x%2Fy"
     );
     assert_eq!(
-        uploads.url("", &[("uploads", "")]).unwrap().as_str(),
+        uploads.url("", &[("uploads", "")])?.as_str(),
         "http://minio:9000/bkt?uploads="
     );
+
+    Ok(())
 }
 
 struct MockS3 {
@@ -358,14 +369,16 @@ async fn mock_s3(respond: fn(&str, &str) -> (StatusCode, Vec<u8>)) -> MockS3 {
         async move {
             let method = request.method().to_string();
             let uri = request.uri().to_string();
-            seen.lock()
-                .unwrap()
-                .push((method.clone(), uri.clone(), request.headers().clone()));
+            seen.lock().expect("lock should succeed").push((
+                method.clone(),
+                uri.clone(),
+                request.headers().clone(),
+            ));
             let (status, body) = respond(&method, &uri);
             Response::builder()
                 .status(status)
                 .body(Body::from(body))
-                .unwrap()
+                .expect("body should succeed")
         }
     });
     MockS3 {
@@ -383,7 +396,7 @@ fn mock_driver(mock: &MockS3, max_retries: usize) -> S3BackupDriver {
         request_timeout_seconds: 5,
         ..config()
     })
-    .unwrap()
+    .expect("config should succeed")
 }
 
 fn list_page(key: &str) -> Vec<u8> {
@@ -396,7 +409,7 @@ fn list_page(key: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn listings_are_signed_and_must_stay_inside_the_prefix() {
+async fn listings_are_signed_and_must_stay_inside_the_prefix() -> anyhow::Result<()> {
     let mock = mock_s3(|_, uri| {
         let key = if uri.contains("inst_one") {
             "dbev/instances/inst_two/backups/x"
@@ -408,7 +421,10 @@ async fn listings_are_signed_and_must_stay_inside_the_prefix() {
     .await;
     let driver = mock_driver(&mock, 0);
 
-    let error = driver.list_keys(PREFIX).await.unwrap_err();
+    let error = driver
+        .list_keys(PREFIX)
+        .await
+        .expect_err("list keys should return an error");
 
     assert!(
         error
@@ -416,7 +432,10 @@ async fn listings_are_signed_and_must_stay_inside_the_prefix() {
             .contains("outside the requested backup prefix"),
         "{error}"
     );
-    let requests = mock.requests.lock().unwrap();
+    let requests = mock
+        .requests
+        .lock()
+        .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?;
     let (method, uri, headers) = &requests[0];
     assert_eq!(method, "GET");
     assert!(uri.starts_with("/bkt?"), "{uri}");
@@ -425,12 +444,14 @@ async fn listings_are_signed_and_must_stay_inside_the_prefix() {
         uri.contains("prefix=dbev%2Finstances%2Finst_one%2Fbackups%2F"),
         "{uri}"
     );
-    let authorization = headers["authorization"].to_str().unwrap();
+    let authorization = headers["authorization"].to_str()?;
     assert!(
         authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKID/"),
         "{authorization}"
     );
     assert!(authorization.contains("/eu-west-1/s3/aws4_request"));
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -448,25 +469,41 @@ async fn api_responses_beyond_the_safety_limit_are_refused() {
 }
 
 #[tokio::test]
-async fn server_errors_are_retried_up_to_max_retries() {
+async fn server_errors_are_retried_up_to_max_retries() -> anyhow::Result<()> {
     let mock = mock_s3(|_, _| (StatusCode::SERVICE_UNAVAILABLE, Vec::new())).await;
     let driver = mock_driver(&mock, 2);
 
     assert!(driver.get_bytes(&format!("{PREFIX}x"), 10).await.is_err());
-    assert_eq!(mock.requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        mock.requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+            .len(),
+        3
+    );
 
-    mock.requests.lock().unwrap().clear();
+    mock.requests
+        .lock()
+        .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+        .clear();
     let uploads = &driver.client;
     let response = uploads
         .discovery_get("", &[("uploads", "")], "list")
-        .await
-        .unwrap();
+        .await?;
     assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(mock.requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        mock.requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+            .len(),
+        3
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn missing_objects_map_to_not_found() {
+async fn missing_objects_map_to_not_found() -> anyhow::Result<()> {
     let mock = mock_s3(|_, _| {
         (
             StatusCode::NOT_FOUND,
@@ -480,14 +517,13 @@ async fn missing_objects_map_to_not_found() {
         driver.find("inst_one", "a.physical.tar.gz").await,
         Err(BackupStoreError::NotFound)
     ));
-    driver
-        .delete_object(&format!("{PREFIX}a"), true)
-        .await
-        .unwrap();
+    driver.delete_object(&format!("{PREFIX}a"), true).await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn only_no_such_upload_confirms_an_abort() {
+async fn only_no_such_upload_confirms_an_abort() -> anyhow::Result<()> {
     let mock = mock_s3(|_, uri| {
         let code = if uri.contains("gone") {
             "NoSuchUpload"
@@ -503,16 +539,13 @@ async fn only_no_such_upload_confirms_an_abort() {
     let driver = mock_driver(&mock, 0);
     let uploads = &driver.client;
 
-    assert!(
-        uploads
-            .upload_gone(&format!("{PREFIX}a"), "gone")
-            .await
-            .unwrap()
-    );
+    assert!(uploads.upload_gone(&format!("{PREFIX}a"), "gone").await?);
     assert!(
         uploads
             .upload_gone(&format!("{PREFIX}a"), "other")
             .await
             .is_err()
     );
+
+    Ok(())
 }

@@ -614,13 +614,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mysql_filename_mapping_matches_server_rules_for_managed_names() {
-        assert_eq!(mysql_filename("tenant_db").unwrap(), "tenant_db");
-        assert_eq!(
-            mysql_filename("tenant-db-1").unwrap(),
-            "tenant@002ddb@002d1"
-        );
+    fn mysql_filename_mapping_matches_server_rules_for_managed_names() -> anyhow::Result<()> {
+        assert_eq!(mysql_filename("tenant_db")?, "tenant_db");
+        assert_eq!(mysql_filename("tenant-db-1")?, "tenant@002ddb@002d1");
         assert!(mysql_filename("tenant.db").is_err());
+
+        Ok(())
     }
 
     #[test]
@@ -688,8 +687,8 @@ mod tests {
     }
 
     #[test]
-    fn persisted_pool_method_selects_raw_or_fuse_visible_boundary() {
-        let temp = tempfile::tempdir().unwrap();
+    fn persisted_pool_method_selects_raw_or_fuse_visible_boundary() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let raw_root = temp.path().join("volumes").join("pool-postgres-a");
         let raw_path = raw_root
             .join(POSTGRES_TENANT_ROOT)
@@ -704,69 +703,80 @@ mod tests {
         config.paths.fuse = temp.path().join("fuse").display().to_string();
         config.disk.mode = crate::config::DiskLimitMode::SoftScanner;
 
-        let fuse = live_boundary_for_method(&config, "fuse_quota", &boundary).unwrap();
+        let fuse = live_boundary_for_method(&config, "fuse_quota", &boundary)?;
         assert_ne!(fuse.root, raw_root);
         assert!(fuse.root.starts_with(temp.path().join("fuse/instances")));
         assert_eq!(
-            fuse.path.strip_prefix(&fuse.root).unwrap(),
-            raw_path.strip_prefix(&raw_root).unwrap()
+            fuse.path.strip_prefix(&fuse.root)?,
+            raw_path.strip_prefix(&raw_root)?
         );
 
         config.disk.mode = crate::config::DiskLimitMode::FuseQuota;
         for method in ["soft_scanner", "host_xfs_project_quota"] {
-            let live = live_boundary_for_method(&config, method, &boundary).unwrap();
+            let live = live_boundary_for_method(&config, method, &boundary)?;
             assert_eq!(live.root, raw_root, "persisted method {method}");
             assert_eq!(live.path, raw_path, "persisted method {method}");
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn validation_never_creates_a_missing_raw_backing_path() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn validation_never_creates_a_missing_raw_backing_path() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("pool");
         let path = root.join(POSTGRES_TENANT_ROOT).join("missing");
-        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&root)?;
 
-        let error = require_dir_chain(&root, &path).await.unwrap_err();
+        let error = require_dir_chain(&root, &path)
+            .await
+            .expect_err("require dir chain should return an error");
 
         assert!(matches!(error, TenantDiskError::Io { .. }));
         assert!(!path.exists());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_boundary_is_accepted_without_recreation() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn missing_boundary_is_accepted_without_recreation() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let boundary = temp.path().join("dropped-tenant");
 
-        remove_empty_boundary(&boundary).await.unwrap();
+        remove_empty_boundary(&boundary).await?;
 
         assert!(!boundary.exists());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn empty_boundary_is_removed_before_quota_teardown() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn empty_boundary_is_removed_before_quota_teardown() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let boundary = temp.path().join("empty-tenant");
-        std::fs::create_dir(&boundary).unwrap();
+        std::fs::create_dir(&boundary)?;
 
-        remove_empty_boundary(&boundary).await.unwrap();
+        remove_empty_boundary(&boundary).await?;
 
         assert!(!boundary.exists());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn nonempty_boundary_fails_closed_and_preserves_data() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn nonempty_boundary_fails_closed_and_preserves_data() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let boundary = temp.path().join("tenant-with-data");
-        std::fs::create_dir(&boundary).unwrap();
-        std::fs::write(boundary.join("keep"), b"tenant data").unwrap();
+        std::fs::create_dir(&boundary)?;
+        std::fs::write(boundary.join("keep"), b"tenant data")?;
 
-        let error = remove_empty_boundary(&boundary).await.unwrap_err();
+        let error = remove_empty_boundary(&boundary)
+            .await
+            .expect_err("remove empty boundary should return an error");
 
         assert!(matches!(error, TenantDiskError::Io { .. }));
-        assert_eq!(
-            std::fs::read(boundary.join("keep")).unwrap(),
-            b"tenant data"
-        );
+        assert_eq!(std::fs::read(boundary.join("keep"))?, b"tenant data");
+
+        Ok(())
     }
 }

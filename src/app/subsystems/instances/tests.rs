@@ -14,16 +14,14 @@ use crate::server::metadata::InstanceStatus;
 use crate::subsystems::instances::requests::LimitsRequest;
 
 #[tokio::test]
-async fn cancelled_resize_waiter_does_not_leave_queued_work() {
+async fn cancelled_resize_waiter_does_not_leave_queued_work() -> anyhow::Result<()> {
     use crate::{
         auth::api_token::ApiToken,
         server::{manager::InstanceManager, state::InstanceStore},
         storage::repositories::InstanceRepository,
     };
     use axum::extract::FromRequestParts;
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect_lazy("sqlite::memory:")
-        .unwrap();
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().connect_lazy("sqlite::memory:")?;
     let store = InstanceStore::default();
     let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool.clone()));
     let state = crate::subsystems::test_support::state(
@@ -36,12 +34,9 @@ async fn cancelled_resize_waiter_does_not_leave_queued_work() {
     );
     let (mut parts, _) = http::Request::builder()
         .header("authorization", "Bearer test-token")
-        .body(())
-        .unwrap()
+        .body(())?
         .into_parts();
-    let auth = ApiRequestContext::from_request_parts(&mut parts, &state)
-        .await
-        .unwrap();
+    let auth = ApiRequestContext::from_request_parts(&mut parts, &state).await?;
     let creation = state.instance_locks.lock_creation().await;
     let worker_state = state.clone();
     let waiter = tokio::spawn(update_instance_limits(
@@ -59,8 +54,7 @@ async fn cancelled_resize_waiter_does_not_leave_queued_work() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
+    .await?;
     waiter.abort();
     let _ = waiter.await;
     assert_eq!(state.daemon_shutdown.active_mutation_count(), 0);
@@ -73,6 +67,8 @@ async fn cancelled_resize_waiter_does_not_leave_queued_work() {
             .await
     );
     assert_eq!(state.daemon_shutdown.active_mutation_count(), 0);
+
+    Ok(())
 }
 
 async fn assert_owned_task_survives_waiter<F>(label: &str, spawn: F)
@@ -92,10 +88,12 @@ where
     let waiter = tokio::spawn(async move {
         let _ = owned.await;
     });
-    started_rx.await.unwrap();
+    started_rx
+        .await
+        .expect("assert owned task survives waiter should succeed");
     waiter.abort();
     let _ = waiter.await;
-    release_tx.send(()).unwrap();
+    release_tx.send(()).expect("send should succeed");
 
     let finished = tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx).await;
     assert!(
@@ -199,7 +197,9 @@ fn shared_pool_logs_are_never_available_through_any_api_transport() {
 
     metadata.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     metadata.runtime_id = "pool_postgres_test".to_string();
-    let error = check_logs_available(&metadata).unwrap_err().to_string();
+    let error = check_logs_available(&metadata)
+        .expect_err("check logs available should return an error")
+        .to_string();
 
     assert!(error.contains("pool-wide"));
     assert!(error.contains("other databases"));
@@ -249,8 +249,8 @@ fn failed_image_update_quarantine_is_fail_closed() {
 }
 
 #[tokio::test]
-async fn retained_instance_volume_paths_are_scoped_to_the_exact_instance() {
-    let root = tempfile::tempdir().unwrap();
+async fn retained_instance_volume_paths_are_scoped_to_the_exact_instance() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
     let data_path = root.path().join("inst_customer_db");
     let old_upgrade = root
         .path()
@@ -261,42 +261,47 @@ async fn retained_instance_volume_paths_are_scoped_to_the_exact_instance() {
     let unrelated = root
         .path()
         .join(".dbe-major-upgrade-old-inst_customer_db-other-550e8400-e29b-41d4-a716-446655440002");
-    tokio::fs::create_dir(&old_upgrade).await.unwrap();
-    tokio::fs::create_dir(&failed_restore).await.unwrap();
-    tokio::fs::create_dir(&unrelated).await.unwrap();
+    tokio::fs::create_dir(&old_upgrade).await?;
+    tokio::fs::create_dir(&failed_restore).await?;
+    tokio::fs::create_dir(&unrelated).await?;
 
-    let mut paths = retained_instance_volume_paths(&data_path).await.unwrap();
+    let mut paths = retained_instance_volume_paths(&data_path).await?;
     paths.sort();
     let mut expected = vec![old_upgrade, failed_restore];
     expected.sort();
 
     assert_eq!(paths, expected);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn major_upgrade_rollback_location_never_guesses_which_volume_is_authoritative() {
-    let root = tempfile::tempdir().unwrap();
+async fn major_upgrade_rollback_location_never_guesses_which_volume_is_authoritative()
+-> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
     let data = root.path().join("data");
     let backup = root.path().join("backup");
 
-    tokio::fs::create_dir(&data).await.unwrap();
+    tokio::fs::create_dir(&data).await?;
     assert_eq!(
-        classify_upgrade_rollback(&data, &backup).await.unwrap(),
+        classify_upgrade_rollback(&data, &backup).await?,
         MajorUpgradeRollbackLocation::OriginalDataInPlace
     );
 
-    tokio::fs::rename(&data, &backup).await.unwrap();
+    tokio::fs::rename(&data, &backup).await?;
     assert_eq!(
-        classify_upgrade_rollback(&data, &backup).await.unwrap(),
+        classify_upgrade_rollback(&data, &backup).await?,
         MajorUpgradeRollbackLocation::OldVolumeBackup
     );
 
-    tokio::fs::create_dir(&data).await.unwrap();
+    tokio::fs::create_dir(&data).await?;
     assert!(classify_upgrade_rollback(&data, &backup).await.is_err());
 
-    tokio::fs::remove_dir(&data).await.unwrap();
-    tokio::fs::remove_dir(&backup).await.unwrap();
+    tokio::fs::remove_dir(&data).await?;
+    tokio::fs::remove_dir(&backup).await?;
     assert!(classify_upgrade_rollback(&data, &backup).await.is_err());
+
+    Ok(())
 }
 
 #[test]
@@ -334,25 +339,28 @@ fn major_versions_parse_only_from_pinned_image_tags() {
 }
 
 #[test]
-fn classifies_major_version_changes() {
-    let change = classify_image_update(Protocol::Mongodb, "mongo:7.0.37", "mongo:8.3.4").unwrap();
+fn classifies_major_version_changes() -> anyhow::Result<()> {
+    let change = classify_image_update(Protocol::Mongodb, "mongo:7.0.37", "mongo:8.3.4")?;
     assert_eq!(change, ImageVersionChange::Major);
 
-    let change =
-        classify_image_update(Protocol::Postgres, "postgres:18.3", "postgres:18.4").unwrap();
+    let change = classify_image_update(Protocol::Postgres, "postgres:18.3", "postgres:18.4")?;
     assert_eq!(change, ImageVersionChange::SameMajorOrUnknown);
 
-    let error =
-        classify_image_update(Protocol::Mongodb, "mongo:7.0.37", "mongo:latest").unwrap_err();
+    let error = classify_image_update(Protocol::Mongodb, "mongo:7.0.37", "mongo:latest")
+        .expect_err("classify image update should return an error");
     assert!(error.to_string().contains("cannot compare requested image"));
+
+    Ok(())
 }
 
 #[test]
 fn major_upgrade_path_blocks_downgrades_and_skipped_mongodb_versions() {
-    let error = validate_upgrade_path(Protocol::Postgres, 18, 17).unwrap_err();
+    let error = validate_upgrade_path(Protocol::Postgres, 18, 17)
+        .expect_err("validate upgrade path should return an error");
     assert!(error.to_string().contains("downgrade is blocked"));
 
-    let error = validate_upgrade_path(Protocol::Mongodb, 6, 8).unwrap_err();
+    let error = validate_upgrade_path(Protocol::Mongodb, 6, 8)
+        .expect_err("validate upgrade path should return an error");
     assert!(error.to_string().contains("cannot skip versions"));
 
     assert!(validate_upgrade_path(Protocol::Mongodb, 7, 8).is_ok());
@@ -370,19 +378,21 @@ fn major_migration_support_is_limited_to_logical_dump_protocols() {
 }
 
 #[test]
-fn replacement_validation_uses_managed_database_unix_sockets() {
-    let postgres = replacement_check_command(Protocol::Postgres, "app_user", "app_db").unwrap();
+fn replacement_validation_uses_managed_database_unix_sockets() -> anyhow::Result<()> {
+    let postgres = replacement_check_command(Protocol::Postgres, "app_user", "app_db")?;
     assert!(postgres.contains("-h /var/run/postgresql"));
     assert!(!postgres.contains("-h 127.0.0.1"));
 
-    let mariadb = replacement_check_command(Protocol::Mariadb, "app_user", "app_db").unwrap();
+    let mariadb = replacement_check_command(Protocol::Mariadb, "app_user", "app_db")?;
     assert!(mariadb.contains("--protocol=socket"));
     assert!(mariadb.contains("--socket=/run/mysqld/mysqld.sock"));
     assert!(!mariadb.contains("-h 127.0.0.1"));
 
-    let mysql = replacement_check_command(Protocol::Mysql, "app_user", "app_db").unwrap();
+    let mysql = replacement_check_command(Protocol::Mysql, "app_user", "app_db")?;
     assert!(mysql.contains("--protocol=socket"));
     assert!(mysql.contains("--socket=/var/run/mysqld/mysqld.sock"));
+
+    Ok(())
 }
 
 #[test]

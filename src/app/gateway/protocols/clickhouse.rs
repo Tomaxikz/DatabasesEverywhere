@@ -382,10 +382,12 @@ fn write_uvarint(bytes: &mut Vec<u8>, mut value: u64) {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn parses_native_hello_route() {
+    fn parses_native_hello_route() -> anyhow::Result<()> {
         let mut packet = Vec::new();
         write_uvarint(&mut packet, 0);
         write_string(&mut packet, "ClickHouse client");
@@ -401,14 +403,16 @@ mod tests {
             if trailing {
                 candidate.extend_from_slice(b"next packet bytes");
             }
-            let route = parse_native_initial_route(&candidate).unwrap();
+            let route = parse_native_initial_route(&candidate)?;
             assert_eq!(route.username, "app");
             assert_eq!(route.database, "analytics");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn injects_unique_database_into_native_jdbc_hello() {
+    fn injects_unique_database_into_native_jdbc_hello() -> anyhow::Result<()> {
         let mut packet = Vec::new();
         write_uvarint(&mut packet, 0);
         write_string(&mut packet, "ClickHouse JDBC");
@@ -420,12 +424,14 @@ mod tests {
         write_string(&mut packet, "secret");
         packet.extend_from_slice(b"trailing hello fields");
 
-        let rewritten = native_hello_with_database(&packet, "analytics").unwrap();
-        let route = parse_native_initial_route(&rewritten).unwrap();
+        let rewritten = native_hello_with_database(&packet, "analytics")?;
+        let route = parse_native_initial_route(&rewritten)?;
 
         assert_eq!(route.username, "app");
         assert_eq!(route.database, "analytics");
         assert!(rewritten.ends_with(b"trailing hello fields"));
+
+        Ok(())
     }
 
     #[test]
@@ -434,7 +440,8 @@ mod tests {
         write_uvarint(&mut packet, 0);
         write_string(&mut packet, "ClickHouse client");
 
-        let error = parse_native_initial_route(&packet).unwrap_err();
+        let error = parse_native_initial_route(&packet)
+            .expect_err("parse native initial route should return an error");
 
         assert!(matches!(error, ClickhouseParseError::IncompleteNativeHello));
     }
@@ -455,24 +462,26 @@ mod tests {
     }
 
     #[test]
-    fn accepts_missing_or_empty_database_for_unique_username_routing() {
+    fn accepts_missing_or_empty_database_for_unique_username_routing() -> anyhow::Result<()> {
         for request in [
             b"GET / HTTP/1.1\r\nAuthorization: Basic YXBwOnNlY3JldA==\r\n\r\n".as_slice(),
             b"GET /?database= HTTP/1.1\r\nX-ClickHouse-User: app\r\n\r\n".as_slice(),
         ] {
-            let route = parse_http_initial_route(request).unwrap();
+            let route = parse_http_initial_route(request)?;
             assert_eq!(route.username, "app");
             assert!(route.database.is_empty());
         }
+
+        Ok(())
     }
 
     #[test]
-    fn injects_unique_database_into_clickhouse_http_jdbc_request() {
+    fn injects_unique_database_into_clickhouse_http_jdbc_request() -> anyhow::Result<()> {
         let request = b"POST /?query_id=one&database=default HTTP/1.1\r\nHost: example\r\nX-ClickHouse-User: app\r\nX-ClickHouse-Database: default\r\n\r\nSELECT 1";
 
-        let rewritten = http_request_for_gateway(request, "analytics").unwrap();
-        let route = parse_http_initial_route(&rewritten).unwrap();
-        let text = String::from_utf8(rewritten.clone()).unwrap();
+        let rewritten = http_request_for_gateway(request, "analytics")?;
+        let route = parse_http_initial_route(&rewritten)?;
+        let text = String::from_utf8(rewritten.clone())?;
 
         assert_eq!(route.username, "app");
         assert_eq!(route.database, "analytics");
@@ -480,16 +489,19 @@ mod tests {
         assert!(text.contains("X-ClickHouse-Database: analytics\r\n"));
         assert!(text.contains("Connection: close\r\n"));
         assert!(rewritten.ends_with(b"SELECT 1"));
+
+        Ok(())
     }
 
     #[test]
-    fn clickhouse_http_gateway_disables_cross_tenant_keep_alive() {
+    fn clickhouse_http_gateway_disables_cross_tenant_keep_alive() -> anyhow::Result<()> {
         let request = b"GET /?database=tenant HTTP/1.1\r\nHost: example\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\nX-ClickHouse-User: app\r\n\r\n";
-        let rewritten =
-            String::from_utf8(http_request_for_gateway(request, "tenant").unwrap()).unwrap();
+        let rewritten = String::from_utf8(http_request_for_gateway(request, "tenant")?)?;
         assert_eq!(rewritten.matches("Connection: close\r\n").count(), 1);
         assert!(!rewritten.to_ascii_lowercase().contains("keep-alive"));
         assert!(!rewritten.to_ascii_lowercase().contains("proxy-connection"));
+
+        Ok(())
     }
 
     #[test]
@@ -532,17 +544,20 @@ mod tests {
     }
 
     #[test]
-    fn every_forwarded_database_value_is_the_gateway_database() {
+    fn every_forwarded_database_value_is_the_gateway_database() -> anyhow::Result<()> {
         let request = b"POST /?database=tenant&Database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r\nx-clickhouse-database: tenant\r\nX-Other: kept\r\n\r\nSELECT 1";
-        let rewritten =
-            String::from_utf8(http_request_for_gateway(request, "tenant").unwrap()).unwrap();
-        let (head, body) = rewritten.split_once("\r\n\r\n").unwrap();
+        let rewritten = String::from_utf8(http_request_for_gateway(request, "tenant")?)?;
+        let (head, body) = rewritten
+            .split_once("\r\n\r\n")
+            .context("expected a value from split_once")?;
         assert_eq!(body, "SELECT 1");
         assert!(head.split("\r\n").all(|line| !line.contains(['\r', '\n'])));
         assert!(head.starts_with("POST /?database=tenant HTTP/1.1\r\n"));
         assert_eq!(head.matches("X-ClickHouse-Database: tenant").count(), 1);
         assert!(head.contains("X-Other: kept"));
         assert!(http_request_for_gateway(request, "ten\r\nant").is_err());
+
+        Ok(())
     }
 
     #[test]

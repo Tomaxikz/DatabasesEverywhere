@@ -835,6 +835,8 @@ pub(super) fn connection_string(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::commands::console::api::{DatabaseIdentity, Limits, PublicEndpoint};
 
@@ -886,23 +888,45 @@ mod tests {
     }
 
     #[test]
-    fn instances_are_sorted_filtered_and_selection_survives_refresh() {
+    fn instances_are_sorted_filtered_and_selection_survives_refresh() -> anyhow::Result<()> {
         let mut app = loaded();
-        assert_eq!(app.current().unwrap().instance_id, "a_pg");
+        assert_eq!(
+            app.current()
+                .context("current should provide a value")?
+                .instance_id,
+            "a_pg"
+        );
         app.on_key(key(KeyCode::Down));
-        assert_eq!(app.current().unwrap().instance_id, "b_redis");
+        assert_eq!(
+            app.current()
+                .context("current should provide a value")?
+                .instance_id,
+            "b_redis"
+        );
         app.on_outcome(Outcome::Instances(vec![
             instance("0_first", Protocol::Postgres, "running"),
             instance("a_pg", Protocol::Postgres, "running"),
             instance("b_redis", Protocol::Redis, "running"),
         ]));
-        assert_eq!(app.current().unwrap().instance_id, "b_redis");
+        assert_eq!(
+            app.current()
+                .context("current should provide a value")?
+                .instance_id,
+            "b_redis"
+        );
 
         app.on_key(key(KeyCode::Char('/')));
         type_text(&mut app, "redis");
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.visible().len(), 1);
-        assert_eq!(app.current().unwrap().instance_id, "b_redis");
+        assert_eq!(
+            app.current()
+                .context("current should provide a value")?
+                .instance_id,
+            "b_redis"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -935,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn a_creation_that_leaves_the_list_reports_why_it_failed() {
+    fn a_creation_that_leaves_the_list_reports_why_it_failed() -> anyhow::Result<()> {
         let mut app = loaded();
         app.on_outcome(Outcome::Instances(vec![instance(
             "a_pg",
@@ -955,10 +979,11 @@ mod tests {
                 "status": "failed",
                 "diagnostic": { "code": "internal", "message": "instance creation failed", "error_id": "e1" }
             }
-        }))
-        .unwrap();
+        }))?;
         app.on_outcome(Outcome::Progress("c_new".to_string(), failed));
-        let message = app.message.as_ref().unwrap();
+        let message = app.message.as_ref().context(
+            "a creation that leaves the list reports why it failed should provide a value",
+        )?;
         assert_eq!(message.level, Level::Error);
         assert!(
             message
@@ -974,11 +999,15 @@ mod tests {
         assert!(
             app.message
                 .as_ref()
-                .unwrap()
+                .context(
+                    "a creation that leaves the list reports why it failed should provide a value"
+                )?
                 .text
                 .contains("creating gone failed")
         );
         assert!(app.creating.is_empty());
+
+        Ok(())
     }
 
     #[test]
@@ -1083,13 +1112,13 @@ mod tests {
     }
 
     #[test]
-    fn finished_operations_refresh_and_failures_stay_visible() {
+    fn finished_operations_refresh_and_failures_stay_visible() -> anyhow::Result<()> {
         let mut app = loaded();
         let job = Job::Power("a_pg".to_string(), PowerAction::Start);
         app.started(&job);
         assert_eq!(app.running.len(), 1);
         let jobs = app.on_outcome(Outcome::Done {
-            label: job.label().unwrap(),
+            label: job.label().context("expected a value from label")?,
             refresh: true,
         });
         assert!(app.running.is_empty());
@@ -1098,7 +1127,17 @@ mod tests {
             label: "delete x".to_string(),
             error: "409 busy".to_string(),
         });
-        assert_eq!(app.message.as_ref().unwrap().level, Level::Error);
+        assert_eq!(
+            app.message
+                .as_ref()
+                .context(
+                    "finished operations refresh and failures stay visible should provide a value"
+                )?
+                .level,
+            Level::Error
+        );
+
+        Ok(())
     }
 
     #[test]

@@ -228,8 +228,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_user_scripts_scope_roles_and_keep_passwords_out_of_commands() {
-        let script = create_root_user_script("dbe_root").unwrap();
+    fn generated_user_scripts_scope_roles_and_keep_passwords_out_of_commands() -> anyhow::Result<()>
+    {
+        let script = create_root_user_script("dbe_root")?;
 
         assert!(script.contains("getSiblingDB(\"admin\")"));
         assert!(script.contains("root"));
@@ -237,13 +238,13 @@ mod tests {
         assert!(script.contains("process.env.DBE_MONGO_ROOT_PASSWORD"));
         assert!(!script.contains("secret"));
 
-        let script = password_update_script("mongo_1", "app_mongo_1").unwrap();
+        let script = password_update_script("mongo_1", "app_mongo_1")?;
 
         assert!(script.contains("db.updateUser"));
         assert!(script.contains("process.env.DBE_ROTATED_PASSWORD"));
         assert!(!script.contains("secret"));
 
-        let script = create_tenant_script("mongo_1", "app_mongo_1").unwrap();
+        let script = create_tenant_script("mongo_1", "app_mongo_1")?;
 
         assert!(script.contains("process.env.DBE_TENANT_PASSWORD"));
         assert!(!script.contains("process.env.DBE_ADMIN_PASSWORD"));
@@ -258,11 +259,14 @@ mod tests {
         assert!(script.contains("process.env.DBE_ADMIN_PASSWORD"));
         assert!(script.contains("encodeURIComponent(adminPassword)"));
         assert!(script.contains("db.adminCommand({ ping: 1 });"));
+
+        Ok(())
     }
 
     #[test]
     fn rejects_identifier_with_dot() {
-        let error = validate_identifier("database", "bad.name").unwrap_err();
+        let error = validate_identifier("database", "bad.name")
+            .expect_err("validate identifier should return an error");
 
         assert!(matches!(
             error,
@@ -271,12 +275,12 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_scripts_are_database_and_user_scoped() {
+    fn lifecycle_scripts_are_database_and_user_scoped() -> anyhow::Result<()> {
         for (database, username) in [("tenant_a", "user_a"), ("tenant-b", "user-b")] {
-            let fence = fence_tenant_script(database, username).unwrap();
-            let unfence = unfence_tenant_script(database, username).unwrap();
-            let terminate = terminate_tenant_script(database, username).unwrap();
-            let drop = drop_tenant_script(database, username).unwrap();
+            let fence = fence_tenant_script(database, username)?;
+            let unfence = unfence_tenant_script(database, username)?;
+            let terminate = terminate_tenant_script(database, username)?;
+            let drop = drop_tenant_script(database, username)?;
 
             assert!(fence.contains("roles: []"));
             assert!(unfence.contains("readWrite"));
@@ -291,16 +295,20 @@ mod tests {
                 assert!(!script.contains("clusterAdmin"));
             }
         }
+
+        Ok(())
     }
 
     #[test]
-    fn storage_script_uses_database_total_size_in_input_order() {
-        let script = tenant_storage_script(&["tenant_a", "tenant-b"]).unwrap();
+    fn storage_script_uses_database_total_size_in_input_order() -> anyhow::Result<()> {
+        let script = tenant_storage_script(&["tenant_a", "tenant-b"])?;
 
         assert!(script.contains(r#"["tenant_a","tenant-b"]"#));
         assert!(script.contains("runCommand({ dbStats: 1, scale: 1 })"));
         assert!(script.contains("stats.totalSize"));
         assert!(!script.contains("fsUsedSize"));
         assert!(tenant_storage_script(&["bad.name"]).is_err());
+
+        Ok(())
     }
 }

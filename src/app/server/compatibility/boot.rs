@@ -395,6 +395,8 @@ async fn isolate_failure(state: &AppState, metadata: &InstanceMetadata, reason: 
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::{
         databases::protocol::Protocol, server::test_support, utils::backend::BackendEndpoint,
@@ -416,27 +418,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_upgrade_preflight_preserves_missing_credentials_and_storage() {
+    fn legacy_upgrade_preflight_preserves_missing_credentials_and_storage() -> anyhow::Result<()> {
         let disk = crate::config::DiskConfig::default();
         let mut instance = metadata(Protocol::Mariadb, "/tmp/mariadb.sock".into());
         instance.tenant_password = None;
         assert!(
             upgrade_blocker(&instance, &disk)
-                .unwrap()
+                .context("upgrade blocker should provide a value")?
                 .contains("tenant credential")
         );
         instance.tenant_password = Some("saved-secret".into());
         instance.mariadb_root_password = None;
         assert!(
             upgrade_blocker(&instance, &disk)
-                .unwrap()
+                .context("upgrade blocker should provide a value")?
                 .contains("administrator credential")
         );
         let mut instance = metadata(Protocol::Qdrant, "/tmp/qdrant.sock".into());
         instance.limits.disk_enforcement_method = "fuse_quota".into();
         assert!(
             upgrade_blocker(&instance, &disk)
-                .unwrap()
+                .context("upgrade blocker should provide a value")?
                 .contains("storage migration")
         );
         instance.limits.disk_enforcement_method =
@@ -445,17 +447,20 @@ mod tests {
                 .method()
                 .into();
         assert_eq!(upgrade_blocker(&instance, &disk), None);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn qdrant_runtime_spec_upgrade_is_required_only_until_rest_socket_is_live() {
-        let directory = tempfile::tempdir().unwrap();
+    async fn qdrant_runtime_spec_upgrade_is_required_only_until_rest_socket_is_live()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let grpc_socket = directory.path().join("qdrant-grpc.sock");
         let http_socket = directory.path().join("qdrant-http.sock");
         let qdrant = metadata(Protocol::Qdrant, grpc_socket.display().to_string());
         assert!(runtime_spec_upgrade_required(&qdrant).await);
 
-        let listener = tokio::net::UnixListener::bind(http_socket).unwrap();
+        let listener = tokio::net::UnixListener::bind(http_socket)?;
         let accept = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -464,6 +469,8 @@ mod tests {
 
         let postgres = metadata(Protocol::Postgres, "/tmp/postgres.sock".to_string());
         assert!(!runtime_spec_upgrade_required(&postgres).await);
+
+        Ok(())
     }
 
     fn metadata(protocol: Protocol, socket_path: String) -> InstanceMetadata {

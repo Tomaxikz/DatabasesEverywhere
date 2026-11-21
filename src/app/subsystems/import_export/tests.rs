@@ -20,10 +20,11 @@ use crate::{
 
 pub(super) fn assert_failed_clickhouse_listing(script: &str) {
     use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("tempdir should succeed");
     let client = directory.path().join("clickhouse-client");
-    std::fs::write(&client, b"#!/bin/sh\ncase \"$*\" in *'SELECT version()'*) echo 26.4; exit 0 ;; esac\necho 'simulated catalog failure' >&2\nexit 7\n").unwrap();
-    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&client, b"#!/bin/sh\ncase \"$*\" in *'SELECT version()'*) echo 26.4; exit 0 ;; esac\necho 'simulated catalog failure' >&2\nexit 7\n").expect("version should succeed");
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700))
+        .expect("from mode should succeed");
     // The remote helper normally uses /work. Keep every test write private.
     let script = script.replace("/work/", &format!("{}/", directory.path().display()));
     let output = std::process::Command::new("/bin/sh")
@@ -39,7 +40,7 @@ pub(super) fn assert_failed_clickhouse_listing(script: &str) {
         .env("CLICKHOUSE_USER", "user")
         .env("CLICKHOUSE_PASSWORD", "test-only")
         .output()
-        .unwrap();
+        .expect("output should succeed");
     assert_eq!(
         output.status.code(),
         Some(44),
@@ -50,26 +51,25 @@ pub(super) fn assert_failed_clickhouse_listing(script: &str) {
 }
 
 #[test]
-fn clickhouse_export_and_wipe_cannot_hide_a_catalog_failure() {
+fn clickhouse_export_and_wipe_cannot_hide_a_catalog_failure() -> anyhow::Result<()> {
     let mut metadata = crate::server::test_support::shared_metadata();
     metadata.protocol = Protocol::Clickhouse;
-    assert_failed_clickhouse_listing(
-        &export_script(
-            &metadata,
-            "/dev/stdout",
-            &ImportExportSelection::default(),
-            false,
-        )
-        .unwrap(),
-    );
-    assert_failed_clickhouse_listing(&wipe_logical_script(&metadata, false).unwrap());
+    assert_failed_clickhouse_listing(&export_script(
+        &metadata,
+        "/dev/stdout",
+        &ImportExportSelection::default(),
+        false,
+    )?);
+    assert_failed_clickhouse_listing(&wipe_logical_script(&metadata, false)?);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn public_job_response_never_exposes_a_host_path() {
-    let dir = tempfile::tempdir().unwrap();
+async fn public_job_response_never_exposes_a_host_path() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     let artifact = dir.path().join("dump.postgres.sql");
-    tokio::fs::write(&artifact, b"select 1").await.unwrap();
+    tokio::fs::write(&artifact, b"select 1").await?;
     let job = ImportExportJob {
         job_id: "job-1".to_string(),
         instance_id: "instance-1".to_string(),
@@ -82,7 +82,7 @@ async fn public_job_response_never_exposes_a_host_path() {
         updated_at: "2026-01-01T00:00:00Z".to_string(),
     };
 
-    let response = serde_json::to_value(public_job_response(job).await).unwrap();
+    let response = serde_json::to_value(public_job_response(job).await)?;
 
     assert_eq!(response["artifact_id"], "dump.postgres.sql");
     assert_eq!(response["artifact_size_bytes"], 8);
@@ -92,10 +92,12 @@ async fn public_job_response_never_exposes_a_host_path() {
             .to_string()
             .contains(&dir.path().display().to_string())
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn public_job_response_redacts_legacy_internal_failure_text() {
+async fn public_job_response_redacts_legacy_internal_failure_text() -> anyhow::Result<()> {
     let job = ImportExportJob {
         job_id: "job-legacy".to_string(),
         instance_id: "instance-1".to_string(),
@@ -108,10 +110,12 @@ async fn public_job_response_redacts_legacy_internal_failure_text() {
         updated_at: "2026-01-01T00:00:00Z".to_string(),
     };
 
-    let response = serde_json::to_string(&public_job_response(job).await).unwrap();
+    let response = serde_json::to_string(&public_job_response(job).await)?;
     assert!(response.contains("internal_error"));
     assert!(!response.contains("hunter2"));
     assert!(!response.contains("/var/lib/private"));
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -135,15 +139,22 @@ async fn failed_export_does_not_advertise_a_nonexistent_artifact() {
 }
 
 #[test]
-fn archive_copy_stops_at_expired_deadline() {
+fn archive_copy_stops_at_expired_deadline() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let mut input = Cursor::new(b"contents".as_slice());
     let mut output = Vec::new();
-    let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .context("expected a value from checked_sub")?;
 
-    let error = copy_limited_until(&mut input, &mut output, u64::MAX, expired).unwrap_err();
+    let error = copy_limited_until(&mut input, &mut output, u64::MAX, expired)
+        .expect_err("copy limited until should return an error");
 
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(output.is_empty());
+
+    Ok(())
 }
 
 #[test]
@@ -158,15 +169,19 @@ fn logical_archive_accounting_includes_empty_entry_filesystem_overhead() {
 }
 
 #[test]
-fn compressed_export_capacity_covers_worst_case_expansion() {
-    let bound =
-        export_artifact_capacity_bytes(MAX_UNARCHIVED_BYTES, ExportArchiveFormat::Bzip2).unwrap();
+fn compressed_export_capacity_covers_worst_case_expansion() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let bound = export_artifact_capacity_bytes(MAX_UNARCHIVED_BYTES, ExportArchiveFormat::Bzip2)
+        .context("expected a value from export_artifact_capacity_bytes")?;
 
     assert!(bound > MAX_UNARCHIVED_BYTES + 64 * 1024 * 1024);
     assert_eq!(
         bound,
         MAX_UNARCHIVED_BYTES + MAX_UNARCHIVED_BYTES.div_ceil(50) + 1024 * 1024
     );
+
+    Ok(())
 }
 
 #[test]
@@ -208,16 +223,20 @@ fn plain_export_on_one_filesystem_does_not_reserve_the_dump_twice() {
 }
 
 #[tokio::test]
-async fn compressed_export_cannot_write_past_its_reserved_bound() {
-    let directory = tempfile::tempdir().unwrap();
+async fn compressed_export_cannot_write_past_its_reserved_bound() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let source = directory.path().join("source.sql");
     let target = directory.path().join("target.sql.gz");
-    tokio::fs::write(&source, vec![0x5a; 4096]).await.unwrap();
+    tokio::fs::write(&source, vec![0x5a; 4096]).await?;
 
-    let error = compress_gzip(&source, &target, 1).await.unwrap_err();
+    let error = compress_gzip(&source, &target, 1)
+        .await
+        .expect_err("compress gzip should return an error");
 
     assert!(matches!(error, ApiError::Runtime(_)));
     assert!(!target.exists());
+
+    Ok(())
 }
 
 #[test]
@@ -235,24 +254,20 @@ fn physical_operation_preserves_primary_or_restart_error_order() {
 }
 
 #[test]
-fn physical_upload_expansion_is_capped_by_the_instance_disk_limit() {
+fn physical_upload_expansion_is_capped_by_the_instance_disk_limit() -> anyhow::Result<()> {
     let one_gib = 1024_u64 * 1024 * 1024;
     for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
+        assert_eq!(physical_staging_bytes(protocol, 1024)?, Some(one_gib));
         assert_eq!(
-            physical_staging_bytes(protocol, 1024).unwrap(),
-            Some(one_gib)
-        );
-        assert_eq!(
-            physical_staging_bytes(protocol, u64::MAX / (1024 * 1024)).unwrap(),
+            physical_staging_bytes(protocol, u64::MAX / (1024 * 1024))?,
             Some(crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES)
         );
     }
-    assert_eq!(
-        physical_staging_bytes(Protocol::Postgres, 1024).unwrap(),
-        None
-    );
+    assert_eq!(physical_staging_bytes(Protocol::Postgres, 1024)?, None);
     assert!(physical_staging_bytes(Protocol::Redis, 0).is_err());
     assert!(physical_staging_bytes(Protocol::Redis, u64::MAX).is_err());
+
+    Ok(())
 }
 
 #[test]
@@ -329,49 +344,44 @@ fn recovery_restore_is_destructive_and_infers_only_real_wrapper_formats() {
 
 #[test]
 fn rar_is_rejected_instead_of_being_advertised_but_unimplemented() {
-    let error = ImportArchiveFormat::parse("rar").unwrap_err();
+    let error = ImportArchiveFormat::parse("rar").expect_err("parse should return an error");
     assert!(error.to_string().contains("unsupported archive_format"));
 }
 
 #[tokio::test]
-async fn remote_import_staging_budget_is_aggregate() {
-    let directory = tempfile::tempdir().unwrap();
+async fn remote_import_staging_budget_is_aggregate() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let source = directory.path().join("source");
     let rollback = directory.path().join("rollback");
-    tokio::fs::write(&source, [0_u8; 4]).await.unwrap();
-    tokio::fs::write(&rollback, [0_u8; 5]).await.unwrap();
+    tokio::fs::write(&source, [0_u8; 4]).await?;
+    tokio::fs::write(&rollback, [0_u8; 5]).await?;
 
-    check_remote_staging_space(&[&source, &rollback], 0, 9)
-        .await
-        .unwrap();
+    check_remote_staging_space(&[&source, &rollback], 0, 9).await?;
     let error = check_remote_staging_space(&[&source, &rollback], 0, 8)
         .await
-        .unwrap_err();
+        .expect_err("check remote staging space should return an error");
     assert!(
         error
             .to_string()
             .contains("configured 8-byte staging limit")
     );
 
-    tokio::fs::remove_file(&source).await.unwrap();
-    assert_eq!(
-        check_remote_staging_space(&[&rollback], 4, 9)
-            .await
-            .unwrap(),
-        9
-    );
+    tokio::fs::remove_file(&source).await?;
+    assert_eq!(check_remote_staging_space(&[&rollback], 4, 9).await?, 9);
     let error = check_remote_staging_space(&[&rollback], 4, 8)
         .await
-        .unwrap_err();
+        .expect_err("check remote staging space should return an error");
     assert!(
         error
             .to_string()
             .contains("configured 8-byte staging limit")
     );
+
+    Ok(())
 }
 
 #[test]
-fn remote_logical_import_reserves_source_and_private_recovery_copies() {
+fn remote_logical_import_reserves_source_and_private_recovery_copies() -> anyhow::Result<()> {
     const MIB: u64 = 1024 * 1024;
     for protocol in [
         Protocol::Postgres,
@@ -380,18 +390,14 @@ fn remote_logical_import_reserves_source_and_private_recovery_copies() {
         Protocol::Mongodb,
         Protocol::Clickhouse,
     ] {
-        assert_eq!(
-            jobs::import_staging_bytes(protocol, 8 * MIB).unwrap(),
-            16 * MIB
-        );
+        assert_eq!(jobs::import_staging_bytes(protocol, 8 * MIB)?, 16 * MIB);
     }
     for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
-        assert_eq!(
-            jobs::import_staging_bytes(protocol, 8 * MIB).unwrap(),
-            8 * MIB
-        );
+        assert_eq!(jobs::import_staging_bytes(protocol, 8 * MIB)?, 8 * MIB);
     }
     assert!(jobs::import_staging_bytes(Protocol::Mysql, u64::MAX).is_err());
+
+    Ok(())
 }
 
 #[test]
@@ -411,15 +417,13 @@ fn mongodb_gzip_export_is_normalized_to_its_native_gzip_archive() {
 }
 
 #[tokio::test]
-async fn mongodb_native_gzip_import_keeps_the_stream_mongorestore_expects() {
-    let directory = tempfile::tempdir().unwrap();
+async fn mongodb_native_gzip_import_keeps_the_stream_mongorestore_expects() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let raw = directory.path().join("raw.archive");
     let native_gzip = directory.path().join("dump.mongodb.archive.gz");
     let prepared = directory.path().join("prepared.mongodb.archive.gz");
-    tokio::fs::write(&raw, b"mongodb archive bytes")
-        .await
-        .unwrap();
-    compress_gzip(&raw, &native_gzip, 1024).await.unwrap();
+    tokio::fs::write(&raw, b"mongodb archive bytes").await?;
+    compress_gzip(&raw, &native_gzip, 1024).await?;
     let options = ImportOptions {
         archive_format: Some("gzip".to_string()),
         ..ImportOptions::default()
@@ -433,13 +437,14 @@ async fn mongodb_native_gzip_import_keeps_the_stream_mongorestore_expects() {
         &options,
         1024,
     )
-    .await
-    .unwrap();
+    .await?;
 
     assert_eq!(
-        tokio::fs::read(&prepared).await.unwrap(),
-        tokio::fs::read(&native_gzip).await.unwrap()
+        tokio::fs::read(&prepared).await?,
+        tokio::fs::read(&native_gzip).await?
     );
+
+    Ok(())
 }
 
 #[test]
@@ -566,7 +571,9 @@ fn mongodb_namespace_pattern_escapes_literal_database_wildcards() {
 }
 
 #[test]
-fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
+fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     use crate::utils::backend::BackendEndpoint;
 
     let mut metadata = crate::server::test_support::metadata("inst_mysql_1", Protocol::Mysql);
@@ -587,22 +594,19 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         "/tmp/export.mysql.sql",
         &ImportExportSelection::default(),
         false,
-    )
-    .unwrap();
+    )?;
     let rollback_export = export_script(
         &metadata,
         "/tmp/rollback.mysql.sql",
         &ImportExportSelection::default(),
         true,
-    )
-    .unwrap();
+    )?;
     let selection = ImportExportSelection::default();
-    let import =
-        import_script(&metadata, "/tmp/import.mysql.sql", None, &selection, false).unwrap();
+    let import = import_script(&metadata, "/tmp/import.mysql.sql", None, &selection, false)?;
     let rollback_import =
-        import_script(&metadata, "/tmp/rollback.mysql.sql", None, &selection, true).unwrap();
-    let wipe = wipe_logical_script(&metadata, false).unwrap();
-    let rollback_wipe = wipe_logical_script(&metadata, true).unwrap();
+        import_script(&metadata, "/tmp/rollback.mysql.sql", None, &selection, true)?;
+    let wipe = wipe_logical_script(&metadata, false)?;
+    let rollback_wipe = wipe_logical_script(&metadata, true)?;
 
     assert_eq!(dump_extension(Protocol::Mysql), "mysql.sql");
     assert!(dump_candidate_suffixes(Protocol::Mysql).contains(&".mysql.sql"));
@@ -644,17 +648,15 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         "/tmp/export.postgres.sql",
         &ImportExportSelection::default(),
         false,
-    )
-    .unwrap();
+    )?;
     let postgres_import = import_script(
         &postgres,
         "/tmp/import.postgres.sql",
         None,
         &selection,
         false,
-    )
-    .unwrap();
-    let postgres_wipe = wipe_logical_script(&postgres, false).unwrap();
+    )?;
+    let postgres_wipe = wipe_logical_script(&postgres, false)?;
     for script in [&postgres_export, &postgres_import, &postgres_wipe] {
         assert!(script.contains("-h /var/run/postgresql"));
         assert!(script.contains("DBE_POSTGRES_PASSWORD"));
@@ -671,7 +673,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         .split_once("\\restrict ")
         .and_then(|(_, suffix)| suffix.split_once('\''))
         .map(|(key, _)| key)
-        .unwrap();
+        .context("expected a value from map")?;
     assert_eq!(restrict_key.len(), 36);
     assert!(restrict_key.starts_with("dbev"));
     assert!(
@@ -687,8 +689,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         false,
         Some((5, 900)),
         ImportConnection::LocalSocket,
-    )
-    .unwrap();
+    )?;
     assert!(wrapped_postgres_import.contains("sed -e '5d' -e '900d' /dev/stdin"));
     assert!(wrapped_postgres_import.contains("\\restrict dbev"));
     assert!(!wrapped_postgres_import.contains("\\unrestrict"));
@@ -700,27 +701,24 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         "/tmp/export.mariadb.sql",
         &ImportExportSelection::default(),
         false,
-    )
-    .unwrap();
+    )?;
     let mariadb_rollback_export = export_script(
         &mariadb,
         "/tmp/rollback.mariadb.sql",
         &ImportExportSelection::default(),
         true,
-    )
-    .unwrap();
+    )?;
     let mariadb_import =
-        import_script(&mariadb, "/tmp/import.mariadb.sql", None, &selection, false).unwrap();
+        import_script(&mariadb, "/tmp/import.mariadb.sql", None, &selection, false)?;
     let mariadb_rollback_import = import_script(
         &mariadb,
         "/tmp/rollback.mariadb.sql",
         None,
         &selection,
         true,
-    )
-    .unwrap();
-    let mariadb_wipe = wipe_logical_script(&mariadb, false).unwrap();
-    let mariadb_rollback_wipe = wipe_logical_script(&mariadb, true).unwrap();
+    )?;
+    let mariadb_wipe = wipe_logical_script(&mariadb, false)?;
+    let mariadb_rollback_wipe = wipe_logical_script(&mariadb, true)?;
     for script in [&mariadb_export, &mariadb_import, &mariadb_wipe] {
         assert!(script.contains("--protocol=socket"));
         assert!(script.contains("--socket=/run/mysqld/mysqld.sock"));
@@ -759,9 +757,8 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         "/tmp/shared.mysql.sql",
         &ImportExportSelection::default(),
         false,
-    )
-    .unwrap();
-    let shared_wipe = wipe_logical_script(&shared_mysql, false).unwrap();
+    )?;
+    let shared_wipe = wipe_logical_script(&shared_mysql, false)?;
     assert!(shared_export.contains("-u \"$MYSQL_USER\""));
     assert!(shared_export.contains("DBE_MYSQL_PASSWORD"));
     assert!(!shared_export.contains("MYSQL_ROOT_PASSWORD"));
@@ -777,8 +774,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         false,
         None,
         ImportConnection::PoolLoopback,
-    )
-    .unwrap();
+    )?;
     assert!(shared_mysql_helper.contains("--protocol=TCP"));
     assert!(shared_mysql_helper.contains("--host=127.0.0.1"));
     assert!(!shared_mysql_helper.contains("mysqld.sock"));
@@ -795,7 +791,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
 
     let mut shared_postgres = shared_mysql.clone();
     shared_postgres.protocol = Protocol::Postgres;
-    let shared_postgres_wipe = wipe_logical_script(&shared_postgres, false).unwrap();
+    let shared_postgres_wipe = wipe_logical_script(&shared_postgres, false)?;
     assert!(shared_postgres_wipe.contains("c.relowner"));
     assert!(!shared_postgres_wipe.contains("CREATE SCHEMA public"));
     let shared_postgres_helper = build_import_script(
@@ -806,8 +802,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         false,
         None,
         ImportConnection::PoolLoopback,
-    )
-    .unwrap();
+    )?;
     assert!(shared_postgres_helper.contains("-h 127.0.0.1"));
     assert!(!shared_postgres_helper.contains("/var/run/postgresql"));
     assert!(!shared_postgres_helper.contains("$POSTGRES_PASSWORD"));
@@ -819,9 +814,8 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         "/tmp/shared.mariadb.sql",
         &ImportExportSelection::default(),
         false,
-    )
-    .unwrap();
-    let shared_mariadb_wipe = wipe_logical_script(&shared_mariadb, false).unwrap();
+    )?;
+    let shared_mariadb_wipe = wipe_logical_script(&shared_mariadb, false)?;
     assert!(shared_mariadb_export.contains("--skip-routines --skip-events --skip-triggers"));
     assert!(!shared_mariadb_export.contains("information_schema.ROUTINES"));
     assert!(shared_mariadb_wipe.contains("DBE_MARIADB_PASSWORD"));
@@ -835,8 +829,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         false,
         None,
         ImportConnection::PoolLoopback,
-    )
-    .unwrap();
+    )?;
     assert!(shared_mariadb_helper.contains("--protocol=TCP"));
     assert!(shared_mariadb_helper.contains("--host=127.0.0.1"));
     assert!(!shared_mariadb_helper.contains("mysqld.sock"));
@@ -856,8 +849,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         None,
         &mongodb_selection,
         false,
-    )
-    .unwrap();
+    )?;
     assert!(mongodb_import.contains("mongorestore"));
     assert!(mongodb_import.contains("--nsInclude \"$DBE_MONGO_DATABASE\".'orders'"));
     assert!(mongodb_import.contains("--nsInclude \"$DBE_MONGO_DATABASE\".'customers'"));
@@ -872,9 +864,8 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         None,
         &ImportExportSelection::default(),
         false,
-    )
-    .unwrap();
-    let shared_mongodb_wipe = wipe_logical_script(&shared_mongodb, false).unwrap();
+    )?;
+    let shared_mongodb_wipe = wipe_logical_script(&shared_mongodb, false)?;
     assert!(shared_mongodb_import.contains("DBE_MONGO_USER"));
     assert!(shared_mongodb_import.contains("DBE_MONGO_PASSWORD"));
     assert!(!shared_mongodb_import.contains("DBE_MONGO_ROOT_PASSWORD"));
@@ -888,28 +879,29 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         "/tmp/shared.clickhouse.sql",
         &ImportExportSelection::default(),
         false,
-    )
-    .unwrap();
-    let shared_clickhouse_wipe = wipe_logical_script(&shared_clickhouse, false).unwrap();
+    )?;
+    let shared_clickhouse_wipe = wipe_logical_script(&shared_clickhouse, false)?;
     assert!(shared_clickhouse_export.contains("ORDER BY engine = 'View'"));
     assert!(shared_clickhouse_export.contains("DROP VIEW IF EXISTS"));
     assert!(shared_clickhouse_export.contains("MaterializedView|LiveView|WindowView"));
     assert!(shared_clickhouse_wipe.contains("ORDER BY engine != 'View'"));
     assert!(shared_clickhouse_wipe.contains("drop='DROP VIEW'"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn artifact_imports_are_scoped_to_the_requested_instance() {
-    let dir = tempfile::tempdir().unwrap();
+async fn artifact_imports_are_scoped_to_the_requested_instance() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     let artifacts = dir.path().join("artifacts");
     let exports = artifacts.join("exports").join("instance-1");
     let foreign_exports = artifacts.join("exports").join("instance-2");
-    std::fs::create_dir_all(&exports).unwrap();
-    std::fs::create_dir_all(&foreign_exports).unwrap();
+    std::fs::create_dir_all(&exports)?;
+    std::fs::create_dir_all(&foreign_exports)?;
     let allowed = exports.join("dump.postgres.sql");
     let outside = foreign_exports.join("dump.postgres.sql");
-    std::fs::write(&allowed, b"select 1").unwrap();
-    std::fs::write(&outside, b"select 1").unwrap();
+    std::fs::write(&allowed, b"select 1")?;
+    std::fs::write(&outside, b"select 1")?;
     let state = test_state_with_config(Config {
         paths: crate::config::PathConfig {
             artifacts: artifacts.display().to_string(),
@@ -920,41 +912,41 @@ async fn artifact_imports_are_scoped_to_the_requested_instance() {
     .await;
 
     assert_eq!(
-        validate_artifact_path(&state, "instance-1", FsPath::new("dump.postgres.sql"))
-            .await
-            .unwrap(),
-        allowed.canonicalize().unwrap()
+        validate_artifact_path(&state, "instance-1", FsPath::new("dump.postgres.sql")).await?,
+        allowed.canonicalize()?
     );
     {
         use std::os::unix::fs::PermissionsExt;
 
         assert_eq!(
-            std::fs::metadata(&allowed).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&allowed)?.permissions().mode() & 0o777,
             0o600
         );
         assert_eq!(
-            std::fs::metadata(&exports).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&exports)?.permissions().mode() & 0o777,
             0o700
         );
     }
     let error = validate_artifact_path(&state, "instance-1", &outside)
         .await
-        .unwrap_err();
+        .expect_err("validate artifact path should return an error");
     assert!(error.to_string().contains("requested instance"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn artifact_import_rejects_symlinks_inside_allowed_root() {
+async fn artifact_import_rejects_symlinks_inside_allowed_root() -> anyhow::Result<()> {
     use std::os::unix::fs::symlink;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let artifacts = dir.path().join("artifacts");
     let exports = artifacts.join("exports").join("instance-1");
-    std::fs::create_dir_all(&exports).unwrap();
+    std::fs::create_dir_all(&exports)?;
     let real = exports.join("real.postgres.sql");
     let link = exports.join("linked.postgres.sql");
-    std::fs::write(&real, b"select 1").unwrap();
-    symlink(&real, &link).unwrap();
+    std::fs::write(&real, b"select 1")?;
+    symlink(&real, &link)?;
     let state = test_state_with_config(Config {
         paths: crate::config::PathConfig {
             artifacts: artifacts.display().to_string(),
@@ -966,14 +958,16 @@ async fn artifact_import_rejects_symlinks_inside_allowed_root() {
 
     let error = validate_artifact_path(&state, "instance-1", &link)
         .await
-        .unwrap_err();
+        .expect_err("validate artifact path should return an error");
 
     assert!(error.to_string().contains("real regular file"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn artifact_import_rejects_relative_path_traversal() {
-    let dir = tempfile::tempdir().unwrap();
+async fn artifact_import_rejects_relative_path_traversal() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     let artifacts = dir.path().join("missing-artifacts");
     let state = test_state_with_config(Config {
         paths: crate::config::PathConfig {
@@ -986,17 +980,20 @@ async fn artifact_import_rejects_relative_path_traversal() {
 
     let error = validate_artifact_path(&state, "instance-1", FsPath::new("../../etc/passwd"))
         .await
-        .unwrap_err();
+        .expect_err("validate artifact path should return an error");
 
     assert!(error.to_string().contains("invalid artifact_id"));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn artifact_import_rejects_outside_absolute_path_when_exports_root_is_missing() {
-    let dir = tempfile::tempdir().unwrap();
+async fn artifact_import_rejects_outside_absolute_path_when_exports_root_is_missing()
+-> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     let artifacts = dir.path().join("artifacts");
     let outside = dir.path().join("outside.postgres.sql");
-    std::fs::write(&outside, b"select 1").unwrap();
+    std::fs::write(&outside, b"select 1")?;
     let state = test_state_with_config(Config {
         paths: crate::config::PathConfig {
             artifacts: artifacts.display().to_string(),
@@ -1008,14 +1005,16 @@ async fn artifact_import_rejects_outside_absolute_path_when_exports_root_is_miss
 
     let error = validate_artifact_path(&state, "instance-1", &outside)
         .await
-        .unwrap_err();
+        .expect_err("validate artifact path should return an error");
 
     assert!(error.to_string().contains("requested instance"));
     assert!(artifacts.join("exports").join("instance-1").is_dir());
+
+    Ok(())
 }
 
 #[test]
-fn remote_import_source_is_typed_and_does_not_accept_a_protocol_override() {
+fn remote_import_source_is_typed_and_does_not_accept_a_protocol_override() -> anyhow::Result<()> {
     let request = serde_json::from_value::<ImportRequest>(serde_json::json!({
         "source": {
             "type": "remote",
@@ -1027,8 +1026,7 @@ fn remote_import_source_is_typed_and_does_not_accept_a_protocol_override() {
             "password": "secret"
         },
         "mode": "wipe"
-    }))
-    .unwrap();
+    }))?;
     assert_eq!(request.mode, ImportMode::Wipe);
     assert!(matches!(request.source, ImportSource::Remote(_)));
 
@@ -1043,10 +1041,12 @@ fn remote_import_source_is_typed_and_does_not_accept_a_protocol_override() {
         }
     }));
     assert!(override_attempt.is_err());
+
+    Ok(())
 }
 
 #[test]
-fn mongodb_upload_source_database_is_validated_and_preserved_for_replay() {
+fn mongodb_upload_source_database_is_validated_and_preserved_for_replay() -> anyhow::Result<()> {
     let request = serde_json::from_value::<ImportRequest>(serde_json::json!({
         "source": {
             "type": "upload",
@@ -1054,27 +1054,28 @@ fn mongodb_upload_source_database_is_validated_and_preserved_for_replay() {
             "source_database": "legacy_tenant"
         },
         "mode": "wipe"
-    }))
-    .unwrap();
+    }))?;
     let options = ImportOptions::from(&request);
 
     assert_eq!(options.source_database.as_deref(), Some("legacy_tenant"));
-    validate_source_database(Protocol::Mongodb, &options).unwrap();
+    validate_source_database(Protocol::Mongodb, &options)?;
     let replay = serde_json::to_string(&ReplayDescriptor::UploadImport {
         upload_id: "upload-1".to_string(),
         source_database: options.source_database.clone(),
         mode: options.mode,
         selection: options.selection.clone(),
-    })
-    .unwrap();
+    })?;
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&replay).unwrap()["source_database"],
+        serde_json::from_str::<serde_json::Value>(&replay)?["source_database"],
         "legacy_tenant"
     );
+
+    Ok(())
 }
 
 #[test]
-fn mongodb_upload_allows_catalog_resolution_but_rejects_unsafe_manual_database() {
+fn mongodb_upload_allows_catalog_resolution_but_rejects_unsafe_manual_database()
+-> anyhow::Result<()> {
     let missing = ImportOptions {
         source: ImportSourceOptions::Upload {
             upload_id: "upload-1".to_string(),
@@ -1082,13 +1083,14 @@ fn mongodb_upload_allows_catalog_resolution_but_rejects_unsafe_manual_database()
         },
         ..ImportOptions::default()
     };
-    validate_source_database(Protocol::Mongodb, &missing).unwrap();
+    validate_source_database(Protocol::Mongodb, &missing)?;
 
     let invalid = ImportOptions {
         source_database: Some("unsafe.name".to_string()),
         ..missing.clone()
     };
-    let error = validate_source_database(Protocol::Mongodb, &invalid).unwrap_err();
+    let error = validate_source_database(Protocol::Mongodb, &invalid)
+        .expect_err("validate source database should return an error");
     assert!(matches!(error, ApiError::BadRequest(_)));
     assert!(error.to_string().contains("1-63 UTF-8 bytes"));
 
@@ -1096,8 +1098,11 @@ fn mongodb_upload_allows_catalog_resolution_but_rejects_unsafe_manual_database()
         source_database: Some("legacy_tenant".to_string()),
         ..missing
     };
-    let error = validate_source_database(Protocol::Postgres, &wrong_protocol).unwrap_err();
+    let error = validate_source_database(Protocol::Postgres, &wrong_protocol)
+        .expect_err("validate source database should return an error");
     assert!(error.to_string().contains("only for mongodb"));
+
+    Ok(())
 }
 
 #[test]
@@ -1130,7 +1135,9 @@ fn legacy_archive_flags_are_rejected_instead_of_ignored() {
 }
 
 #[test]
-fn export_selection_accepts_only_the_legacy_empty_fields_array() {
+fn export_selection_accepts_only_the_legacy_empty_fields_array() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let request = serde_json::from_value::<ExportRequest>(serde_json::json!({
         "selection": {
             "mode": "selective",
@@ -1138,10 +1145,17 @@ fn export_selection_accepts_only_the_legacy_empty_fields_array() {
             "exclude": [],
             "fields": []
         }
-    }))
-    .unwrap();
+    }))?;
 
-    assert!(request.selection.unwrap().fields.is_empty());
+    assert!(
+        request
+            .selection
+            .context(
+                "export selection accepts only the legacy empty fields array should provide a value"
+            )?
+            .fields
+            .is_empty()
+    );
     let error = serde_json::from_value::<ExportRequest>(serde_json::json!({
         "selection": {
             "mode": "selective",
@@ -1150,13 +1164,15 @@ fn export_selection_accepts_only_the_legacy_empty_fields_array() {
             "fields": ["id"]
         }
     }))
-    .unwrap_err();
+    .expect_err("from value should return an error");
 
     assert!(
         error
             .to_string()
             .contains("selection.fields must be an object or an empty array")
     );
+
+    Ok(())
 }
 
 #[test]
@@ -1179,13 +1195,13 @@ fn selective_import_cannot_exclude_an_included_object() {
         let error = protocol
             .engine()
             .validate_selection(&selection, SelectionUse::Import)
-            .unwrap_err();
+            .expect_err("validate selection should return an error");
         assert!(error.to_string().contains("both include and exclude"));
     }
 }
 
 #[test]
-fn mongodb_dump_selection_uses_supported_collection_flags() {
+fn mongodb_dump_selection_uses_supported_collection_flags() -> anyhow::Result<()> {
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
         include: vec!["orders".to_string()],
@@ -1193,16 +1209,18 @@ fn mongodb_dump_selection_uses_supported_collection_flags() {
         ..ImportExportSelection::default()
     };
 
-    let args = mongodb_dump_selection_args(&selection).unwrap();
+    let args = mongodb_dump_selection_args(&selection)?;
 
     assert!(args.contains("--collection='orders'"));
     assert!(!args.contains("--excludeCollection"));
     assert!(!args.contains("--nsInclude"));
     assert!(!args.contains("--nsExclude"));
+
+    Ok(())
 }
 
 #[test]
-fn only_mongodb_logical_artifacts_accept_selective_imports() {
+fn only_mongodb_logical_artifacts_accept_selective_imports() -> anyhow::Result<()> {
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
         include: vec!["orders".to_string()],
@@ -1211,8 +1229,7 @@ fn only_mongodb_logical_artifacts_accept_selective_imports() {
 
     Protocol::Mongodb
         .engine()
-        .validate_artifact_selection(&selection)
-        .unwrap();
+        .validate_artifact_selection(&selection)?;
     for protocol in [
         Protocol::Postgres,
         Protocol::Mariadb,
@@ -1225,9 +1242,11 @@ fn only_mongodb_logical_artifacts_accept_selective_imports() {
         let error = protocol
             .engine()
             .validate_artifact_selection(&selection)
-            .unwrap_err();
+            .expect_err("validate artifact selection should return an error");
         assert!(error.to_string().contains("selection.mode=full"));
     }
+
+    Ok(())
 }
 
 #[test]
@@ -1254,7 +1273,7 @@ fn local_mongodb_rollback_import_keeps_selection_but_prefiltered_remote_does_not
 }
 
 #[test]
-fn mongodb_restore_namespace_args_cover_local_remapped_and_full_selections() {
+fn mongodb_restore_namespace_args_cover_local_remapped_and_full_selections() -> anyhow::Result<()> {
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
         include: vec!["orders".to_string(), "customers_2026".to_string()],
@@ -1262,7 +1281,7 @@ fn mongodb_restore_namespace_args_cover_local_remapped_and_full_selections() {
         ..ImportExportSelection::default()
     };
 
-    let args = mongodb_restore_namespace_args(&selection, None).unwrap();
+    let args = mongodb_restore_namespace_args(&selection, None)?;
 
     assert_eq!(
         args,
@@ -1282,7 +1301,7 @@ fn mongodb_restore_namespace_args_cover_local_remapped_and_full_selections() {
         ..ImportExportSelection::default()
     };
 
-    let args = mongodb_restore_namespace_args(&selection, Some("tenant*archive")).unwrap();
+    let args = mongodb_restore_namespace_args(&selection, Some("tenant*archive"))?;
 
     assert_eq!(
         args,
@@ -1298,17 +1317,19 @@ fn mongodb_restore_namespace_args_cover_local_remapped_and_full_selections() {
     let full = ImportExportSelection::default();
 
     assert_eq!(
-        mongodb_restore_namespace_args(&full, None).unwrap(),
+        mongodb_restore_namespace_args(&full, None)?,
         "--nsInclude \"$DBE_MONGO_DATABASE.*\""
     );
     assert_eq!(
-        mongodb_restore_namespace_args(&full, Some("analytics")).unwrap(),
+        mongodb_restore_namespace_args(&full, Some("analytics"))?,
         concat!(
             "--nsInclude 'analytics.*' \\\n",
             "  --nsFrom 'analytics.*' \\\n",
             "  --nsTo \"$DBE_MONGO_DATABASE.*\""
         )
     );
+
+    Ok(())
 }
 
 #[test]
@@ -1319,7 +1340,8 @@ fn mongodb_restore_selection_rejects_overlap_and_shell_injection() {
         exclude: vec!["orders".to_string()],
         ..ImportExportSelection::default()
     };
-    let overlap_error = mongodb_restore_namespace_args(&overlap, None).unwrap_err();
+    let overlap_error = mongodb_restore_namespace_args(&overlap, None)
+        .expect_err("mongodb restore namespace args should return an error");
     assert!(
         overlap_error
             .to_string()
@@ -1331,7 +1353,8 @@ fn mongodb_restore_selection_rejects_overlap_and_shell_injection() {
         include: vec!["orders'; touch /tmp/pwn; #".to_string()],
         ..ImportExportSelection::default()
     };
-    let injection_error = mongodb_restore_namespace_args(&injection, Some("source")).unwrap_err();
+    let injection_error = mongodb_restore_namespace_args(&injection, Some("source"))
+        .expect_err("mongodb restore namespace args should return an error");
     assert!(
         injection_error
             .to_string()
@@ -1340,7 +1363,8 @@ fn mongodb_restore_selection_rejects_overlap_and_shell_injection() {
 }
 
 #[test]
-fn mongodb_remote_import_accepts_multiple_collections_but_export_stays_single_collection() {
+fn mongodb_remote_import_accepts_multiple_collections_but_export_stays_single_collection()
+-> anyhow::Result<()> {
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
         include: vec!["orders".to_string(), "customers".to_string()],
@@ -1349,17 +1373,18 @@ fn mongodb_remote_import_accepts_multiple_collections_but_export_stays_single_co
 
     Protocol::Mongodb
         .engine()
-        .validate_selection(&selection, SelectionUse::Import)
-        .unwrap();
+        .validate_selection(&selection, SelectionUse::Import)?;
     let export_error = Protocol::Mongodb
         .engine()
         .validate_selection(&selection, SelectionUse::Export)
-        .unwrap_err();
+        .expect_err("validate selection should return an error");
     assert!(
         export_error
             .to_string()
             .contains("exactly one included collection")
     );
+
+    Ok(())
 }
 
 #[test]
@@ -1373,12 +1398,13 @@ fn mongodb_selection_rejects_duplicate_included_collections() {
     let error = Protocol::Mongodb
         .engine()
         .validate_selection(&selection, SelectionUse::Import)
-        .unwrap_err();
+        .expect_err("validate selection should return an error");
     assert!(error.to_string().contains("more than once"));
 }
 
 #[tokio::test]
-async fn qdrant_artifact_selection_must_be_full_but_remote_may_be_selective() {
+async fn qdrant_artifact_selection_must_be_full_but_remote_may_be_selective() -> anyhow::Result<()>
+{
     let state = test_state_with_config(Config::default()).await;
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
@@ -1393,28 +1419,29 @@ async fn qdrant_artifact_selection_must_be_full_but_remote_may_be_selective() {
 
     let error = validate_import_source(&state, Protocol::Qdrant, &artifact)
         .await
-        .unwrap_err();
+        .expect_err("validate import source should return an error");
     assert!(error.to_string().contains("selection.mode=full"));
 
     let request: RemoteImportRequest = serde_json::from_value(serde_json::json!({
         "host": "qdrant.example.com",
         "port": 6333,
         "tls": true
-    }))
-    .unwrap();
+    }))?;
     let remote = ImportOptions {
         source: ImportSourceOptions::RemoteRequest(request),
         selection,
         ..ImportOptions::default()
     };
-    validate_import_source(&state, Protocol::Qdrant, &remote)
-        .await
-        .unwrap();
+    validate_import_source(&state, Protocol::Qdrant, &remote).await?;
+
+    Ok(())
 }
 
 async fn test_state_with_config(config: Config) -> AppState {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let pool = sqlite::connect(dir.path())
+        .await
+        .expect("path should succeed");
     let store = InstanceStore::default();
     let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool.clone()));
     test_state_with_store(store, manager, config, pool)
@@ -1437,26 +1464,28 @@ fn test_state_with_store(
 }
 
 #[test]
-fn extracted_file_collection_is_bounded_and_ignores_links() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(root.path().join("nested/deeper")).unwrap();
-    std::fs::write(root.path().join("nested/deeper/dump.sql"), b"select 1").unwrap();
-    std::os::unix::fs::symlink("/etc", root.path().join("link")).unwrap();
+fn extracted_file_collection_is_bounded_and_ignores_links() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir_all(root.path().join("nested/deeper"))?;
+    std::fs::write(root.path().join("nested/deeper/dump.sql"), b"select 1")?;
+    std::os::unix::fs::symlink("/etc", root.path().join("link"))?;
     let mut files = Vec::new();
-    collect_regular_files(root.path(), &mut files).unwrap();
+    collect_regular_files(root.path(), &mut files)?;
     assert_eq!(files, [root.path().join("nested/deeper/dump.sql")]);
 
-    let deep = tempfile::tempdir().unwrap();
+    let deep = tempfile::tempdir()?;
     let mut path = deep.path().to_path_buf();
     for level in 0..=MAX_ARCHIVE_DEPTH {
         path.push(format!("d{level}"));
     }
-    std::fs::create_dir_all(&path).unwrap();
+    std::fs::create_dir_all(&path)?;
     assert!(collect_regular_files(deep.path(), &mut Vec::new()).is_err());
 
-    let wide = tempfile::tempdir().unwrap();
+    let wide = tempfile::tempdir()?;
     for index in 0..=MAX_ARCHIVE_ENTRIES {
-        std::fs::write(wide.path().join(format!("f{index}")), b"").unwrap();
+        std::fs::write(wide.path().join(format!("f{index}")), b"")?;
     }
     assert!(collect_regular_files(wide.path(), &mut Vec::new()).is_err());
+
+    Ok(())
 }

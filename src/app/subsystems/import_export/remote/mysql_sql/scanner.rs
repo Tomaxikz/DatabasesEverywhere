@@ -45,9 +45,7 @@ pub(super) fn rewrite_sql<R: Read, W: Write>(
             continue;
         }
 
-        let byte = input
-            .next_byte()?
-            .expect("a special byte must remain available");
+        let byte = input.require_byte()?;
         match byte {
             b'\'' => {
                 executable_version_pending = false;
@@ -236,11 +234,7 @@ pub(super) fn handle_unquoted_token<R: Read, W: Write>(
             context.observe_identifier_or_value();
             return Ok(0);
         }
-        token.push(
-            input
-                .next_byte()?
-                .expect("peek confirmed an unquoted token byte"),
-        );
+        token.push(input.require_byte()?);
     }
 
     if executable_version_pending && token.iter().all(|byte| byte.is_ascii_digit()) {
@@ -382,9 +376,7 @@ pub(super) fn copy_quoted_string<R: Read, W: Write>(
             continue;
         }
 
-        let byte = input
-            .next_byte()?
-            .expect("a quoted-string special byte must remain available");
+        let byte = input.require_byte()?;
         match byte {
             b'\\' => {
                 output.write_byte(byte)?;
@@ -447,9 +439,7 @@ pub(super) fn copy_line_comment<R: Read, W: Write>(
             continue;
         }
 
-        let byte = input
-            .next_byte()?
-            .expect("a line-comment special byte must remain available");
+        let byte = input.require_byte()?;
         if byte == b'\n' {
             output.write_byte(byte)?;
             return Ok(());

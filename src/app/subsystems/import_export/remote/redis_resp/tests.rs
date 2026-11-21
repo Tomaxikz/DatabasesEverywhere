@@ -24,12 +24,15 @@ fn encode_command(arguments: &[&[u8]]) -> Vec<u8> {
 
 async fn read_exact_command(server: &mut DuplexStream, expected: &[u8]) {
     let mut actual = vec![0_u8; expected.len()];
-    server.read_exact(&mut actual).await.unwrap();
+    server
+        .read_exact(&mut actual)
+        .await
+        .expect("read exact should succeed");
     assert_eq!(actual, expected);
 }
 
 #[tokio::test]
-async fn dump_restore_relay_preserves_binary_keys_and_payloads() {
+async fn dump_restore_relay_preserves_binary_keys_and_payloads() -> anyhow::Result<()> {
     let key = b"line\r\nnul\0tail";
     let payload = b"\x00\r\n\xff\n\r\0tail";
     let expected_dump = encode_command(&[b"DUMP", key]);
@@ -42,13 +45,22 @@ async fn dump_restore_relay_preserves_binary_keys_and_payloads() {
         source_server
             .write_all(format!("${}\r\n", payload.len()).as_bytes())
             .await
-            .unwrap();
-        source_server.write_all(payload).await.unwrap();
-        source_server.write_all(b"\r\n").await.unwrap();
+            .expect("as bytes should succeed");
+        source_server
+            .write_all(payload)
+            .await
+            .expect("write all should succeed");
+        source_server
+            .write_all(b"\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let target_task = tokio::spawn(async move {
         read_exact_command(&mut target_server, &expected_restore).await;
-        target_server.write_all(b"+OK\r\n").await.unwrap();
+        target_server
+            .write_all(b"+OK\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let mut source = connection(source_client);
     let mut target = connection(target_client);
@@ -60,16 +72,17 @@ async fn dump_restore_relay_preserves_binary_keys_and_payloads() {
             RedisRestoreExpiration::Persistent,
             TEST_MAX_STREAMED_BULK_LEN,
         )
-        .await
-        .unwrap();
+        .await?;
 
     assert!(restored);
-    source_task.await.unwrap();
-    target_task.await.unwrap();
+    source_task.await?;
+    target_task.await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn dump_restore_relay_streams_payload_larger_than_its_buffer_exactly() {
+async fn dump_restore_relay_streams_payload_larger_than_its_buffer_exactly() -> anyhow::Result<()> {
     let key = b"large-key";
     let payload = (0..(RELAY_BUFFER_BYTES * 3 + 137))
         .map(|index| ((index * 131 + 17) % 256) as u8)
@@ -94,18 +107,21 @@ async fn dump_restore_relay_streams_payload_larger_than_its_buffer_exactly() {
         source_server
             .write_all(format!("${}\r\n", source_payload.len()).as_bytes())
             .await
-            .unwrap();
+            .expect("as bytes should succeed");
         let split = RELAY_BUFFER_BYTES / 2;
         source_server
             .write_all(&source_payload[..split])
             .await
-            .unwrap();
+            .expect("write all should succeed");
         tokio::time::sleep(Duration::from_millis(20)).await;
         source_server
             .write_all(&source_payload[split..])
             .await
-            .unwrap();
-        source_server.write_all(b"\r\n").await.unwrap();
+            .expect("write all should succeed");
+        source_server
+            .write_all(b"\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let target_task = tokio::spawn(async move {
         read_exact_command(&mut target_server, &restore_prefix).await;
@@ -116,7 +132,7 @@ async fn dump_restore_relay_streams_payload_larger_than_its_buffer_exactly() {
             target_server
                 .read_exact(&mut buffer[..length])
                 .await
-                .unwrap();
+                .expect("read exact should succeed");
             assert_eq!(
                 &buffer[..length],
                 &expected_payload[offset..offset + length]
@@ -124,7 +140,10 @@ async fn dump_restore_relay_streams_payload_larger_than_its_buffer_exactly() {
             offset += length;
         }
         read_exact_command(&mut target_server, b"\r\n$7\r\nREPLACE\r\n$6\r\nABSTTL\r\n").await;
-        target_server.write_all(b"+OK\r\n").await.unwrap();
+        target_server
+            .write_all(b"+OK\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let mut source = connection(source_client);
     let mut target = connection(target_client);
@@ -136,23 +155,27 @@ async fn dump_restore_relay_streams_payload_larger_than_its_buffer_exactly() {
             RedisRestoreExpiration::AbsoluteUnixMilliseconds(1_900_000_000_123),
             TEST_MAX_STREAMED_BULK_LEN,
         )
-        .await
-        .unwrap();
+        .await?;
 
     assert!(restored);
-    source_task.await.unwrap();
-    target_task.await.unwrap();
+    source_task.await?;
+    target_task.await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn dump_restore_relay_skips_null_dump_without_touching_target() {
+async fn dump_restore_relay_skips_null_dump_without_touching_target() -> anyhow::Result<()> {
     let key = b"expired";
     let expected_dump = encode_command(&[b"DUMP", key]);
     let (source_client, mut source_server) = tokio::io::duplex(1024);
     let (target_client, mut target_server) = tokio::io::duplex(1024);
     let source_task = tokio::spawn(async move {
         read_exact_command(&mut source_server, &expected_dump).await;
-        source_server.write_all(b"$-1\r\n").await.unwrap();
+        source_server
+            .write_all(b"$-1\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let mut source = connection(source_client);
     let mut target = connection(target_client);
@@ -164,8 +187,7 @@ async fn dump_restore_relay_skips_null_dump_without_touching_target() {
             RedisRestoreExpiration::Persistent,
             TEST_MAX_STREAMED_BULK_LEN,
         )
-        .await
-        .unwrap();
+        .await?;
 
     assert!(!restored);
     assert!(
@@ -173,11 +195,13 @@ async fn dump_restore_relay_skips_null_dump_without_touching_target() {
             .await
             .is_err()
     );
-    source_task.await.unwrap();
+    source_task.await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn dump_restore_relay_requires_restore_ok() {
+async fn dump_restore_relay_requires_restore_ok() -> anyhow::Result<()> {
     let key = b"key";
     let payload = b"value";
     let expected_dump = encode_command(&[b"DUMP", key]);
@@ -186,11 +210,17 @@ async fn dump_restore_relay_requires_restore_ok() {
     let (target_client, mut target_server) = tokio::io::duplex(1024);
     let source_task = tokio::spawn(async move {
         read_exact_command(&mut source_server, &expected_dump).await;
-        source_server.write_all(b"$5\r\nvalue\r\n").await.unwrap();
+        source_server
+            .write_all(b"$5\r\nvalue\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let target_task = tokio::spawn(async move {
         read_exact_command(&mut target_server, &expected_restore).await;
-        target_server.write_all(b"+NOPE\r\n").await.unwrap();
+        target_server
+            .write_all(b"+NOPE\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let mut source = connection(source_client);
     let mut target = connection(target_client);
@@ -203,7 +233,7 @@ async fn dump_restore_relay_requires_restore_ok() {
             TEST_MAX_STREAMED_BULK_LEN,
         )
         .await
-        .unwrap_err();
+        .expect_err("relay restore replace should return an error");
 
     assert!(matches!(
         error,
@@ -212,12 +242,14 @@ async fn dump_restore_relay_requires_restore_ok() {
             ..
         })
     ));
-    source_task.await.unwrap();
-    target_task.await.unwrap();
+    source_task.await?;
+    target_task.await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn dump_restore_relay_decouples_streamed_and_control_bulk_limits() {
+async fn dump_restore_relay_decouples_streamed_and_control_bulk_limits() -> anyhow::Result<()> {
     let key = b"key";
     let payload = b"123456789";
     let expected_dump = encode_command(&[b"DUMP", key]);
@@ -229,11 +261,14 @@ async fn dump_restore_relay_decouples_streamed_and_control_bulk_limits() {
         source_server
             .write_all(b"$9\r\n123456789\r\n")
             .await
-            .unwrap();
+            .expect("write all should succeed");
     });
     let target_task = tokio::spawn(async move {
         read_exact_command(&mut target_server, &expected_restore).await;
-        target_server.write_all(b"+OK\r\n").await.unwrap();
+        target_server
+            .write_all(b"+OK\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let control_limits = RespLimits {
         max_bulk_len: 8,
@@ -249,23 +284,28 @@ async fn dump_restore_relay_decouples_streamed_and_control_bulk_limits() {
             RedisRestoreExpiration::Persistent,
             payload.len(),
         )
-        .await
-        .unwrap();
+        .await?;
 
     assert!(restored);
-    source_task.await.unwrap();
-    target_task.await.unwrap();
+    source_task.await?;
+    target_task.await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn dump_restore_relay_enforces_source_and_target_bulk_limits_before_copying() {
+async fn dump_restore_relay_enforces_source_and_target_bulk_limits_before_copying()
+-> anyhow::Result<()> {
     let key = b"key";
     let expected_dump = encode_command(&[b"DUMP", key]);
     let (source_client, mut source_server) = tokio::io::duplex(1024);
     let (target_client, mut target_server) = tokio::io::duplex(1024);
     let source_task = tokio::spawn(async move {
         read_exact_command(&mut source_server, &expected_dump).await;
-        source_server.write_all(b"$9\r\n").await.unwrap();
+        source_server
+            .write_all(b"$9\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let mut source = connection_with_limits(
         source_client,
@@ -279,7 +319,7 @@ async fn dump_restore_relay_enforces_source_and_target_bulk_limits_before_copyin
     let error = source
         .relay_restore_replace(&mut target, key, RedisRestoreExpiration::Persistent, 8)
         .await
-        .unwrap_err();
+        .expect_err("relay restore replace should return an error");
 
     assert!(matches!(
         error,
@@ -293,7 +333,7 @@ async fn dump_restore_relay_enforces_source_and_target_bulk_limits_before_copyin
             .await
             .is_err()
     );
-    source_task.await.unwrap();
+    source_task.await?;
 
     let key = b"nine-byte";
     let expected_dump = encode_command(&[b"DUMP", key]);
@@ -301,7 +341,10 @@ async fn dump_restore_relay_enforces_source_and_target_bulk_limits_before_copyin
     let (target_client, mut target_server) = tokio::io::duplex(1024);
     let source_task = tokio::spawn(async move {
         read_exact_command(&mut source_server, &expected_dump).await;
-        source_server.write_all(b"$1\r\n").await.unwrap();
+        source_server
+            .write_all(b"$1\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let mut source = connection(source_client);
     let mut target = connection_with_limits(
@@ -320,7 +363,7 @@ async fn dump_restore_relay_enforces_source_and_target_bulk_limits_before_copyin
             TEST_MAX_STREAMED_BULK_LEN,
         )
         .await
-        .unwrap_err();
+        .expect_err("relay restore replace should return an error");
 
     assert!(matches!(
         error,
@@ -334,11 +377,13 @@ async fn dump_restore_relay_enforces_source_and_target_bulk_limits_before_copyin
             .await
             .is_err()
     );
-    source_task.await.unwrap();
+    source_task.await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn scan_preserves_binary_keys_and_parses_cursor() {
+async fn scan_preserves_binary_keys_and_parses_cursor() -> anyhow::Result<()> {
     let (client, mut server) = tokio::io::duplex(4096);
     let server_task = tokio::spawn(async move {
         let expected = b"*4\r\n$4\r\nSCAN\r\n$1\r\n0\r\n$5\r\nCOUNT\r\n$2\r\n25\r\n";
@@ -346,36 +391,43 @@ async fn scan_preserves_binary_keys_and_parses_cursor() {
         server
             .write_all(b"*2\r\n$2\r\n42\r\n*2\r\n$3\r\na\nb\r\n$3\r\nx\0y\r\n")
             .await
-            .unwrap();
+            .expect("write all should succeed");
     });
     let mut client = connection(client);
 
-    let page = client.scan(0, 25).await.unwrap();
+    let page = client.scan(0, 25).await?;
 
     assert_eq!(page.next_cursor, 42);
     assert_eq!(page.keys, vec![b"a\nb".to_vec(), b"x\0y".to_vec()]);
-    server_task.await.unwrap();
+    server_task.await?;
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn command_turns_resp_error_into_typed_server_error() {
+async fn command_turns_resp_error_into_typed_server_error() -> anyhow::Result<()> {
     let (client, mut server) = tokio::io::duplex(1024);
     let server_task = tokio::spawn(async move {
         read_exact_command(&mut server, b"*1\r\n$4\r\nPING\r\n").await;
         server
             .write_all(b"-WRONGPASS invalid credentials\r\n")
             .await
-            .unwrap();
+            .expect("write all should succeed");
     });
     let mut client = connection(client);
 
-    let error = client.ping().await.unwrap_err();
+    let error = client
+        .ping()
+        .await
+        .expect_err("ping should return an error");
 
     assert!(matches!(
         error,
         RedisRespError::Server(message) if message == "WRONGPASS invalid credentials"
     ));
-    server_task.await.unwrap();
+    server_task.await?;
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -417,41 +469,63 @@ async fn rejects_bulk_array_line_and_nesting_over_limits() {
 async fn assert_limit_error(response: &'static [u8], limits: RespLimits) {
     let (client, mut server) = tokio::io::duplex(1024);
     let server_task = tokio::spawn(async move {
-        server.write_all(response).await.unwrap();
+        server
+            .write_all(response)
+            .await
+            .expect("write all should succeed");
     });
     let mut client = RespConnection::from_stream(client, limits, TEST_TIMEOUT, TEST_TIMEOUT);
 
-    let error = client.read_response().await.unwrap_err();
+    let error = client
+        .read_response()
+        .await
+        .expect_err("read response should return an error");
 
     assert!(matches!(error, RedisRespError::LimitExceeded { .. }));
-    server_task.await.unwrap();
+    server_task
+        .await
+        .expect("assert limit error should succeed");
 }
 
 #[tokio::test]
-async fn rejects_bad_bulk_delimiter_and_negative_lengths() {
+async fn rejects_bad_bulk_delimiter_and_negative_lengths() -> anyhow::Result<()> {
     let (client, mut server) = tokio::io::duplex(1024);
     let server_task = tokio::spawn(async move {
-        server.write_all(b"$3\r\nabcxx").await.unwrap();
+        server
+            .write_all(b"$3\r\nabcxx")
+            .await
+            .expect("write all should succeed");
     });
     let mut client = connection(client);
 
     assert!(matches!(
-        client.read_response().await.unwrap_err(),
+        client
+            .read_response()
+            .await
+            .expect_err("read response should return an error"),
         RedisRespError::Protocol(_)
     ));
-    server_task.await.unwrap();
+    server_task.await?;
 
     let (client, mut server) = tokio::io::duplex(1024);
     let server_task = tokio::spawn(async move {
-        server.write_all(b"*-2\r\n").await.unwrap();
+        server
+            .write_all(b"*-2\r\n")
+            .await
+            .expect("write all should succeed");
     });
     let mut client = connection(client);
 
     assert!(matches!(
-        client.read_response().await.unwrap_err(),
+        client
+            .read_response()
+            .await
+            .expect_err("read response should return an error"),
         RedisRespError::Protocol(_)
     ));
-    server_task.await.unwrap();
+    server_task.await?;
+
+    Ok(())
 }
 
 #[tokio::test]

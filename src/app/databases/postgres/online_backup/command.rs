@@ -269,6 +269,8 @@ printf 'auth=%s\n' "$auth"
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use secrecy::ExposeSecret;
 
@@ -276,10 +278,10 @@ mod tests {
     const LABEL: &str = "dbev-0123456789abcdef0123456789abcdef";
 
     #[test]
-    fn replication_password_is_stable_hex_and_rejects_empty_input() {
-        let first = replication_password("admin-secret").unwrap();
-        let second = replication_password("admin-secret").unwrap();
-        let other = replication_password("other-secret").unwrap();
+    fn replication_password_is_stable_hex_and_rejects_empty_input() -> anyhow::Result<()> {
+        let first = replication_password("admin-secret").map_err(anyhow::Error::msg)?;
+        let second = replication_password("admin-secret").map_err(anyhow::Error::msg)?;
+        let other = replication_password("other-secret").map_err(anyhow::Error::msg)?;
         assert_eq!(first.expose_secret(), second.expose_secret());
         assert_eq!(first.expose_secret().len(), 64);
         assert!(
@@ -291,6 +293,8 @@ mod tests {
         assert_ne!(first.expose_secret(), other.expose_secret());
         assert_ne!(first.expose_secret(), "admin-secret");
         assert!(replication_password("").is_err());
+
+        Ok(())
     }
 
     #[test]
@@ -342,7 +346,8 @@ mod tests {
     }
 
     #[test]
-    fn replication_role_sql_is_login_replication_without_a_password_literal() {
+    fn replication_role_sql_is_login_replication_without_a_password_literal() -> anyhow::Result<()>
+    {
         let ensure = ensure_replication_role_sql();
         let reset = reset_replication_password_sql();
         let state = replication_role_state_sql();
@@ -365,11 +370,21 @@ mod tests {
         assert!(!reset.contains("hunter2"));
         assert!(ensure.contains("SET LOCAL password_encryption = 'scram-sha-256'"));
         assert!(ensure.contains("SET LOCAL log_min_error_statement = PANIC"));
-        let begin = ensure.find("BEGIN;").unwrap();
-        let create = ensure.find("CREATE ROLE").unwrap();
-        let alter = ensure.find("ALTER ROLE").unwrap();
-        let comment_at = ensure.find("COMMENT ON ROLE").unwrap();
-        let commit = ensure.find("COMMIT;").unwrap();
+        let begin = ensure
+            .find("BEGIN;")
+            .context("expected a value from find")?;
+        let create = ensure
+            .find("CREATE ROLE")
+            .context("expected a value from find")?;
+        let alter = ensure
+            .find("ALTER ROLE")
+            .context("expected a value from find")?;
+        let comment_at = ensure
+            .find("COMMENT ON ROLE")
+            .context("expected a value from find")?;
+        let commit = ensure
+            .find("COMMIT;")
+            .context("expected a value from find")?;
         assert!(begin < create && create < alter && alter < comment_at && comment_at < commit);
         assert_eq!(ensure.matches("BEGIN;").count(), 1);
         assert_eq!(ensure.matches("COMMIT;").count(), 1);
@@ -428,6 +443,8 @@ mod tests {
         assert!(preflight_script().contains("pg_ls_waldir"));
         assert!(preflight_script().contains("nspname <> 'pg_toast'"));
         assert!(!preflight_script().contains("hunter2"));
+
+        Ok(())
     }
 
     fn has_pair(argv: &[String], name: &str, value: &str) -> bool {

@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn permits_non_executable_backup_storage_patches() {
+    fn permits_non_executable_backup_storage_patches() -> anyhow::Result<()> {
         let patch = serde_json::json!({
             "backups": {
                 "storage": {
@@ -253,12 +253,14 @@ mod tests {
                 }
             }
         });
-        reject_forbidden_paths(&patch).unwrap();
+        reject_forbidden_paths(&patch)?;
+
+        Ok(())
     }
 
     #[test]
-    fn sequential_patches_merge_against_the_latest_disk_config() {
-        let directory = tempfile::tempdir().unwrap();
+    fn sequential_patches_merge_against_the_latest_disk_config() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("config.yml");
         std::fs::write(
             &path,
@@ -277,11 +279,10 @@ paths:
   logs: /var/log/databases-everywhere
   artifacts: /var/lib/databases-everywhere/artifacts
 "#,
-        )
-        .unwrap();
+        )?;
 
-        apply_config_patch(&path, serde_json::json!({"api": {"port": 9090}})).unwrap();
-        apply_config_patch(&path, serde_json::json!({"debug": true})).unwrap();
+        apply_config_patch(&path, serde_json::json!({"api": {"port": 9090}}))?;
+        apply_config_patch(&path, serde_json::json!({"debug": true}))?;
         apply_config_patch(
             &path,
             serde_json::json!({
@@ -291,14 +292,15 @@ paths:
                     "prevent_disk_overallocation": false
                 }
             }),
-        )
-        .unwrap();
+        )?;
 
-        let config = load_config(&path).unwrap();
+        let config = load_config(&path)?;
         assert_eq!(config.api.port, 9090);
         assert!(config.debug);
         assert!(!config.allocation.prevent_cpu_overallocation);
         assert!(!config.allocation.prevent_memory_overallocation);
         assert!(!config.allocation.prevent_disk_overallocation);
+
+        Ok(())
     }
 }

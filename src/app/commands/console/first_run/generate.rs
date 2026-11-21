@@ -291,6 +291,8 @@ pub(super) fn kernel_release() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::config::Config;
 
@@ -308,9 +310,9 @@ mod tests {
 
     fn generated(choices: &Choices, kernel: Option<&str>) -> Value {
         let identity = NodeIdentity::generate();
-        let text = render(choices, &identity, kernel).unwrap();
+        let text = render(choices, &identity, kernel).expect("render should succeed");
         assert!(text.starts_with("# DatabasesEverywhere node config"));
-        yaml_serde::from_str(&text).unwrap()
+        yaml_serde::from_str(&text).expect("from str should succeed")
     }
 
     fn text<'a>(value: &'a Value, path: &[&str]) -> &'a str {
@@ -324,26 +326,28 @@ mod tests {
     }
 
     #[test]
-    fn identities_are_random_long_and_distinct() {
+    fn identities_are_random_long_and_distinct() -> anyhow::Result<()> {
         let first = NodeIdentity::generate();
         let second = NodeIdentity::generate();
         let token = first.token.expose_secret();
         let key = first.jwt_signing_key.expose_secret();
         assert!(token.len() >= 32 && key.len() >= 32);
-        assert_eq!(URL_SAFE_NO_PAD.decode(token).unwrap().len(), SECRET_BYTES);
+        assert_eq!(URL_SAFE_NO_PAD.decode(token)?.len(), SECRET_BYTES);
         assert_ne!(token, key);
         assert_ne!(token, second.token.expose_secret());
         assert_ne!(first.uuid, second.uuid);
         assert_ne!(first.token_id, second.token_id);
-        uuid::Uuid::parse_str(&first.uuid).unwrap();
+        uuid::Uuid::parse_str(&first.uuid)?;
         assert!(!format!("{first:?}").contains(token));
+
+        Ok(())
     }
 
     #[test]
-    fn generated_config_carries_choices_identity_and_no_panel() {
+    fn generated_config_carries_choices_identity_and_no_panel() -> anyhow::Result<()> {
         let choices = choices();
         let identity = NodeIdentity::generate();
-        let config = standalone_config(&choices, &identity, Some("6.12.0")).unwrap();
+        let config = standalone_config(&choices, &identity, Some("6.12.0"))?;
         assert!(config.get("remote").is_none());
         assert_eq!(text(&config, &["uuid"]), identity.uuid);
         assert_eq!(text(&config, &["token_id"]), identity.token_id);
@@ -369,11 +373,13 @@ mod tests {
         }
         assert_eq!(text(&config, &["postgres", "bind"]), "0.0.0.0:5434");
         assert_eq!(text(&config, &["clickhouse", "http_bind"]), "0.0.0.0:8123");
+
+        Ok(())
     }
 
     #[test]
-    fn every_example_setting_is_kept_in_order() {
-        let example: Value = yaml_serde::from_str(EXAMPLE_CONFIG).unwrap();
+    fn every_example_setting_is_kept_in_order() -> anyhow::Result<()> {
+        let example: Value = yaml_serde::from_str(EXAMPLE_CONFIG)?;
         let config = generated(&choices(), None);
         let (Value::Mapping(example), Value::Mapping(config)) = (&example, &config) else {
             panic!("configs are mappings");
@@ -401,6 +407,8 @@ mod tests {
             config["security"]["api_rate_limit_per_minute"],
             example["security"]["api_rate_limit_per_minute"]
         );
+
+        Ok(())
     }
 
     #[test]
@@ -417,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn mongodb_falls_back_to_7_on_kernels_it_cannot_run_on() {
+    fn mongodb_falls_back_to_7_on_kernels_it_cannot_run_on() -> anyhow::Result<()> {
         assert_eq!(mongodb_image("mongo:8.3.4", Some("6.18.20")), "mongo:8.3.4");
         assert_eq!(mongodb_image("mongo:8.3.4", None), "mongo:8.3.4");
         for kernel in ["6.19.0", "7.3.0-2-cachyos", "10.0"] {
@@ -440,8 +448,10 @@ mod tests {
         // The fallback must stay an image operators allowed in the example.
         let allowed = config["images"]["allowed"]["mongodb"]
             .as_sequence()
-            .unwrap();
+            .context("expected a sequence")?;
         assert!(allowed.contains(&Value::from(MONGODB_KERNEL_FALLBACK)));
+
+        Ok(())
     }
 
     #[test]
@@ -466,11 +476,11 @@ mod tests {
     }
 
     #[test]
-    fn generated_configs_pass_validation() {
+    fn generated_configs_pass_validation() -> anyhow::Result<()> {
         let kernel = kernel_release();
         // Validation inspects the configured host paths; keep it off this
         // machine's real (possibly root-only) /var/lib/dbev.
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir()?;
         let engines = [
             (ContainerRuntime::Docker, String::new()),
             (ContainerRuntime::Podman, String::new()),
@@ -485,17 +495,25 @@ mod tests {
                     choices.socket_path = socket_path.clone();
                     choices.disk = disk;
                     let mut config = generated(&choices, kernel.as_deref());
-                    let paths = config["paths"].as_mapping_mut().unwrap();
+                    let paths = config["paths"]
+                        .as_mapping_mut()
+                        .context("expected a mapping")?;
                     for (_, path) in paths.iter_mut() {
-                        let inside = format!("{}{}", root.path().display(), path.as_str().unwrap());
+                        let inside = format!(
+                            "{}{}",
+                            root.path().display(),
+                            path.as_str().context("as str should provide a value")?
+                        );
                         *path = inside.into();
                     }
-                    let config: Config = yaml_serde::from_value(config).unwrap();
-                    crate::config::validate::validate_config(&config).unwrap();
+                    let config: Config = yaml_serde::from_value(config)?;
+                    crate::config::validate::validate_config(&config)?;
                     assert_eq!(config.daemon.engine.as_str(), runtime.as_str());
                     assert_eq!(config.daemon.socket_path, *socket_path);
                 }
             }
         }
+
+        Ok(())
     }
 }

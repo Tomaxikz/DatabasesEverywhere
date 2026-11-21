@@ -45,23 +45,25 @@ fn authentic_snapshot_list() -> String {
 }
 
 #[test]
-fn authentic_cli_snapshot_lists_are_read_through_stored_tag_keys() {
-    let snapshots = parse_snapshot_list(authentic_snapshot_list().as_bytes()).unwrap();
+fn authentic_cli_snapshot_lists_are_read_through_stored_tag_keys() -> anyhow::Result<()> {
+    let snapshots = parse_snapshot_list(authentic_snapshot_list().as_bytes())?;
     assert_eq!(snapshots.len(), 2);
     let checkpoint = &snapshots[0];
     assert_eq!(checkpoint.incomplete, "checkpoint");
     assert!(checkpoint.tags.is_empty());
     assert_eq!(checkpoint.source.path, SOURCE);
 
-    let record = record_from_snapshot("inst_one", &snapshots[1]).unwrap();
+    let record = record_from_snapshot("inst_one", &snapshots[1])?;
     assert_eq!(record.backup_id, "one.physical.tar.gz");
     assert_eq!(record.protocol, Protocol::Postgres);
     assert_eq!(record.layout, BackupLayout::Physical);
     assert!(record.catalog_available);
+
+    Ok(())
 }
 
 #[test]
-fn unprefixed_tags_are_accepted_but_conflicting_forms_are_not() {
+fn unprefixed_tags_are_accepted_but_conflicting_forms_are_not() -> anyhow::Result<()> {
     let snapshot = |tags: serde_json::Value| -> KopiaManifest {
         serde_json::from_value(serde_json::json!({
             "id": "m1",
@@ -69,9 +71,9 @@ fn unprefixed_tags_are_accepted_but_conflicting_forms_are_not() {
             "rootEntry": { "obj": "k1" },
             "tags": tags,
         }))
-        .unwrap()
+        .expect("from value should succeed")
     };
-    let plain = normalize_tags(snapshot(serde_json::json!({ "dbev-backup": "a" }))).unwrap();
+    let plain = normalize_tags(snapshot(serde_json::json!({ "dbev-backup": "a" })))?;
     assert_eq!(plain.tags.get(TAG_BACKUP).map(String::as_str), Some("a"));
     let same = serde_json::json!({ "dbev-backup": "a", "tag:dbev-backup": "a" });
     assert!(normalize_tags(snapshot(same)).is_ok());
@@ -80,38 +82,55 @@ fn unprefixed_tags_are_accepted_but_conflicting_forms_are_not() {
         normalize_tags(snapshot(conflict)),
         Err(BackupStoreError::Corrupt(_))
     ));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn create_passes_unprefixed_tags_and_a_pin_value() {
+async fn create_passes_unprefixed_tags_and_a_pin_value() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let manifest = v2_manifest().await;
     let arguments = create_arguments(SOURCE, &manifest, legacy_manifest_tags(&manifest));
-    let position = |flag: &str| arguments.iter().position(|arg| arg == flag).unwrap();
+    let position = |flag: &str| {
+        arguments
+            .iter()
+            .position(|arg| arg == flag)
+            .expect("expected a value from position")
+    };
     assert_eq!(arguments[2], SOURCE);
     // kingpin rejects `--pin --tags ...`: the next token must be a value.
     assert_eq!(arguments[position("--pin") + 1], DBEV_PIN);
     let tag = &arguments[position("--tags") + 1];
-    assert!(tag.to_str().unwrap().starts_with("dbev-instance:"));
     assert!(
-        !arguments
-            .iter()
-            .any(|arg| arg.to_str().unwrap().starts_with("tag:"))
+        tag.to_str()
+            .context("to str should provide a value")?
+            .starts_with("dbev-instance:")
     );
+    assert!(!arguments.iter().any(|arg| {
+        arg.to_str()
+            .expect("to str should provide a value")
+            .starts_with("tag:")
+    }));
+
+    Ok(())
 }
 
 #[test]
-fn source_paths_match_kopia_clean_without_resolving_links() {
+fn source_paths_match_kopia_clean_without_resolving_links() -> anyhow::Result<()> {
     assert_eq!(
-        snapshot_source_path(Path::new("/var/lib/dbev/./backups//.staging/i/.x.bundle/")).unwrap(),
+        snapshot_source_path(Path::new("/var/lib/dbev/./backups//.staging/i/.x.bundle/"))?,
         "/var/lib/dbev/backups/.staging/i/.x.bundle"
     );
     for path in ["relative/bundle", "/var/../etc", "/"] {
         assert!(snapshot_source_path(Path::new(path)).is_err(), "{path}");
     }
+
+    Ok(())
 }
 
 #[test]
-fn checkpoints_are_found_by_their_source_path_label() {
+fn checkpoints_are_found_by_their_source_path_label() -> anyhow::Result<()> {
     let arguments = source_manifest_arguments(SOURCE);
     assert_eq!(
         arguments[..2],
@@ -127,12 +146,10 @@ fn checkpoints_are_found_by_their_source_path_label() {
   {{ "id": "1b2c3d4e5f60718293a4b5c6d7e8f901", "length": 1204, "labels": {{ "hostname": "node-a", "path": "{SOURCE}", "tag:dbev-backup": "one.physical.tar.gz", "type": "snapshot", "username": "root" }}, "mtime": "2026-10-11T10:00:00.1Z" }}
 ]"#
     );
-    let ids = parse_manifest_entries(stdout.as_bytes())
-        .unwrap()
+    let ids = parse_manifest_entries(stdout.as_bytes())?
         .into_iter()
         .map(|entry| source_entry_id(entry, SOURCE))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+        .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(ids.len(), 2);
 
     for labels in [
@@ -140,9 +157,11 @@ fn checkpoints_are_found_by_their_source_path_label() {
         serde_json::json!({ "type": "policy", "path": SOURCE }),
     ] {
         let entry: KopiaManifestEntry =
-            serde_json::from_value(serde_json::json!({ "id": "m", "labels": labels })).unwrap();
+            serde_json::from_value(serde_json::json!({ "id": "m", "labels": labels }))?;
         assert!(source_entry_id(entry, SOURCE).is_err());
     }
+
+    Ok(())
 }
 
 fn snapshot_with_tags(tags: Vec<String>) -> KopiaManifest {
@@ -158,18 +177,22 @@ fn snapshot_with_tags(tags: Vec<String>) -> KopiaManifest {
         tags: tags
             .into_iter()
             .map(|tag| {
-                let (key, value) = tag.split_once(':').unwrap();
+                let (key, value) = tag
+                    .split_once(':')
+                    .expect("expected a value from split_once");
                 (format!("{STORED_TAG_PREFIX}{key}"), value.to_string())
             })
             .collect(),
     })
-    .unwrap()
+    .expect("collect should succeed")
 }
 
 async fn v2_manifest() -> StoredBackup {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().expect("tempdir should succeed");
     let archive = temp.path().join("archive");
-    tokio::fs::write(&archive, b"archive").await.unwrap();
+    tokio::fs::write(&archive, b"archive")
+        .await
+        .expect("write should succeed");
     crate::server::backup::build_manifest(
         "two.physical.tar.gz".to_string(),
         "inst_one".to_string(),
@@ -180,19 +203,22 @@ async fn v2_manifest() -> StoredBackup {
         crate::server::backup::test_details(BackupLayout::Physical),
     )
     .await
-    .unwrap()
+    .expect("test details should succeed")
 }
 
 #[tokio::test]
-async fn schema_two_tags_bind_the_canonical_manifest_and_starve_legacy_readers() {
-    let manifest = v2_manifest().await;
-    let bytes = manifest.to_json().unwrap();
-    let checksum = crate::server::backup::sha256_bytes(&bytes);
-    let snapshot = snapshot_with_tags(v2_manifest_tags(&manifest, &checksum).unwrap());
+async fn schema_two_tags_bind_the_canonical_manifest_and_starve_legacy_readers()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
 
-    let projection = V2Projection::from_snapshot("inst_one", &snapshot).unwrap();
+    let manifest = v2_manifest().await;
+    let bytes = manifest.to_json()?;
+    let checksum = crate::server::backup::sha256_bytes(&bytes);
+    let snapshot = snapshot_with_tags(v2_manifest_tags(&manifest, &checksum)?);
+
+    let projection = V2Projection::from_snapshot("inst_one", &snapshot)?;
     assert_eq!(projection.manifest_sha256, checksum);
-    projection.check(&manifest).unwrap();
+    projection.check(&manifest)?;
     // A schema 1 reader must not reconstruct a manifest from these tags.
     assert!(matches!(
         record_from_snapshot("inst_one", &snapshot),
@@ -200,21 +226,27 @@ async fn schema_two_tags_bind_the_canonical_manifest_and_starve_legacy_readers()
     ));
 
     let mut altered = manifest.clone();
-    altered.details.as_mut().unwrap().restore_recipe.version = 9;
+    altered
+        .details
+        .as_mut()
+        .context("expected a value from as_mut")?
+        .restore_recipe
+        .version = 9;
     assert!(projection.check(&altered).is_err());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn unknown_kopia_manifest_versions_are_unsupported() {
+async fn unknown_kopia_manifest_versions_are_unsupported() -> anyhow::Result<()> {
     let driver = KopiaBackupDriver::new(
         BackupKopiaConfig {
             executable: "/usr/bin/kopia".to_string(),
             ..Default::default()
         },
         PathBuf::from("/var/lib/dbev/backups"),
-    )
-    .unwrap();
-    let mut tags = v2_manifest_tags(&v2_manifest().await, &"a".repeat(64)).unwrap();
+    )?;
+    let mut tags = v2_manifest_tags(&v2_manifest().await, &"a".repeat(64))?;
     tags.retain(|tag| !tag.starts_with(TAG_MANIFEST_VERSION));
     tags.push(format!("{TAG_MANIFEST_VERSION}:3"));
     assert!(matches!(
@@ -223,4 +255,6 @@ async fn unknown_kopia_manifest_versions_are_unsupported() {
             .await,
         Err(BackupStoreError::UnsupportedFormat(_))
     ));
+
+    Ok(())
 }

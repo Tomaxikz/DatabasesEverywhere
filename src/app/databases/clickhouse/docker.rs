@@ -383,10 +383,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_hosted_config_that_disables_internal_log_tables() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_hosted_config(dir.path()).await.unwrap();
-        let config = tokio::fs::read_to_string(path).await.unwrap();
+    async fn writes_hosted_config_that_disables_internal_log_tables() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = write_hosted_config(dir.path()).await?;
+        let config = tokio::fs::read_to_string(path).await?;
 
         assert!(config.contains("<trace_log remove=\"1\"/>"));
         assert!(config.contains("<text_log remove=\"1\"/>"));
@@ -402,44 +402,48 @@ mod tests {
         assert!(config.contains("<async_queue_max_size>1024</async_queue_max_size>"));
         assert!(!config.contains("/var/log/"));
         assert!(config.contains("<listen_host>127.0.0.1</listen_host>"));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn legacy_log_cleanup_preserves_unknown_files_and_links() {
+    async fn legacy_log_cleanup_preserves_unknown_files_and_links() -> anyhow::Result<()> {
         use std::os::unix::fs::symlink;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let logs = directory.path().join("logs");
-        std::fs::create_dir(&logs).unwrap();
+        std::fs::create_dir(&logs)?;
         for name in ["clickhouse-server.log", "clickhouse-server.err.log.0.gz"] {
-            std::fs::write(logs.join(name), b"old logs").unwrap();
+            std::fs::write(logs.join(name), b"old logs")?;
         }
         let keep = directory.path().join("keep");
-        std::fs::write(&keep, b"unchanged").unwrap();
-        symlink(&keep, logs.join("clickhouse-server.log.1")).unwrap();
-        std::fs::hard_link(&keep, logs.join("clickhouse-server.err.log.1")).unwrap();
-        std::fs::write(logs.join("database.bin"), b"data").unwrap();
-        std::fs::write(logs.join("clickhouse-server.log.notes"), b"notes").unwrap();
-        std::fs::create_dir(logs.join("clickhouse-server.log.2")).unwrap();
-        let (removed, _) = remove_legacy_logs(&logs).await.unwrap();
+        std::fs::write(&keep, b"unchanged")?;
+        symlink(&keep, logs.join("clickhouse-server.log.1"))?;
+        std::fs::hard_link(&keep, logs.join("clickhouse-server.err.log.1"))?;
+        std::fs::write(logs.join("database.bin"), b"data")?;
+        std::fs::write(logs.join("clickhouse-server.log.notes"), b"notes")?;
+        std::fs::create_dir(logs.join("clickhouse-server.log.2"))?;
+        let (removed, _) = remove_legacy_logs(&logs).await?;
         assert_eq!(removed, 2);
-        assert_eq!(std::fs::read(&keep).unwrap(), b"unchanged");
-        assert_eq!(std::fs::read(logs.join("database.bin")).unwrap(), b"data");
+        assert_eq!(std::fs::read(&keep)?, b"unchanged");
+        assert_eq!(std::fs::read(logs.join("database.bin"))?, b"data");
         assert_eq!(
-            std::fs::read(logs.join("clickhouse-server.log.notes")).unwrap(),
+            std::fs::read(logs.join("clickhouse-server.log.notes"))?,
             b"notes"
         );
         assert!(logs.join("clickhouse-server.log.2").is_dir());
-        assert_eq!(remove_legacy_logs(&logs).await.unwrap().0, 0);
+        assert_eq!(remove_legacy_logs(&logs).await?.0, 0);
         let link = directory.path().join("linked-logs");
-        symlink(&logs, &link).unwrap();
+        symlink(&logs, &link)?;
         assert!(remove_legacy_logs(&link).await.is_err());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn shared_hosted_config_requires_explicit_engine_grants() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_shared_hosted_config(dir.path()).await.unwrap();
-        let config = tokio::fs::read_to_string(path).await.unwrap();
+    async fn shared_hosted_config_requires_explicit_engine_grants() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = write_shared_hosted_config(dir.path()).await?;
+        let config = tokio::fs::read_to_string(path).await?;
 
         assert!(config.contains("<table_engines_require_grant>true</table_engines_require_grant>"));
         assert!(
@@ -459,44 +463,42 @@ mod tests {
         ));
         assert!(config.contains("<memory_worker_use_cgroup>1</memory_worker_use_cgroup>"));
         assert!(!hosted_config_xml(false).contains("<max_server_memory_usage_to_ram_ratio>"));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hosted_config_is_private_on_host_but_readable_in_container() {
+    async fn hosted_config_is_private_on_host_but_readable_in_container() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_hosted_config(dir.path()).await.unwrap();
+        let dir = tempfile::tempdir()?;
+        let path = write_hosted_config(dir.path()).await?;
 
         assert_eq!(
-            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(dir.path())?.permissions().mode() & 0o777,
             0o700
         );
-        assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o444
-        );
+        assert_eq!(std::fs::metadata(path)?.permissions().mode() & 0o777, 0o444);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn replaces_a_hosted_config_symlink_without_following_it() {
+    async fn replaces_a_hosted_config_symlink_without_following_it() -> anyhow::Result<()> {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let victim = directory.path().join("victim");
         let config_directory = directory.path().join("runtime-config");
-        std::fs::create_dir(&config_directory).unwrap();
-        std::fs::write(&victim, b"untouched").unwrap();
-        symlink(&victim, config_directory.join(HOSTED_CONFIG_FILENAME)).unwrap();
+        std::fs::create_dir(&config_directory)?;
+        std::fs::write(&victim, b"untouched")?;
+        symlink(&victim, config_directory.join(HOSTED_CONFIG_FILENAME))?;
 
-        let path = write_hosted_config(&config_directory).await.unwrap();
+        let path = write_hosted_config(&config_directory).await?;
 
-        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
-        assert!(
-            !std::fs::symlink_metadata(path)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert_eq!(std::fs::read(victim)?, b"untouched");
+        assert!(!std::fs::symlink_metadata(path)?.file_type().is_symlink());
+
+        Ok(())
     }
 }

@@ -143,6 +143,8 @@ impl ManagedContainerEvent {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use bollard::models::EventActor;
 
@@ -162,8 +164,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_managed_lifecycle_events_across_engine_spellings() {
-        let parsed = ManagedContainerEvent::from_message(event("die"), Some("node-a")).unwrap();
+    fn parses_managed_lifecycle_events_across_engine_spellings() -> anyhow::Result<()> {
+        let parsed = ManagedContainerEvent::from_message(event("die"), Some("node-a"))
+            .context("expected a value from from_message")?;
 
         assert_eq!(parsed.instance_id, "inst_pg_1");
         assert_eq!(parsed.container_id.as_deref(), Some("container-old"));
@@ -175,42 +178,52 @@ mod tests {
 
         assert!(matches!(
             ManagedContainerEvent::from_message(event("died"), None)
-                .unwrap()
+                .context("event should provide a value")?
                 .action,
             ManagedContainerAction::Exited { .. }
         ));
         assert_eq!(
             ManagedContainerEvent::from_message(event("remove"), None)
-                .unwrap()
+                .context("event should provide a value")?
                 .action,
             ManagedContainerAction::Destroyed
         );
 
         let mut unidentified = event("die");
-        unidentified.actor.as_mut().unwrap().id = None;
+        unidentified
+            .actor
+            .as_mut()
+            .context(
+                "parses managed lifecycle events across engine spellings should provide a value",
+            )?
+            .id = None;
 
-        let parsed = ManagedContainerEvent::from_message(unidentified, None).unwrap();
+        let parsed = ManagedContainerEvent::from_message(unidentified, None)
+            .context("expected a value from from_message")?;
 
         assert!(parsed.container_id.is_none());
         assert_eq!(
             parsed.action,
             ManagedContainerAction::Exited { exit_code: None }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn preserves_nonzero_exit_codes_as_runtime_failures() {
+    fn preserves_nonzero_exit_codes_as_runtime_failures() -> anyhow::Result<()> {
         let mut failed = event("die");
         failed
             .actor
             .as_mut()
-            .unwrap()
+            .context("expected a value from as_mut")?
             .attributes
             .as_mut()
-            .unwrap()
+            .context("expected a value from as_mut")?
             .insert("exitCode".to_string(), "137".to_string());
 
-        let parsed = ManagedContainerEvent::from_message(failed, None).unwrap();
+        let parsed = ManagedContainerEvent::from_message(failed, None)
+            .context("expected a value from from_message")?;
 
         assert_eq!(
             parsed.action,
@@ -220,10 +233,12 @@ mod tests {
         );
         assert!(parsed.action.indicates_unexpected_failure());
         assert!(parsed.action.deactivates_container());
+
+        Ok(())
     }
 
     #[test]
-    fn ignores_health_and_unmanaged_events() {
+    fn ignores_health_and_unmanaged_events() -> anyhow::Result<()> {
         // Readiness and log-policy repair must never trigger their own
         // activation reconciliation, or a successful probe could feed a loop.
         for action in [
@@ -240,26 +255,30 @@ mod tests {
         unmanaged
             .actor
             .as_mut()
-            .unwrap()
+            .context("expected a value from as_mut")?
             .attributes
             .as_mut()
-            .unwrap()
+            .context("expected a value from as_mut")?
             .insert(MANAGED_LABEL.to_string(), "false".to_string());
         assert!(ManagedContainerEvent::from_message(unmanaged, None).is_none());
+
+        Ok(())
     }
 
     #[test]
-    fn ignores_events_owned_by_another_dbev_node() {
+    fn ignores_events_owned_by_another_dbev_node() -> anyhow::Result<()> {
         let mut foreign = event("start");
         foreign
             .actor
             .as_mut()
-            .unwrap()
+            .context("expected a value from as_mut")?
             .attributes
             .as_mut()
-            .unwrap()
+            .context("expected a value from as_mut")?
             .insert(NODE_LABEL.to_string(), "node-b".to_string());
 
         assert!(ManagedContainerEvent::from_message(foreign, Some("node-a")).is_none());
+
+        Ok(())
     }
 }

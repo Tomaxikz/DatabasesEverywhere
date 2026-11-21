@@ -31,19 +31,23 @@ impl Fixture {
                 let (head, body) = request.into_parts();
                 let query = form_urlencoded::parse(head.uri.query().unwrap_or_default().as_bytes())
                     .collect::<BTreeMap<_, _>>();
-                let body = to_bytes(body, 32 << 20).await.unwrap();
+                let body = to_bytes(body, 32 << 20)
+                    .await
+                    .expect("to bytes should succeed");
                 let key = head
                     .uri
                     .path()
                     .strip_prefix("/bkt")
-                    .unwrap()
+                    .expect("expected a value from strip_prefix")
                     .trim_start_matches('/');
-                let key = crate::utils::percent::decode_strict(key).unwrap();
-                server
-                    .0
-                    .lock()
-                    .unwrap()
-                    .respond(head.method, &key, &query, body)
+                let key = crate::utils::percent::decode_strict(key)
+                    .expect("decode strict should succeed");
+                server.0.lock().expect("lock should succeed").respond(
+                    head.method,
+                    &key,
+                    &query,
+                    body,
+                )
             }
         });
         let endpoint = super::wire::serve(app).await;
@@ -54,18 +58,28 @@ impl Fixture {
             max_retries: 0,
             ..config()
         })
-        .unwrap();
+        .expect("config should succeed");
         (driver, fixture)
     }
 
     pub(super) fn keys(&self) -> Vec<String> {
-        self.0.lock().unwrap().objects.keys().cloned().collect()
+        self.0
+            .lock()
+            .expect("lock should succeed")
+            .objects
+            .keys()
+            .cloned()
+            .collect()
     }
     pub(super) fn get(&self, key: &str) -> Bytes {
-        self.0.lock().unwrap().objects[key].clone()
+        self.0.lock().expect("lock should succeed").objects[key].clone()
     }
     pub(super) fn insert(&self, key: String, body: Bytes) {
-        self.0.lock().unwrap().objects.insert(key, body);
+        self.0
+            .lock()
+            .expect("lock should succeed")
+            .objects
+            .insert(key, body);
     }
 }
 
@@ -95,7 +109,9 @@ impl State {
                     if self.fail == Some("part") {
                         return StatusCode::FORBIDDEN.into_response();
                     }
-                    let number = query["partNumber"].parse::<u64>().unwrap();
+                    let number = query["partNumber"]
+                        .parse::<u64>()
+                        .expect("parse should succeed");
                     parts.insert(number, body);
                     ([(header::ETAG, format!("\"part&{number}\""))], "").into_response()
                 }
@@ -116,7 +132,8 @@ impl State {
                         #[serde(rename = "ETag")]
                         etag: String,
                     }
-                    let completed: Completed = quick_xml::de::from_reader(body.as_ref()).unwrap();
+                    let completed: Completed = quick_xml::de::from_reader(body.as_ref())
+                        .expect("from reader should succeed");
                     let mut bytes = Vec::new();
                     for (i, part) in completed.parts.iter().enumerate() {
                         assert_eq!(part.number, i as u64 + 1);
@@ -203,7 +220,7 @@ impl PublicationJournal for Fixture {
         resource: &'a PublicationResource,
     ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
         Box::pin(async move {
-            let mut state = self.0.lock().unwrap();
+            let mut state = self.0.lock().expect("lock should succeed");
             let PublicationResource::S3MultipartUpload { key, upload_id } = resource else {
                 panic!("unexpected journal entry")
             };
@@ -222,8 +239,8 @@ impl PublicationJournal for Fixture {
 }
 
 #[tokio::test]
-async fn failed_publication_aborts_the_journaled_upload() {
-    let temp = tempfile::tempdir().unwrap();
+async fn failed_publication_aborts_the_journaled_upload() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let (bundle, manifest) =
         bundle_with_archive(temp.path(), "inst_one", b"part body", false).await;
     for (failure, events) in [
@@ -235,7 +252,11 @@ async fn failed_publication_aborts_the_journaled_upload() {
         ),
     ] {
         let (driver, fixture) = Fixture::start().await;
-        fixture.0.lock().unwrap().fail = Some(failure);
+        fixture
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+            .fail = Some(failure);
         let error = driver
             .multipart_upload(
                 "archive",
@@ -245,34 +266,45 @@ async fn failed_publication_aborts_the_journaled_upload() {
                 &fixture,
             )
             .await
-            .unwrap_err();
+            .expect_err("multipart upload should return an error");
         if failure == "complete" {
             assert!(error.to_string().contains("InvalidPart"), "{error}");
         }
-        let state = fixture.0.lock().unwrap();
+        let state = fixture
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?;
         assert_eq!(state.events, events);
         assert!(state.uploads.is_empty() && state.objects.is_empty());
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn instance_purge_confirms_and_relists_only_owned_uploads() {
+async fn instance_purge_confirms_and_relists_only_owned_uploads() -> anyhow::Result<()> {
     let (driver, fixture) = Fixture::start().await;
     let mut handles = Vec::new();
     for instance in ["inst_one", "inst_one_b"] {
-        let key = format!("{}orphan", driver.instance_prefix(instance).unwrap());
-        let id = driver.client.create_multipart(&key).await.unwrap();
-        driver
-            .client
-            .put_part(&key, &id, 1, "part".into())
-            .await
-            .unwrap();
+        let key = format!("{}orphan", driver.instance_prefix(instance)?);
+        let id = driver.client.create_multipart(&key).await?;
+        driver.client.put_part(&key, &id, 1, "part".into()).await?;
         handles.push((key, id));
     }
-    fixture.0.lock().unwrap().events.clear();
-    assert_eq!(driver.delete_instance("inst_one").await.unwrap(), 0);
-    let state = fixture.0.lock().unwrap();
+    fixture
+        .0
+        .lock()
+        .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?
+        .events
+        .clear();
+    assert_eq!(driver.delete_instance("inst_one").await?, 0);
+    let state = fixture
+        .0
+        .lock()
+        .map_err(|_| anyhow::anyhow!("test mutex was poisoned"))?;
     assert_eq!(state.events, ["discover", "abort", "confirm", "discover"]);
     assert!(!state.uploads.contains_key(&handles[0]));
     assert_eq!(state.uploads[&handles[1]][&1], "part");
+
+    Ok(())
 }

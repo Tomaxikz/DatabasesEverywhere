@@ -16,13 +16,13 @@ use crate::subsystems::monitoring::{
 use std::collections::HashMap;
 
 #[tokio::test]
-async fn small_read_buffer_accepts_full_frames_and_keeps_size_limit() {
+async fn small_read_buffer_accepts_full_frames_and_keeps_size_limit() -> anyhow::Result<()> {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
     };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
     let app = axum::Router::new().route(
         "/ws",
         axum::routing::get(|ws: WebSocketUpgrade| async {
@@ -36,14 +36,16 @@ async fn small_read_buffer_accepts_full_frames_and_keeps_size_limit() {
         }),
     );
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app)
+            .await
+            .expect("serve should succeed");
     });
     let result = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+        let mut client = TcpStream::connect(address).await.expect("connect should succeed");
+        client.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.expect("write all should succeed");
         let mut headers = Vec::new();
         while !headers.ends_with(b"\r\n\r\n") {
-            headers.push(client.read_u8().await.unwrap());
+            headers.push(client.read_u8().await.expect("read u8 should succeed"));
             assert!(headers.len() < 4096);
         }
         assert!(headers.starts_with(b"HTTP/1.1 101"));
@@ -54,22 +56,24 @@ async fn small_read_buffer_accepts_full_frames_and_keeps_size_limit() {
             frame.extend_from_slice(&(length as u16).to_be_bytes());
             frame.extend_from_slice(&mask);
             frame.extend(payload.iter().enumerate().map(|(index, byte)| byte ^ mask[index % 4]));
-            client.write_all(&frame).await.unwrap();
+            client.write_all(&frame).await.expect("write all should succeed");
             if length > WEBSOCKET_MAX_MESSAGE_BYTES {
                 let mut byte = [0];
                 assert!(matches!(client.read(&mut byte).await, Ok(0) | Err(_)), "oversized frame was accepted");
                 break;
             }
-            assert_eq!(client.read_u8().await.unwrap(), 0x82);
-            assert_eq!(client.read_u8().await.unwrap(), 126);
-            assert_eq!(client.read_u16().await.unwrap() as usize, length);
+            assert_eq!(client.read_u8().await.expect("read u8 should succeed"), 0x82);
+            assert_eq!(client.read_u8().await.expect("read u8 should succeed"), 126);
+            assert_eq!(client.read_u16().await.expect("read u16 should succeed") as usize, length);
             let mut echoed = vec![0; length];
-            client.read_exact(&mut echoed).await.unwrap();
+            client.read_exact(&mut echoed).await.expect("read exact should succeed");
             assert_eq!(echoed, payload);
         }
     }).await;
     server.abort();
-    result.unwrap();
+    result?;
+
+    Ok(())
 }
 
 fn activity(instance_id: &str) -> TenantActivity {
@@ -170,14 +174,14 @@ fn monitoring_instance(
 }
 
 #[test]
-fn shared_monitoring_omits_physical_pool_capacity() {
+fn shared_monitoring_omits_physical_pool_capacity() -> anyhow::Result<()> {
     let instance = monitoring_instance(
         "tenant_one",
         crate::server::placement::DeploymentMode::Shared,
         None,
     );
 
-    let json = serde_json::to_value(instance).unwrap();
+    let json = serde_json::to_value(instance)?;
     assert_eq!(
         json["resources"]["cpu"]["usage_percent"],
         serde_json::Value::Null
@@ -192,10 +196,12 @@ fn shared_monitoring_omits_physical_pool_capacity() {
         json["activity"]["sources"]["operations"],
         serde_json::json!("gateway_protocol_observed")
     );
+
+    Ok(())
 }
 
 #[test]
-fn hundreds_of_instances_are_sent_as_bounded_ordered_batches() {
+fn hundreds_of_instances_are_sent_as_bounded_ordered_batches() -> anyhow::Result<()> {
     let instances = (0..300)
         .map(|index| {
             monitoring_instance(
@@ -205,11 +211,12 @@ fn hundreds_of_instances_are_sent_as_bounded_ordered_batches() {
             )
         })
         .collect();
-    let snapshot = MonitoringSnapshotData::new(instances, Vec::new()).unwrap();
-    let batches = snapshot
-        .filtered(&InstanceAuthorization::All)
-        .batches(42, 1_788_220_800, &mut wire::ProgressCursor::default())
-        .unwrap();
+    let snapshot = MonitoringSnapshotData::new(instances, Vec::new())?;
+    let batches = snapshot.filtered(&InstanceAuthorization::All).batches(
+        42,
+        1_788_220_800,
+        &mut wire::ProgressCursor::default(),
+    )?;
 
     assert!(batches.len() > 1);
     assert_eq!(
@@ -237,8 +244,10 @@ fn hundreds_of_instances_are_sent_as_bounded_ordered_batches() {
         assert_eq!(batch.sequence, 42);
         assert_eq!(batch.batch_index, index as u32);
         assert_eq!(batch.batch_count, batches.len() as u32);
-        assert!(serde_json::to_vec(batch).unwrap().len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
+        assert!(serde_json::to_vec(batch)?.len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
     }
+
+    Ok(())
 }
 
 #[test]
@@ -344,13 +353,12 @@ fn claims_for_instances(instances: Vec<&str>) -> Claims {
 }
 
 #[test]
-fn selected_authorization_is_bound_to_the_instance_generation() {
+fn selected_authorization_is_bound_to_the_instance_generation() -> anyhow::Result<()> {
     let claims = claims_for_instances(vec!["tenant_one"]);
     let authorized = InstanceAuthorization::selected(
         &claims,
         vec![("tenant_one".to_string(), "generation-a".to_string())],
-    )
-    .unwrap();
+    )?;
     assert!(authorized.allows("tenant_one", "generation-a"));
     assert!(!authorized.allows("tenant_one", "generation-b"));
 
@@ -368,7 +376,7 @@ fn selected_authorization_is_bound_to_the_instance_generation() {
             ),
         ]
     };
-    let snapshot = MonitoringSnapshotData::new(instances(), Vec::new()).unwrap();
+    let snapshot = MonitoringSnapshotData::new(instances(), Vec::new())?;
     assert_eq!(
         snapshot
             .filtered(&authorized)
@@ -380,7 +388,7 @@ fn selected_authorization_is_bound_to_the_instance_generation() {
     );
     let mut replaced = instances();
     replaced[0].instance_generation = "generation-b".to_string();
-    let snapshot = MonitoringSnapshotData::new(replaced, Vec::new()).unwrap();
+    let snapshot = MonitoringSnapshotData::new(replaced, Vec::new())?;
     assert!(snapshot.filtered(&authorized).instances.is_empty());
 
     assert!(
@@ -400,6 +408,8 @@ fn selected_authorization_is_bound_to_the_instance_generation() {
         )
         .is_err()
     );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -470,13 +480,15 @@ fn sample_job(job_id: &str, instance_id: &str) -> ImportExportJob {
 }
 
 #[test]
-fn compact_monitoring_preserves_every_metric_without_duplicate_identity() {
+fn compact_monitoring_preserves_every_metric_without_duplicate_identity() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let instance = monitoring_instance(
         "tenant",
         crate::server::placement::DeploymentMode::Dedicated,
         Some(11.0),
     );
-    let mut expected_resources = serde_json::to_value(&instance.resources).unwrap();
+    let mut expected_resources = serde_json::to_value(&instance.resources)?;
     for field in [
         "instance_id",
         "runtime_id",
@@ -487,25 +499,32 @@ fn compact_monitoring_preserves_every_metric_without_duplicate_identity() {
         "network",
         "pool",
     ] {
-        expected_resources.as_object_mut().unwrap().remove(field);
+        expected_resources
+            .as_object_mut()
+            .context("expected an object")?
+            .remove(field);
     }
-    let mut expected_activity = serde_json::to_value(&instance.activity).unwrap();
+    let mut expected_activity = serde_json::to_value(&instance.activity)?;
     expected_activity
         .as_object_mut()
-        .unwrap()
+        .context("expected an object")?
         .remove("instance_id");
-    let json = serde_json::to_value(&instance).unwrap();
+    let json = serde_json::to_value(&instance)?;
     assert_eq!(json["resources"], expected_resources);
     assert_eq!(json["activity"], expected_activity);
     assert_eq!(json["instance_id"], "tenant");
     let mut old = json.clone();
-    old["resources"] = serde_json::to_value(&instance.resources).unwrap();
-    old["activity"] = serde_json::to_value(&instance.activity).unwrap();
-    assert!(serde_json::to_vec(&json).unwrap().len() < serde_json::to_vec(&old).unwrap().len());
+    old["resources"] = serde_json::to_value(&instance.resources)?;
+    old["activity"] = serde_json::to_value(&instance.activity)?;
+    assert!(serde_json::to_vec(&json)?.len() < serde_json::to_vec(&old)?.len());
+
+    Ok(())
 }
 
 #[test]
-fn progress_changes_reset_reconnect_and_remove_evicted_records() {
+fn progress_changes_reset_reconnect_and_remove_evicted_records() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let store = crate::subsystems::instances::progress::InstallProgressStore::default();
     store.begin(
         "tenant",
@@ -513,7 +532,7 @@ fn progress_changes_reset_reconnect_and_remove_evicted_records() {
         "mysql:8.4",
     );
     store.complete("tenant", "finished");
-    let first = store.get("tenant").unwrap();
+    let first = store.get("tenant").context("missing tenant entry")?;
     let mut cursor = wire::ProgressCursor::default();
     let delta = cursor.select(&[&first]);
     assert!(delta.reset);
@@ -522,7 +541,7 @@ fn progress_changes_reset_reconnect_and_remove_evicted_records() {
     assert!(!delta.reset);
     assert!(delta.updates.is_empty());
     store.stage("tenant", "retry", "retrying");
-    let mut changed = store.get("tenant").unwrap();
+    let mut changed = store.get("tenant").context("missing tenant entry")?;
     changed.updated_at = first.updated_at.clone();
     assert_eq!(cursor.select(&[&changed]).updates.len(), 1);
     assert_eq!(
@@ -536,10 +555,12 @@ fn progress_changes_reset_reconnect_and_remove_evicted_records() {
     assert_eq!(removed.removed, ["tenant"]);
     assert!(cursor.select::<InstallProgress>(&[]).removed.is_empty());
     assert_eq!(cursor.select(&[&first]).updates.len(), 1);
+
+    Ok(())
 }
 
 #[test]
-fn progress_delta_batches_are_bounded_and_authorized() {
+fn progress_delta_batches_are_bounded_and_authorized() -> anyhow::Result<()> {
     let store = crate::subsystems::instances::progress::InstallProgressStore::default();
     let ids = (0..300)
         .map(|index| format!("tenant-{index:04}"))
@@ -559,14 +580,14 @@ fn progress_delta_batches_are_bounded_and_authorized() {
                 )
             })
             .collect();
-        MonitoringSnapshotData::new(instances, progress).unwrap()
+        MonitoringSnapshotData::new(instances, progress)
+            .expect("progress delta batches are bounded and authorized should succeed")
     };
     let snapshot = snapshot_with(store.list());
     let mut cursor = wire::ProgressCursor::default();
     let first = snapshot
         .filtered(&InstanceAuthorization::All)
-        .batches(1, 1, &mut cursor)
-        .unwrap();
+        .batches(1, 1, &mut cursor)?;
     assert_eq!(
         first
             .iter()
@@ -576,12 +597,11 @@ fn progress_delta_batches_are_bounded_and_authorized() {
     );
     assert!(first.iter().all(|batch| batch.progress_reset));
     for batch in &first {
-        assert!(serde_json::to_vec(batch).unwrap().len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
+        assert!(serde_json::to_vec(batch)?.len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
     }
     let unchanged = snapshot
         .filtered(&InstanceAuthorization::All)
-        .batches(2, 2, &mut cursor)
-        .unwrap();
+        .batches(2, 2, &mut cursor)?;
     assert!(
         unchanged
             .iter()
@@ -597,8 +617,7 @@ fn progress_delta_batches_are_bounded_and_authorized() {
     let snapshot = snapshot_with(Vec::new());
     let removed = snapshot
         .filtered(&InstanceAuthorization::All)
-        .batches(3, 3, &mut cursor)
-        .unwrap();
+        .batches(3, 3, &mut cursor)?;
     assert_eq!(
         removed
             .iter()
@@ -609,23 +628,25 @@ fn progress_delta_batches_are_bounded_and_authorized() {
     for (index, batch) in removed.iter().enumerate() {
         assert_eq!(batch.batch_index, index as u32);
         assert_eq!(batch.batch_count, removed.len() as u32);
-        assert!(serde_json::to_vec(batch).unwrap().len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
+        assert!(serde_json::to_vec(batch)?.len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
     }
     let snapshot = snapshot_with(store.list());
     let authorization = InstanceAuthorization::Selected(HashMap::from([(
         "tenant-0000".into(),
         "generation-a".into(),
     )]));
-    let own = snapshot
-        .filtered(&authorization)
-        .batches(1, 1, &mut wire::ProgressCursor::default())
-        .unwrap();
+    let own =
+        snapshot
+            .filtered(&authorization)
+            .batches(1, 1, &mut wire::ProgressCursor::default())?;
     let ids = own
         .iter()
         .flat_map(|batch| &batch.install_progress)
         .map(|progress| progress.instance_id.as_str())
         .collect::<Vec<_>>();
     assert_eq!(ids, ["tenant-0000"]);
+
+    Ok(())
 }
 
 fn claims_bound(bindings: &[(&str, &str)]) -> Claims {
@@ -644,7 +665,9 @@ fn claims_bound(bindings: &[(&str, &str)]) -> Claims {
 }
 
 #[tokio::test]
-async fn creation_tokens_follow_their_attempt_through_completion() {
+async fn creation_tokens_follow_their_attempt_through_completion() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     use crate::subsystems::instances::progress::{
         CREATION_GENERATION_PREFIX, InstallProgressStatus,
     };
@@ -666,20 +689,16 @@ async fn creation_tokens_follow_their_attempt_through_completion() {
             "postgres:18.4",
             true,
         )
-        .unwrap();
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     let generation = BindableGenerations::of(&state, "creating_one")
         .await
         .preferred()
-        .unwrap();
+        .context("expected a value from preferred")?;
     assert!(generation.starts_with(CREATION_GENERATION_PREFIX));
     let claims = claims_bound(&[("creating_one", &generation)]);
 
-    let authorization = resolve_instance_authorization(&state, &claims)
-        .await
-        .unwrap();
-    let snapshot = monitoring::monitoring_snapshot(&state, &authorization)
-        .await
-        .unwrap();
+    let authorization = resolve_instance_authorization(&state, &claims).await?;
+    let snapshot = monitoring::monitoring_snapshot(&state, &authorization).await?;
     let filtered = snapshot.filtered(&authorization);
     assert!(filtered.instances.is_empty());
     assert_eq!(filtered.install_progress.len(), 1);
@@ -696,12 +715,8 @@ async fn creation_tokens_follow_their_attempt_through_completion() {
         .await;
     state.install_progress.complete("creating_one", "created");
     drop(permit);
-    let authorization = resolve_instance_authorization(&state, &claims)
-        .await
-        .unwrap();
-    let snapshot = monitoring::monitoring_snapshot(&state, &authorization)
-        .await
-        .unwrap();
+    let authorization = resolve_instance_authorization(&state, &claims).await?;
+    let snapshot = monitoring::monitoring_snapshot(&state, &authorization).await?;
     let filtered = snapshot.filtered(&authorization);
     assert!(filtered.instances.is_empty());
     assert_eq!(
@@ -727,16 +742,18 @@ async fn creation_tokens_follow_their_attempt_through_completion() {
             "postgres:18.4",
             true,
         )
-        .unwrap();
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     assert!(
         resolve_instance_authorization(&state, &claims)
             .await
             .is_err()
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn pool_creations_cannot_be_bound_by_instance_tokens() {
+async fn pool_creations_cannot_be_bound_by_instance_tokens() -> anyhow::Result<()> {
     let (state, _dir) =
         crate::subsystems::test_support::database(crate::config::Config::default()).await;
     let _permit = state
@@ -746,17 +763,21 @@ async fn pool_creations_cannot_be_bound_by_instance_tokens() {
             crate::databases::protocol::Protocol::Postgres,
             "postgres:18.4",
         )
-        .unwrap();
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     assert!(
         BindableGenerations::of(&state, "pool_postgres_one")
             .await
             .preferred()
             .is_none()
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn creation_log_targets_need_a_dedicated_attempt_the_token_binds() {
+async fn creation_log_targets_need_a_dedicated_attempt_the_token_binds() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (state, _dir) =
         crate::subsystems::test_support::database(crate::config::Config::default()).await;
     for (instance_id, dedicated) in [("dedicated_new", true), ("shared_new", false)] {
@@ -767,12 +788,15 @@ async fn creation_log_targets_need_a_dedicated_attempt_the_token_binds() {
             dedicated,
         );
     }
-    let dedicated = state.install_progress.get("dedicated_new").unwrap();
-    let generation = dedicated.creation_generation().unwrap();
+    let dedicated = state
+        .install_progress
+        .get("dedicated_new")
+        .context("missing dedicated_new entry")?;
+    let generation = dedicated
+        .creation_generation()
+        .context("expected a value from creation_generation")?;
     let claims = claims_bound(&[("dedicated_new", &generation)]);
-    let authorization = resolve_instance_authorization(&state, &claims)
-        .await
-        .unwrap();
+    let authorization = resolve_instance_authorization(&state, &claims).await?;
     assert!(matches!(
         creating_log_target("dedicated_new", Some(dedicated.clone()), &authorization),
         Ok(log_stream::LogTarget::Creating { .. })
@@ -785,20 +809,25 @@ async fn creation_log_targets_need_a_dedicated_attempt_the_token_binds() {
             .is_err()
     );
 
-    let shared = state.install_progress.get("shared_new").unwrap();
-    let shared_generation = shared.creation_generation().unwrap();
+    let shared = state
+        .install_progress
+        .get("shared_new")
+        .context("missing shared_new entry")?;
+    let shared_generation = shared
+        .creation_generation()
+        .context("expected a value from creation_generation")?;
     let shared_claims = claims_bound(&[("shared_new", &shared_generation)]);
-    let shared_authorization = resolve_instance_authorization(&state, &shared_claims)
-        .await
-        .unwrap();
+    let shared_authorization = resolve_instance_authorization(&state, &shared_claims).await?;
     assert!(matches!(
         creating_log_target("shared_new", Some(shared), &shared_authorization),
         Err(ApiError::Conflict(_))
     ));
+
+    Ok(())
 }
 
 #[test]
-fn pre_encoded_batches_are_byte_identical_to_direct_serialization() {
+fn pre_encoded_batches_are_byte_identical_to_direct_serialization() -> anyhow::Result<()> {
     #[derive(serde::Serialize)]
     struct DirectBatch<'a> {
         progress_reset: bool,
@@ -833,12 +862,12 @@ fn pre_encoded_batches_are_byte_identical_to_direct_serialization() {
             )
         })
         .collect();
-    let snapshot = MonitoringSnapshotData::new(instances, store.list()).unwrap();
+    let snapshot = MonitoringSnapshotData::new(instances, store.list())?;
     let mut cursor = wire::ProgressCursor::default();
-    let batches = snapshot
-        .filtered(&InstanceAuthorization::All)
-        .batches(7, 1_788_220_800, &mut cursor)
-        .unwrap();
+    let batches =
+        snapshot
+            .filtered(&InstanceAuthorization::All)
+            .batches(7, 1_788_220_800, &mut cursor)?;
     assert!(batches.len() > 2);
     for batch in &batches {
         let direct = DirectBatch {
@@ -852,8 +881,10 @@ fn pre_encoded_batches_are_byte_identical_to_direct_serialization() {
             instances: batch.instances.iter().map(|row| &***row).collect(),
             install_progress: batch.install_progress.iter().map(|row| &***row).collect(),
         };
-        let encoded = serde_json::to_string(batch).unwrap();
-        assert_eq!(encoded, serde_json::to_string(&direct).unwrap());
+        let encoded = serde_json::to_string(batch)?;
+        assert_eq!(encoded, serde_json::to_string(&direct)?);
         assert!(encoded.len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
     }
+
+    Ok(())
 }

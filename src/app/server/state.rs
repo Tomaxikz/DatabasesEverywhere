@@ -654,18 +654,28 @@ fn remove_password_route(routes: &mut HashMap<String, HashSet<String>>, old: &In
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::{server::test_support, utils::backend::BackendEndpoint};
 
     #[tokio::test]
-    async fn shared_members_follow_inventory_replacement_migration_and_removal() {
+    async fn shared_members_follow_inventory_replacement_migration_and_removal()
+    -> anyhow::Result<()> {
         let store = InstanceStore::default();
         let mut tenant = test_support::shared_metadata();
         store.replace_all(vec![tenant.clone()]).await;
-        let original = store.shared_runtime_members("pool-a").await.pop().unwrap();
+        let original = store
+            .shared_runtime_members("pool-a")
+            .await
+            .pop()
+            .context("expected a value from pop")?;
         assert!(Arc::ptr_eq(
             &original,
-            &store.snapshot(&tenant.instance_id).await.unwrap()
+            &store
+                .snapshot(&tenant.instance_id)
+                .await
+                .context("snapshot should provide a value")?
         ));
 
         tenant.runtime_id = "pool-b".to_owned();
@@ -688,13 +698,18 @@ mod tests {
                 .len(),
             1
         );
-        store.remove(&tenant.instance_id).await.unwrap();
+        store
+            .remove(&tenant.instance_id)
+            .await
+            .context("expected a value from remove")?;
         assert!(
             store
                 .shared_runtime_members(&tenant.instance_id)
                 .await
                 .is_empty()
         );
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -778,7 +793,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_displaced_owners_preserves_resp_password_sets_and_qdrant_keys() {
+    async fn removing_displaced_owners_preserves_resp_password_sets_and_qdrant_keys()
+    -> anyhow::Result<()> {
         let store = InstanceStore::default();
         let hash = crate::gateway::protocols::redis::password_route_sha256(b"secret");
         for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
@@ -798,7 +814,7 @@ mod tests {
                         store
                             .resolve_redis_password(&hash)
                             .await
-                            .unwrap()
+                            .context("resolve redis password should provide a value")?
                             .1
                             .instance_id,
                         "last"
@@ -810,7 +826,7 @@ mod tests {
                         store
                             .resolve_valkey_password(&hash)
                             .await
-                            .unwrap()
+                            .context("resolve valkey password should provide a value")?
                             .1
                             .instance_id,
                         "last"
@@ -820,16 +836,18 @@ mod tests {
                 Protocol::Qdrant => store.resolve_qdrant("fingerprint").await,
                 _ => unreachable!(),
             };
-            assert_eq!(target.unwrap().instance_id, "last");
+            assert_eq!(target.context("removing displaced owners preserves resp password sets and qdrant keys should provide a value")?.instance_id, "last");
             store.remove("last").await;
             assert!(store.resolve_redis_password(&hash).await.is_none());
             assert!(store.resolve_valkey_password(&hash).await.is_none());
             assert!(store.resolve_qdrant("fingerprint").await.is_none());
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn mongodb_uses_the_exact_database_even_when_it_is_empty() {
+    async fn mongodb_uses_the_exact_database_even_when_it_is_empty() -> anyhow::Result<()> {
         let store = InstanceStore::default();
         let mut metadata = test_support::metadata("mongo", Protocol::Mongodb);
         store.upsert(metadata.clone()).await;
@@ -838,20 +856,31 @@ mod tests {
         store.upsert(metadata).await;
         assert!(store.resolve_mongodb("user", "database").await.is_none());
         assert_eq!(
-            store.resolve_mongodb("user", "").await.unwrap().instance_id,
+            store
+                .resolve_mongodb("user", "")
+                .await
+                .context("resolve mongodb should provide a value")?
+                .instance_id,
             "mongo"
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn password_only_resp_routing_is_unique_and_updates_after_rotation_or_removal() {
+    async fn password_only_resp_routing_is_unique_and_updates_after_rotation_or_removal()
+    -> anyhow::Result<()> {
         let store = InstanceStore::default();
         let first = resp_metadata("inst_first", "first", "shared-secret");
         let second = resp_metadata("inst_second", "second", "shared-secret");
         store.upsert(first.clone()).await;
         let hash = crate::gateway::protocols::redis::password_route_sha256(b"shared-secret");
         assert_eq!(
-            store.resolve_redis_password(&hash).await.unwrap().0,
+            store
+                .resolve_redis_password(&hash)
+                .await
+                .context("resolve redis password should provide a value")?
+                .0,
             "first"
         );
 
@@ -860,7 +889,11 @@ mod tests {
 
         store.remove("inst_second").await;
         assert_eq!(
-            store.resolve_redis_password(&hash).await.unwrap().0,
+            store
+                .resolve_redis_password(&hash)
+                .await
+                .context("resolve redis password should provide a value")?
+                .0,
             "first"
         );
 
@@ -871,9 +904,15 @@ mod tests {
         let rotated_hash =
             crate::gateway::protocols::redis::password_route_sha256(b"rotated-secret");
         assert_eq!(
-            store.resolve_redis_password(&rotated_hash).await.unwrap().0,
+            store
+                .resolve_redis_password(&rotated_hash)
+                .await
+                .context("resolve redis password should provide a value")?
+                .0,
             "first"
         );
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -899,7 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fenced_upsert_never_publishes_running_metadata() {
+    async fn fenced_upsert_never_publishes_running_metadata() -> anyhow::Result<()> {
         let store = InstanceStore::default();
         let mut metadata = resp_metadata("inst_mutating", "tenant", "secret");
         store.upsert(metadata.clone()).await;
@@ -911,13 +950,19 @@ mod tests {
         assert!(store.routes_fenced("inst_mutating").await);
         assert!(store.resolve_redis("tenant").await.is_none());
         assert_eq!(
-            store.get("inst_mutating").await.unwrap().updated_at,
+            store
+                .get("inst_mutating")
+                .await
+                .context("get should provide a value")?
+                .updated_at,
             metadata.updated_at
         );
 
         store.upsert(metadata).await;
         assert!(!store.routes_fenced("inst_mutating").await);
         assert!(store.resolve_redis("tenant").await.is_some());
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -964,11 +1009,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_route_revision_expires_on_fence_and_republish() {
+    async fn resolved_route_revision_expires_on_fence_and_republish() -> anyhow::Result<()> {
         let store = InstanceStore::default();
         let metadata = resp_metadata("inst_revision", "tenant", "secret");
         store.upsert(metadata.clone()).await;
-        let original = store.resolve_redis("tenant").await.unwrap();
+        let original = store
+            .resolve_redis("tenant")
+            .await
+            .context("expected a value from resolve_redis")?;
         assert_eq!(
             original.connection_limit, None,
             "dedicated routes must keep their existing gateway connection behavior"
@@ -987,7 +1035,10 @@ mod tests {
         );
 
         store.upsert(metadata).await;
-        let replacement = store.resolve_redis("tenant").await.unwrap();
+        let replacement = store
+            .resolve_redis("tenant")
+            .await
+            .context("expected a value from resolve_redis")?;
         assert_ne!(original.route_revision, replacement.route_revision);
         assert!(
             !store
@@ -999,6 +1050,8 @@ mod tests {
                 .route_is_current("inst_revision", replacement.route_revision)
                 .await
         );
+
+        Ok(())
     }
 
     #[tokio::test]

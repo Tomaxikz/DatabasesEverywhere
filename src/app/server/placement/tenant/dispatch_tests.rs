@@ -11,7 +11,7 @@ fn offline_docker() -> DockerRuntime {
 }
 
 #[test]
-fn backend_dispatch_preserves_engine_specific_credential_clients() {
+fn backend_dispatch_preserves_engine_specific_credential_clients() -> anyhow::Result<()> {
     for (protocol, expected) in [
         (
             Protocol::Postgres,
@@ -35,13 +35,13 @@ fn backend_dispatch_preserves_engine_specific_credential_clients() {
         ),
     ] {
         assert_eq!(
-            backends::for_protocol(protocol)
-                .unwrap()
-                .verify_command(TARGET),
+            backends::for_protocol(protocol)?.verify_command(TARGET),
             expected,
             "{protocol}"
         );
     }
+
+    Ok(())
 }
 
 #[test]
@@ -100,19 +100,21 @@ async fn unsupported_lifecycle_operations_fail_before_docker_access() {
 }
 
 #[tokio::test]
-async fn empty_storage_measurement_does_not_require_backend_or_admin() {
+async fn empty_storage_measurement_does_not_require_backend_or_admin() -> anyhow::Result<()> {
     let docker = offline_docker();
     for protocol in Protocol::ALL {
         let runtime = runtime("empty-storage", protocol, "test-image");
         assert_eq!(
-            measure_storage(&docker, &runtime, &[]).await.unwrap(),
+            measure_storage(&docker, &runtime, &[]).await?,
             Vec::<u64>::new()
         );
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn dedicated_telemetry_is_rejected_before_backend_or_admin_checks() {
+async fn dedicated_telemetry_is_rejected_before_backend_or_admin_checks() -> anyhow::Result<()> {
     let docker = offline_docker();
     for protocol in Protocol::ALL {
         let mut runtime = runtime("dedicated", protocol, "test-image");
@@ -125,18 +127,18 @@ async fn dedicated_telemetry_is_rejected_before_backend_or_admin_checks() {
             clickhouse_telemetry_window(&docker, &runtime, None, "SELECT 1").await,
             Err(TenantEngineError::DedicatedTelemetry)
         ));
-        secure_pool(&docker, &runtime).await.unwrap();
-        check_rollback_objects(&docker, &runtime, TARGET)
-            .await
-            .unwrap();
+        secure_pool(&docker, &runtime).await?;
+        check_rollback_objects(&docker, &runtime, TARGET).await?;
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn mongodb_quota_remains_policy_only_without_an_engine_command() {
+async fn mongodb_quota_remains_policy_only_without_an_engine_command() -> anyhow::Result<()> {
     let docker = offline_docker();
     let runtime = runtime("mongodb-quota", Protocol::Mongodb, "test-image");
-    set_quota(&docker, &runtime, TARGET, &runtime.limits)
-        .await
-        .unwrap();
+    set_quota(&docker, &runtime, TARGET, &runtime.limits).await?;
+
+    Ok(())
 }

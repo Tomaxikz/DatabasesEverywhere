@@ -892,13 +892,18 @@ mod tests {
     fn every_screen_and_popup_renders_on_small_terminals() {
         let mut app = App::new("http://127.0.0.1:8080".to_string());
         for (width, height) in [(120, 40), (60, 16), (20, 8)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, height)).expect("expected a value from new");
             for screen in [Screen::Instances, Screen::Logs, Screen::Backups] {
                 app.screen = screen;
                 app.modal = Some(Modal::Help);
-                terminal.draw(|frame| draw(frame, &app)).unwrap();
+                terminal
+                    .draw(|frame| draw(frame, &app))
+                    .expect("expected a value from draw");
                 app.modal = Some(Modal::Create(Box::new(CreateForm::new(Vec::new(), "h"))));
-                terminal.draw(|frame| draw(frame, &app)).unwrap();
+                terminal
+                    .draw(|frame| draw(frame, &app))
+                    .expect("expected a value from draw");
             }
         }
     }

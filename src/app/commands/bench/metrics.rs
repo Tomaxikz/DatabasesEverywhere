@@ -512,16 +512,21 @@ fn max_u64(target: &mut Option<u64>, candidate: Option<u64>) {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn latency_summary_interpolates_percentiles() {
-        let summary = LatencySummary::from_micros(&[1_000, 2_000, 3_000, 4_000]).unwrap();
+    fn latency_summary_interpolates_percentiles() -> anyhow::Result<()> {
+        let summary = LatencySummary::from_micros(&[1_000, 2_000, 3_000, 4_000])
+            .context("expected a value from from_micros")?;
 
         assert_eq!(summary.samples, 4);
         assert_eq!(summary.min_ms, 1.0);
         assert_eq!(summary.p50_ms, 2.5);
         assert_eq!(summary.max_ms, 4.0);
+
+        Ok(())
     }
 
     #[test]

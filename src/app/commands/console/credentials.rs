@@ -84,38 +84,44 @@ async fn read_stored(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use secrecy::ExposeSecret;
 
     use super::*;
     use crate::databases::protocol::Protocol;
 
     #[tokio::test]
-    async fn stored_credentials_are_read_without_writing_anything() {
-        let root = tempfile::tempdir().unwrap();
+    async fn stored_credentials_are_read_without_writing_anything() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
         assert!(read_stored(root.path(), "inst_one").await.is_err());
         assert!(
             !root.path().join("metadata.key").exists(),
             "a missing key is never created"
         );
 
-        let pool = crate::storage::sqlite::connect(root.path()).await.unwrap();
-        let writer = InstanceRepository::encrypted(pool.clone(), root.path()).unwrap();
+        let pool = crate::storage::sqlite::connect(root.path()).await?;
+        let writer = InstanceRepository::encrypted(pool.clone(), root.path())?;
         let mut metadata = crate::server::test_support::metadata("inst_one", Protocol::Mariadb);
         metadata.tenant_password = Some("tenant-secret".to_string());
         metadata.mariadb_root_password = Some("root-secret".to_string());
-        writer.upsert(&metadata).await.unwrap();
+        writer.upsert(&metadata).await?;
         pool.close().await;
         let database = crate::storage::sqlite::database_path(root.path());
-        let before = std::fs::read(&database).unwrap();
+        let before = std::fs::read(&database)?;
 
-        let revealed = read_stored(root.path(), "inst_one").await.unwrap();
+        let revealed = read_stored(root.path(), "inst_one").await?;
 
         assert_eq!(revealed.username, metadata.database.username);
         assert_eq!(revealed.password.expose_secret(), "tenant-secret");
-        let (label, admin) = revealed.admin.unwrap();
+        let (label, admin) = revealed.admin.context(
+            "stored credentials are read without writing anything should provide a value",
+        )?;
         assert_eq!(label, "MariaDB root");
         assert_eq!(admin.expose_secret(), "root-secret");
-        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert_eq!(std::fs::read(&database)?, before);
         assert!(read_stored(root.path(), "inst_missing").await.is_err());
+
+        Ok(())
     }
 }

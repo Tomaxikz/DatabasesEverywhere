@@ -1042,11 +1042,7 @@ impl Drop for SocketCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        net::TcpListener,
-        sync::atomic::AtomicUsize,
-        time::Duration,
-    };
+    use std::{net::TcpListener, sync::atomic::AtomicUsize, time::Duration};
 
     static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
     const TEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1063,21 +1059,29 @@ mod tests {
 
     fn start_bridge(target: SocketAddr, max_connections: usize) -> PathBuf {
         let path = socket_path();
-        let listener = UnixListener::bind(&path).unwrap();
-        let reactor = Reactor::new(vec![(listener, target)], max_connections).unwrap();
+        let listener = UnixListener::bind(&path).expect("test bind failed");
+        let reactor =
+            Reactor::new(vec![(listener, target)], max_connections).expect("test new failed");
         thread::spawn(move || reactor.run());
         path
     }
 
     fn client(path: &Path) -> UnixStream {
-        let stream = UnixStream::connect(path).unwrap();
-        stream.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-        stream.set_write_timeout(Some(TEST_TIMEOUT)).unwrap();
+        let stream = UnixStream::connect(path).expect("test connect failed");
+        stream
+            .set_read_timeout(Some(TEST_TIMEOUT))
+            .expect("test set read timeout failed");
+        stream
+            .set_write_timeout(Some(TEST_TIMEOUT))
+            .expect("test set write timeout failed");
         stream
     }
 
     fn unused_port() -> SocketAddr {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+        TcpListener::bind("127.0.0.1:0")
+            .expect("test bind failed")
+            .local_addr()
+            .expect("test local addr failed")
     }
 
     fn pattern(length: usize, seed: u8) -> Vec<u8> {
@@ -1089,72 +1093,95 @@ mod tests {
     /// Reads the whole request (up to EOF), then answers and closes.
     fn spawn_request_response_backend(listener: TcpListener) -> thread::JoinHandle<Vec<u8>> {
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+            let (mut stream, _) = listener.accept().expect("test accept failed");
+            stream
+                .set_read_timeout(Some(TEST_TIMEOUT))
+                .expect("test set read timeout failed");
             let mut request = Vec::new();
-            stream.read_to_end(&mut request).unwrap();
-            stream.write_all(b"response:").unwrap();
-            stream.write_all(&request).unwrap();
+            stream
+                .read_to_end(&mut request)
+                .expect("test read to end failed");
+            stream
+                .write_all(b"response:")
+                .expect("test write all failed");
+            stream.write_all(&request).expect("test write all failed");
             request
         })
     }
 
     #[test]
     fn forwards_half_close_in_both_directions() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let path = start_bridge(listener.local_addr().unwrap(), 8);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test bind failed");
+        let path = start_bridge(listener.local_addr().expect("test local addr failed"), 8);
         let backend = spawn_request_response_backend(listener);
 
         let mut stream = client(&path);
-        stream.write_all(b"query").unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        stream.write_all(b"query").expect("test write all failed");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("test shutdown failed");
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
+        stream
+            .read_to_end(&mut response)
+            .expect("test read to end failed");
 
-        assert_eq!(backend.join().unwrap(), b"query");
+        assert_eq!(
+            backend
+                .join()
+                .expect("forwards half close in both directions should provide a value"),
+            b"query"
+        );
         assert_eq!(response, b"response:query");
     }
 
     #[test]
     fn streams_large_bidirectional_payloads_through_bounded_buffers() {
         const LENGTH: usize = 8 * 1024 * 1024;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let path = start_bridge(listener.local_addr().unwrap(), 8);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test bind failed");
+        let path = start_bridge(listener.local_addr().expect("test local addr failed"), 8);
         // Echo backend: copies everything back until EOF, then half-closes.
         let backend = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = stream.try_clone().unwrap();
+            let (stream, _) = listener.accept().expect("test accept failed");
+            let mut reader = stream.try_clone().expect("test try clone failed");
             let mut writer = stream;
-            io::copy(&mut reader, &mut writer).unwrap();
-            writer.shutdown(Shutdown::Write).unwrap();
+            io::copy(&mut reader, &mut writer).expect("test copy failed");
+            writer
+                .shutdown(Shutdown::Write)
+                .expect("test shutdown failed");
         });
 
         let stream = client(&path);
-        let mut writer = stream.try_clone().unwrap();
+        let mut writer = stream.try_clone().expect("test try clone failed");
         let payload = pattern(LENGTH, 7);
         let expected = payload.clone();
         let upload = thread::spawn(move || {
-            writer.write_all(&payload).unwrap();
-            writer.shutdown(Shutdown::Write).unwrap();
+            writer.write_all(&payload).expect("test write all failed");
+            writer
+                .shutdown(Shutdown::Write)
+                .expect("test shutdown failed");
         });
         // A slow reader forces the bridge buffers to fill and apply backpressure.
         thread::sleep(Duration::from_millis(300));
         let mut echoed = Vec::with_capacity(LENGTH);
-        (&stream).read_to_end(&mut echoed).unwrap();
+        (&stream)
+            .read_to_end(&mut echoed)
+            .expect("test read to end failed");
 
-        upload.join().unwrap();
-        backend.join().unwrap();
+        upload.join().expect("test thread panicked");
+        backend.join().expect("test thread panicked");
         assert_eq!(echoed.len(), expected.len());
         assert!(echoed == expected, "echoed bytes differ");
     }
 
     #[test]
     fn client_disconnect_closes_backend_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let path = start_bridge(listener.local_addr().unwrap(), 8);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test bind failed");
+        let path = start_bridge(listener.local_addr().expect("test local addr failed"), 8);
         let backend = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.set_write_timeout(Some(TEST_TIMEOUT)).unwrap();
+            let (mut stream, _) = listener.accept().expect("test accept failed");
+            stream
+                .set_write_timeout(Some(TEST_TIMEOUT))
+                .expect("test set write timeout failed");
             let chunk = [0x5a; 16 * 1024];
             let started = Instant::now();
             loop {
@@ -1166,10 +1193,12 @@ mod tests {
 
         let mut stream = client(&path);
         let mut first = [0u8; 1024];
-        stream.read_exact(&mut first).unwrap();
+        stream
+            .read_exact(&mut first)
+            .expect("test read exact failed");
         drop(stream);
 
-        let (kind, elapsed) = backend.join().unwrap();
+        let (kind, elapsed) = backend.join().expect("test thread panicked");
         assert!(
             matches!(
                 kind,
@@ -1185,40 +1214,59 @@ mod tests {
         let target = unused_port();
         let path = start_bridge(target, 8);
         let mut stream = client(&path);
-        stream.write_all(b"early").unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        stream.write_all(b"early").expect("test write all failed");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("test shutdown failed");
 
         thread::sleep(Duration::from_millis(700));
-        let backend = spawn_request_response_backend(TcpListener::bind(target).unwrap());
+        let backend =
+            spawn_request_response_backend(TcpListener::bind(target).expect("test bind failed"));
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
+        stream
+            .read_to_end(&mut response)
+            .expect("test read to end failed");
 
-        assert_eq!(backend.join().unwrap(), b"early");
+        assert_eq!(
+            backend
+                .join()
+                .expect("retries until backend starts listening should provide a value"),
+            b"early"
+        );
         assert_eq!(response, b"response:early");
     }
 
     #[test]
     fn rejects_connections_beyond_limit_and_recovers() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let path = start_bridge(listener.local_addr().unwrap(), 1);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test bind failed");
+        let path = start_bridge(listener.local_addr().expect("test local addr failed"), 1);
         let first = client(&path);
-        let (held, _) = listener.accept().unwrap();
+        let (held, _) = listener.accept().expect("test accept failed");
 
         let mut rejected = client(&path);
         let mut buffer = Vec::new();
-        assert_eq!(rejected.read_to_end(&mut buffer).unwrap(), 0);
+        assert_eq!(
+            rejected
+                .read_to_end(&mut buffer)
+                .expect("read to end should provide a value"),
+            0
+        );
 
         drop(first);
         drop(held);
         thread::sleep(Duration::from_millis(200));
         let backend = spawn_request_response_backend(listener);
         let mut stream = client(&path);
-        stream.write_all(b"again").unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        stream.write_all(b"again").expect("test write all failed");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("test shutdown failed");
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
+        stream
+            .read_to_end(&mut response)
+            .expect("test read to end failed");
         assert_eq!(response, b"response:again");
-        backend.join().unwrap();
+        backend.join().expect("test thread panicked");
     }
 
     #[test]
@@ -1230,33 +1278,45 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
 
         let mut stream = client(&path);
-        stream.write_all(b"second").unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        stream.write_all(b"second").expect("test write all failed");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("test shutdown failed");
         thread::sleep(Duration::from_millis(300));
-        let backend = spawn_request_response_backend(TcpListener::bind(target).unwrap());
+        let backend =
+            spawn_request_response_backend(TcpListener::bind(target).expect("test bind failed"));
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
+        stream
+            .read_to_end(&mut response)
+            .expect("test read to end failed");
 
-        assert_eq!(backend.join().unwrap(), b"second");
+        assert_eq!(
+            backend
+                .join()
+                .expect("client hangup cancels pending backend connect should provide a value"),
+            b"second"
+        );
         assert_eq!(response, b"response:second");
     }
 
     #[test]
     fn many_concurrent_connections_share_one_thread() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let path = start_bridge(listener.local_addr().unwrap(), 64);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test bind failed");
+        let path = start_bridge(listener.local_addr().expect("test local addr failed"), 64);
         let backend = thread::spawn(move || {
             let mut handlers = Vec::new();
             for _ in 0..48 {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = listener.accept().expect("test accept failed");
                 handlers.push(thread::spawn(move || {
                     let mut request = Vec::new();
-                    stream.read_to_end(&mut request).unwrap();
-                    stream.write_all(&request).unwrap();
+                    stream
+                        .read_to_end(&mut request)
+                        .expect("test read to end failed");
+                    stream.write_all(&request).expect("test write all failed");
                 }));
             }
             for handler in handlers {
-                handler.join().unwrap();
+                handler.join().expect("test thread panicked");
             }
         });
         let clients = (0..48u8)
@@ -1265,18 +1325,22 @@ mod tests {
                 thread::spawn(move || {
                     let mut stream = client(&path);
                     let payload = pattern(64 * 1024 + usize::from(seed), seed);
-                    stream.write_all(&payload).unwrap();
-                    stream.shutdown(Shutdown::Write).unwrap();
+                    stream.write_all(&payload).expect("test write all failed");
+                    stream
+                        .shutdown(Shutdown::Write)
+                        .expect("test shutdown failed");
                     let mut response = Vec::new();
-                    stream.read_to_end(&mut response).unwrap();
+                    stream
+                        .read_to_end(&mut response)
+                        .expect("test read to end failed");
                     assert!(response == payload);
                 })
             })
             .collect::<Vec<_>>();
         for client in clients {
-            client.join().unwrap();
+            client.join().expect("test thread panicked");
         }
-        backend.join().unwrap();
+        backend.join().expect("test thread panicked");
     }
 
     #[test]

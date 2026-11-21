@@ -37,7 +37,8 @@ where
                 return Ok::<(), ListenerError>(());
             }
             client_read.read_exact(&mut header[1..]).await?;
-            let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+            let [tag, length @ ..] = header;
+            let len = u32::from_be_bytes(length) as usize;
             if len < 4 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -57,7 +58,7 @@ where
                     "postgres frontend message ended before its declared length",
                 )
                 .await?;
-            match header[0] {
+            match tag {
                 b'Q' => activity.accept(classify_sql(prefix)),
                 b'E' => activity.accept(OperationKind::Other),
                 _ => {}

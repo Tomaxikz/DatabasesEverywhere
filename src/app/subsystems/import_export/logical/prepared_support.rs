@@ -372,16 +372,15 @@ mod tests {
     }
 
     #[test]
-    fn shared_staging_reserves_private_source_and_rollback_snapshots() {
+    fn shared_staging_reserves_private_source_and_rollback_snapshots() -> anyhow::Result<()> {
         assert_eq!(
-            staging_reservation_bytes(DeploymentMode::Dedicated, 4, 6).unwrap(),
+            staging_reservation_bytes(DeploymentMode::Dedicated, 4, 6)?,
             10
         );
-        assert_eq!(
-            staging_reservation_bytes(DeploymentMode::Shared, 4, 6).unwrap(),
-            20
-        );
+        assert_eq!(staging_reservation_bytes(DeploymentMode::Shared, 4, 6)?, 20);
         assert!(staging_reservation_bytes(DeploymentMode::Shared, u64::MAX, 1).is_err());
+
+        Ok(())
     }
 
     #[test]

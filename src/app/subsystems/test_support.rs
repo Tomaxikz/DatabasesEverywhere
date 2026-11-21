@@ -19,7 +19,7 @@ pub(crate) fn state(
     manager: InstanceManager,
     pool: SqlitePool,
 ) -> AppState {
-    let config = Arc::new(crate::config::RuntimeConfig::new(config).unwrap());
+    let config = Arc::new(crate::config::RuntimeConfig::new(config).expect("state should succeed"));
     AppState::new(AppStateData {
         config: Arc::clone(&config),
         config_path,
@@ -60,8 +60,10 @@ pub(crate) fn state(
 }
 
 pub(crate) async fn database(config: Config) -> (AppState, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = crate::storage::sqlite::connect(dir.path()).await.unwrap();
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let pool = crate::storage::sqlite::connect(dir.path())
+        .await
+        .expect("path should succeed");
     let store = InstanceStore::default();
     let manager = InstanceManager::new(
         store.clone(),

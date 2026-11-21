@@ -13,7 +13,10 @@ fn log_policy_upgrade_is_idempotent_and_rejects_unbounded_or_legacy_layouts() {
             "Mounts":[]
         });
         let matches = |value: &serde_json::Value| {
-            log_policy_matches(&serde_json::from_value(value.clone()).unwrap(), engine)
+            log_policy_matches(
+                &serde_json::from_value(value.clone()).expect("from value should succeed"),
+                engine,
+            )
         };
         assert!(matches(&value));
         if engine == DaemonEngine::Podman {
@@ -42,7 +45,7 @@ fn log_policy_upgrade_is_idempotent_and_rejects_unbounded_or_legacy_layouts() {
 }
 
 #[tokio::test]
-async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() {
+async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() -> anyhow::Result<()> {
     use axum::body::Body;
     use bytes::Bytes;
     use hyper::{Response, server::conn::http1, service::service_fn};
@@ -67,16 +70,14 @@ async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() {
         bytes.extend_from_slice(contents);
         Bytes::from(bytes)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("docker.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    let listener = UnixListener::bind(&path)?;
     let config = DaemonConfig {
         socket_path: path.display().to_string(),
         ..Default::default()
     };
-    let runtime = DockerRuntime::new(&config, false)
-        .unwrap()
-        .with_node_id("test-node");
+    let runtime = DockerRuntime::new(&config, false)?.with_node_id("test-node");
     let labels = std::collections::HashMap::from([
         (MANAGED_LABEL, "true"),
         (INSTANCE_LABEL, "inst_abc"),
@@ -89,7 +90,7 @@ async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() {
     let dropped = Arc::new(Mutex::new(Some(dropped)));
     let server = tokio::spawn(async move {
         loop {
-            let (socket, _) = listener.accept().await.unwrap();
+            let (socket, _) = listener.accept().await.expect("accept should succeed");
             let inspection = inspection.clone();
             let dropped = dropped.clone();
             tokio::spawn(async move {
@@ -101,10 +102,12 @@ async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() {
                             Body::from(inspection)
                         } else {
                             assert!(request.uri().path().ends_with("/logs"));
-                            let query = request.uri().query().unwrap();
+                            let query = request.uri().query().expect("expected a value from query");
                             assert!(query.contains("tail="));
                             if query.contains("follow=true") {
-                                let guard = StreamDropped(dropped.lock().unwrap().take());
+                                let guard = StreamDropped(
+                                    dropped.lock().expect("lock should succeed").take(),
+                                );
                                 Body::from_stream(futures::stream::unfold(
                                     (guard, 0),
                                     |(guard, index)| async move {
@@ -126,7 +129,7 @@ async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() {
                             Response::builder()
                                 .header("Content-Type", "application/vnd.docker.raw-stream")
                                 .body(body)
-                                .unwrap(),
+                                .expect("body should succeed"),
                         )
                     }
                 });
@@ -140,7 +143,7 @@ async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() {
         let history = runtime
             .logs(Protocol::Postgres, "inst_abc", Some(2000))
             .await
-            .unwrap();
+            .expect("logs should succeed");
         assert!(
             history
                 .stdout
@@ -156,11 +159,27 @@ async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() {
         let mut live = runtime
             .follow_logs(Protocol::Postgres, "inst_abc", None)
             .await
-            .unwrap();
-        assert_eq!(live.next().await.unwrap().unwrap().stdout, "recent tail\n");
-        assert_eq!(live.next().await.unwrap().unwrap().stderr, "live output\n");
+            .expect("follow logs should succeed");
+        assert_eq!(
+            live.next()
+                .await
+                .expect("next should provide a value")
+                .expect("next should succeed")
+                .stdout,
+            "recent tail\n"
+        );
+        assert_eq!(
+            live.next()
+                .await
+                .expect("next should provide a value")
+                .expect("next should succeed")
+                .stderr,
+            "live output\n"
+        );
         drop(live);
-        finished.await.unwrap();
+        finished.await.expect(
+            "history is bounded and dropping a live reader closes the stream should succeed",
+        );
         assert!(
             runtime
                 .logs(Protocol::Postgres, "another_instance", None)
@@ -170,5 +189,7 @@ async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() {
     })
     .await;
     server.abort();
-    result.unwrap();
+    result?;
+
+    Ok(())
 }

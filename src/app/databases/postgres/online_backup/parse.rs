@@ -594,10 +594,11 @@ mod tests {
     }
 
     #[test]
-    fn label_and_manifest_must_agree() {
+    fn label_and_manifest_must_agree() -> anyhow::Result<()> {
         let label = sample_label("0/2000028", 1);
         let manifest = sample_manifest("0/02000028", "0/2000100", 1, &[]);
-        let recovery = recovery_from_label_and_manifest(&label, &manifest, LABEL_NAME).unwrap();
+        let recovery = recovery_from_label_and_manifest(&label, &manifest, LABEL_NAME)
+            .map_err(anyhow::Error::msg)?;
         assert_eq!(
             recovery.0.get("start_lsn").map(String::as_str),
             Some("0/2000028")
@@ -614,10 +615,12 @@ mod tests {
         let fetched = label.replace("streamed", "fetched");
         assert!(recovery_from_label_and_manifest(&fetched, &manifest, LABEL_NAME).is_err());
         assert!(recovery_from_label_and_manifest(&label, &manifest, "dbev-other").is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn manifest_checksum_includes_the_wal_ranges_comma() {
+    fn manifest_checksum_includes_the_wal_ranges_comma() -> anyhow::Result<()> {
         let file_hash = hex::encode(Sha256::digest(b"START\n").as_slice());
         assert_eq!(
             file_hash,
@@ -635,8 +638,8 @@ mod tests {
             v1.contains("d58d195a8c4dffa563d10bad6d06ca788e5883081c9ac26211b73b2a3c007388"),
             "{v1}"
         );
-        verify_manifest_checksum(v2.as_bytes()).unwrap();
-        verify_manifest_checksum(v1.as_bytes()).unwrap();
+        verify_manifest_checksum(v2.as_bytes()).map_err(anyhow::Error::msg)?;
+        verify_manifest_checksum(v1.as_bytes()).map_err(anyhow::Error::msg)?;
 
         let prefix = manifest_prefix(2, Some(7_251_860_123_456_789_012), &files, &ranges);
         assert!(prefix.ends_with(",\n"));
@@ -654,44 +657,48 @@ mod tests {
         flipped[0] = b'x';
         assert!(verify_manifest_checksum(&flipped).is_err());
         assert!(verify_manifest_checksum(b"\"Manifest-Checksum\": \"ab\"}\n").is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn wal_segment_names_match_postgresql() {
+    fn wal_segment_names_match_postgresql() -> anyhow::Result<()> {
         let seg = DEFAULT_WAL_SEGMENT_BYTES;
         assert_eq!(
-            wal_segment_name(1, 0, seg).unwrap(),
+            wal_segment_name(1, 0, seg).map_err(anyhow::Error::msg)?,
             "000000010000000000000000"
         );
         assert_eq!(
-            wal_segment_name(1, 2, seg).unwrap(),
+            wal_segment_name(1, 2, seg).map_err(anyhow::Error::msg)?,
             "000000010000000000000002"
         );
         assert_eq!(
-            wal_segment_name(2, 256, seg).unwrap(),
+            wal_segment_name(2, 256, seg).map_err(anyhow::Error::msg)?,
             "000000020000000100000000"
         );
         assert_eq!(
-            required_wal_segments(1, 0xFFFF00, 0x1000100, seg).unwrap(),
+            required_wal_segments(1, 0xFFFF00, 0x1000100, seg).map_err(anyhow::Error::msg)?,
             vec![
                 "000000010000000000000000".to_string(),
                 "000000010000000000000001".to_string()
             ]
         );
         assert_eq!(
-            required_wal_segments(1, 0, 0x1000000, seg).unwrap(),
+            required_wal_segments(1, 0, 0x1000000, seg).map_err(anyhow::Error::msg)?,
             vec!["000000010000000000000000".to_string()]
         );
         assert!(required_wal_segments(1, 0x1000000, 0x1000000, seg).is_err());
         assert!(required_wal_segments(1, 0x20, 0x10, seg).is_err());
         assert_eq!(
-            wal_segment_name(1, 32, 1024 * 1024).unwrap(),
+            wal_segment_name(1, 32, 1024 * 1024).map_err(anyhow::Error::msg)?,
             "000000010000000000000020"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn staged_tree_accepts_wal_segments_history_and_archive_status() {
+    fn staged_tree_accepts_wal_segments_history_and_archive_status() -> anyhow::Result<()> {
         let seg = DEFAULT_WAL_SEGMENT_BYTES;
         let root = stage_tree(
             &[
@@ -709,10 +716,12 @@ mod tests {
             Some(&pg_control_fixture(1300, DEFAULT_WAL_SEGMENT_BYTES as u32)),
             &[(1, "0/FFFF00", "0/1000100")],
         );
-        fs::create_dir_all(root.join("pg_wal/summaries")).unwrap();
+        fs::create_dir_all(root.join("pg_wal/summaries"))?;
         let outcome = verify_staged_tree(&root);
         let _ = fs::remove_dir_all(&root);
-        assert_eq!(outcome.unwrap(), 2);
+        assert_eq!(outcome.map_err(anyhow::Error::msg)?, 2);
+
+        Ok(())
     }
 
     #[test]
@@ -733,7 +742,9 @@ mod tests {
             );
             let outcome = verify_staged_tree(&root);
             let _ = fs::remove_dir_all(&root);
-            let error = outcome.unwrap_err();
+            let error = outcome.expect_err(
+                "staged tree rejects wal that postgres does not emit should return an error",
+            );
             assert!(
                 error.contains("unexpected file"),
                 "{extra} produced {error}"
@@ -742,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_tree_requires_each_wal_range_segment_at_the_control_size() {
+    fn staged_tree_requires_each_wal_range_segment_at_the_control_size() -> anyhow::Result<()> {
         let standard = pg_control_fixture(1300, DEFAULT_WAL_SEGMENT_BYTES as u32);
         let missing = stage_tree(
             &[],
@@ -751,7 +762,8 @@ mod tests {
             Some(&standard),
             &[(1, "0/2000028", "0/2000100")],
         );
-        let missing_error = verify_staged_tree(&missing).unwrap_err();
+        let missing_error =
+            verify_staged_tree(&missing).expect_err("verify staged tree should return an error");
         let _ = fs::remove_dir_all(&missing);
         assert!(
             missing_error.contains("missing pg_wal/000000010000000000000002"),
@@ -765,7 +777,8 @@ mod tests {
             Some(&standard),
             &[(1, "0/2000028", "0/2000100")],
         );
-        let short_error = verify_staged_tree(&short).unwrap_err();
+        let short_error =
+            verify_staged_tree(&short).expect_err("verify staged tree should return an error");
         let _ = fs::remove_dir_all(&short);
         assert!(short_error.contains("WAL segment size"), "{short_error}");
 
@@ -773,14 +786,11 @@ mod tests {
         for version in [1300_u32, 1700, 1800] {
             let control = pg_control_fixture(version, one_mib);
             assert_eq!(
-                u32::from_le_bytes(control[220..224].try_into().unwrap()),
+                u32::from_le_bytes(control[220..224].try_into()?),
                 131_072,
                 "offset 220 is relseg_size, not the WAL segment size"
             );
-            assert_eq!(
-                u32::from_le_bytes(control[228..232].try_into().unwrap()),
-                one_mib
-            );
+            assert_eq!(u32::from_le_bytes(control[228..232].try_into()?), one_mib);
             let sized = stage_tree(
                 &[("000000010000000000000020", u64::from(one_mib))],
                 &[],
@@ -790,24 +800,33 @@ mod tests {
             );
             let sized_ok = verify_staged_tree(&sized);
             let _ = fs::remove_dir_all(&sized);
-            assert_eq!(sized_ok.unwrap(), 2, "version {version}");
+            assert_eq!(
+                sized_ok.map_err(anyhow::Error::msg)?,
+                2,
+                "version {version}"
+            );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn pg_control_rejects_unreadable_layouts_instead_of_assuming_16_mib() {
+    fn pg_control_rejects_unreadable_layouts_instead_of_assuming_16_mib() -> anyhow::Result<()> {
         assert_eq!(crc32c(b""), 0);
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
 
         let root = control_dir(&pg_control_fixture(1800, 1024 * 1024));
-        assert_eq!(wal_segment_bytes(&root).unwrap(), 1024 * 1024);
+        assert_eq!(
+            wal_segment_bytes(&root).map_err(anyhow::Error::msg)?,
+            1024 * 1024
+        );
         let _ = fs::remove_dir_all(&root);
 
         let mut tail = pg_control_fixture(1300, DEFAULT_WAL_SEGMENT_BYTES as u32);
         tail[400] ^= 0xff;
         let ignored_tail = control_dir(&tail);
         assert_eq!(
-            wal_segment_bytes(&ignored_tail).unwrap(),
+            wal_segment_bytes(&ignored_tail).map_err(anyhow::Error::msg)?,
             DEFAULT_WAL_SEGMENT_BYTES
         );
         let _ = fs::remove_dir_all(&ignored_tail);
@@ -838,14 +857,17 @@ mod tests {
         );
 
         let absent = std::env::temp_dir().join(format!("dbev-pg-control-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&absent).unwrap();
-        let missing = wal_segment_bytes(&absent).unwrap_err();
+        fs::create_dir_all(&absent)?;
+        let missing =
+            wal_segment_bytes(&absent).expect_err("wal segment bytes should return an error");
         let _ = fs::remove_dir_all(&absent);
         assert!(missing.contains("pg_control"), "{missing}");
+
+        Ok(())
     }
 
     #[test]
-    fn manifest_cannot_list_pg_wal_as_a_data_file() {
+    fn manifest_cannot_list_pg_wal_as_a_data_file() -> anyhow::Result<()> {
         let root = stage_tree(
             &[("000000010000000000000002", DEFAULT_WAL_SEGMENT_BYTES)],
             &[],
@@ -866,10 +888,13 @@ mod tests {
             ],
             &[(1, "0/2000028", "0/2000100")],
         );
-        fs::write(root.join("backup_manifest"), listed).unwrap();
-        let error = verify_staged_tree(&root).unwrap_err();
+        fs::write(root.join("backup_manifest"), listed)?;
+        let error =
+            verify_staged_tree(&root).expect_err("verify staged tree should return an error");
         let _ = fs::remove_dir_all(&root);
         assert!(error.contains("lists WAL path"), "{error}");
+
+        Ok(())
     }
 
     fn sample_label(lsn: &str, timeline: u64) -> String {
@@ -901,7 +926,7 @@ mod tests {
         prefix.push_str(",\n");
         if version != 1 {
             prefix.push_str("\"System-Identifier\": ");
-            prefix.push_str(&system_id.unwrap().to_string());
+            prefix.push_str(&system_id.expect("expected system id").to_string());
             prefix.push_str(",\n");
         }
         prefix.push_str("\"Files\": [");
@@ -961,7 +986,8 @@ mod tests {
         bytes[220..224].copy_from_slice(&131_072_u32.to_le_bytes());
         bytes[224..228].copy_from_slice(&8192_u32.to_le_bytes());
         bytes[228..232].copy_from_slice(&wal_segment_bytes.to_le_bytes());
-        let crc_offset = pg_control_crc_offset(version).unwrap();
+        let crc_offset =
+            pg_control_crc_offset(version).expect("pg control crc offset should succeed");
         let crc = crc32c(&bytes[..crc_offset]);
         bytes[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
         bytes
@@ -969,14 +995,14 @@ mod tests {
 
     fn control_dir(bytes: &[u8]) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("dbev-pg-control-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(root.join("global")).unwrap();
-        fs::write(root.join("global/pg_control"), bytes).unwrap();
+        fs::create_dir_all(root.join("global")).expect("create dir all should succeed");
+        fs::write(root.join("global/pg_control"), bytes).expect("write should succeed");
         root
     }
 
     fn expect_control_error(bytes: &[u8], needle: &str) {
         let root = control_dir(bytes);
-        let error = wal_segment_bytes(&root).unwrap_err();
+        let error = wal_segment_bytes(&root).expect_err("wal segment bytes should return an error");
         let _ = fs::remove_dir_all(&root);
         assert!(error.contains(needle), "{error}");
     }
@@ -989,14 +1015,15 @@ mod tests {
         ranges: &[(u64, &str, &str)],
     ) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("dbev-pg-parse-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&root).expect("create dir all should succeed");
         let label = b"START\n";
-        fs::write(root.join("backup_label"), label).unwrap();
+        fs::write(root.join("backup_label"), label).expect("write should succeed");
         let mut files = vec![("backup_label", label.len() as u64, file_sha(label))];
         if let Some(control) = control {
             let path = root.join("global/pg_control");
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, control).unwrap();
+            fs::create_dir_all(path.parent().expect("expected a value from parent"))
+                .expect("parent should succeed");
+            fs::write(&path, control).expect("write should succeed");
             files.push(("global/pg_control", control.len() as u64, file_sha(control)));
         }
         let file_refs: Vec<(&str, u64, &str)> = files
@@ -1007,26 +1034,31 @@ mod tests {
             root.join("backup_manifest"),
             postgres_manifest(2, Some(7_251_860_123_456_789_012), &file_refs, ranges),
         )
-        .unwrap();
+        .expect("postgres manifest should succeed");
         for (name, len) in segments {
             let path = root.join("pg_wal").join(name);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::File::create(path).unwrap().set_len(*len).unwrap();
+            fs::create_dir_all(path.parent().expect("expected a value from parent"))
+                .expect("parent should succeed");
+            fs::File::create(path)
+                .expect("create should succeed")
+                .set_len(*len)
+                .expect("set len should succeed");
         }
         for (name, len) in auxiliary {
             let path = root.join("pg_wal").join(name);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::create_dir_all(path.parent().expect("expected a value from parent"))
+                .expect("parent should succeed");
             fs::File::create(&path)
-                .unwrap()
+                .expect("create should succeed")
                 .set_len(*len as u64)
-                .unwrap();
+                .expect("set len should succeed");
         }
         for (path, bytes) in extra {
             let full = root.join(path);
             if let Some(parent) = full.parent() {
-                fs::create_dir_all(parent).unwrap();
+                fs::create_dir_all(parent).expect("create dir all should succeed");
             }
-            fs::write(full, bytes).unwrap();
+            fs::write(full, bytes).expect("write should succeed");
         }
         root
     }

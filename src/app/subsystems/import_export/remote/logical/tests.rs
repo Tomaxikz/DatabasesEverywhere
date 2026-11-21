@@ -16,21 +16,23 @@ use crate::{
 };
 
 #[test]
-fn credential_files_escape_separators_and_reject_line_injection() {
-    assert_eq!(mysql_option_value("a\"b\\c").unwrap(), "\"a\\\"b\\\\c\"");
-    assert_eq!(pgpass_value(r"a:b\c").unwrap(), r"a\:b\\c");
+fn credential_files_escape_separators_and_reject_line_injection() -> anyhow::Result<()> {
+    assert_eq!(mysql_option_value("a\"b\\c")?, "\"a\\\"b\\\\c\"");
+    assert_eq!(pgpass_value(r"a:b\c")?, r"a\:b\\c");
     for value in ["secret\nother", "secret\rother", "secret\0other"] {
         assert!(matches!(pgpass_value(value), Err(ApiError::BadRequest(_))));
     }
+
+    Ok(())
 }
 
 #[test]
-fn generated_scripts_do_not_contain_passwords() {
+fn generated_scripts_do_not_contain_passwords() -> anyhow::Result<()> {
     let source = RemoteImportSource {
         endpoint: super::super::security::ResolvedRemoteEndpoint {
             host: "db.example.com".to_string(),
             port: 5432,
-            addresses: vec!["203.0.113.5:5432".parse().unwrap()],
+            addresses: vec!["203.0.113.5:5432".parse()?],
             tls: true,
         },
         database: Some("app".to_string()),
@@ -40,19 +42,16 @@ fn generated_scripts_do_not_contain_passwords() {
         database_index: 0,
         api_key: None,
     };
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-        .unwrap();
-    let script = runtime
-        .block_on(prepare_postgres(
-            &source,
-            &ImportExportSelection::default(),
-            dir.path(),
-            37,
-        ))
-        .unwrap();
+        .build()?;
+    let script = runtime.block_on(prepare_postgres(
+        &source,
+        &ImportExportSelection::default(),
+        dir.path(),
+        37,
+    ))?;
     assert!(!script.contains("do-not-leak"));
     assert!(script.contains("sslrootcert=/etc/ssl/certs/ca-certificates.crt"));
     assert!(script.contains("--format=custom"));
@@ -60,17 +59,21 @@ fn generated_scripts_do_not_contain_passwords() {
     assert!(script.contains("--clean --if-exists"));
     assert!(script.contains(&sh_quote(POSTGRES_TOC_FILTER_PROGRAM)));
     assert!(script.contains("CREATE SCHEMA IF NOT EXISTS"));
-    let service = std::fs::read_to_string(dir.path().join("pg_service.conf")).unwrap();
+    let service = std::fs::read_to_string(dir.path().join("pg_service.conf"))?;
     assert!(service.contains("connect_timeout=37"));
+
+    Ok(())
 }
 
 #[test]
-fn mysql_dump_scripts_end_options_before_database_and_tables() {
+fn mysql_dump_scripts_end_options_before_database_and_tables() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let source = RemoteImportSource {
         endpoint: super::super::security::ResolvedRemoteEndpoint {
             host: "db.example.com".to_string(),
             port: 3306,
-            addresses: vec!["203.0.113.5:3306".parse().unwrap()],
+            addresses: vec!["203.0.113.5:3306".parse()?],
             tls: false,
         },
         database: Some("-app".to_string()),
@@ -86,28 +89,27 @@ fn mysql_dump_scripts_end_options_before_database_and_tables() {
         exclude: vec!["legacy".to_string()],
         ..ImportExportSelection::default()
     };
-    let mysql_dir = tempfile::tempdir().unwrap();
-    let mariadb_dir = tempfile::tempdir().unwrap();
+    let mysql_dir = tempfile::tempdir()?;
+    let mariadb_dir = tempfile::tempdir()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-        .unwrap();
-    let mysql = runtime
-        .block_on(prepare_mysql(
-            &source,
-            &selection,
-            "target_user",
-            mysql_dir.path(),
-            23,
-        ))
-        .unwrap();
-    let mariadb = runtime
-        .block_on(prepare_mariadb(&source, &selection, mariadb_dir.path(), 23))
-        .unwrap();
+        .build()?;
+    let mysql = runtime.block_on(prepare_mysql(
+        &source,
+        &selection,
+        "target_user",
+        mysql_dir.path(),
+        23,
+    ))?;
+    let mariadb = runtime.block_on(prepare_mariadb(&source, &selection, mariadb_dir.path(), 23))?;
 
     for script in [&mysql, &mariadb] {
-        let ignore = script.find("--ignore-table='-app.legacy'").unwrap();
-        let positionals = script.find("-- '-app' '-events'").unwrap();
+        let ignore = script
+            .find("--ignore-table='-app.legacy'")
+            .context("expected a value from find")?;
+        let positionals = script
+            .find("-- '-app' '-events'")
+            .context("expected a value from find")?;
         assert!(ignore < positionals);
         assert!(script.contains("--triggers"));
         assert!(!script.contains("--routines"));
@@ -124,9 +126,11 @@ fn mysql_dump_scripts_end_options_before_database_and_tables() {
         "mariadb restores as its tenant and strips source definers"
     );
     for directory in [&mysql_dir, &mariadb_dir] {
-        let config = std::fs::read_to_string(directory.path().join("client.cnf")).unwrap();
+        let config = std::fs::read_to_string(directory.path().join("client.cnf"))?;
         assert!(config.contains("connect-timeout=23"));
     }
+
+    Ok(())
 }
 
 #[test]
@@ -143,7 +147,7 @@ fn full_mysql_dumps_include_database_wide_objects_but_selective_dumps_do_not() {
 }
 
 #[test]
-fn mysql_selection_rejects_a_different_database_qualifier() {
+fn mysql_selection_rejects_a_different_database_qualifier() -> anyhow::Result<()> {
     let mismatched = ImportExportSelection {
         mode: SelectionMode::Selective,
         include: vec!["other.orders".to_string()],
@@ -160,13 +164,15 @@ fn mysql_selection_rejects_a_different_database_qualifier() {
         exclude: vec!["app.audit".to_string()],
         ..ImportExportSelection::default()
     };
-    let (filters, tables) = mysql_selection_args(&matched, "app", "--ignore-table").unwrap();
+    let (filters, tables) = mysql_selection_args(&matched, "app", "--ignore-table")?;
     assert!(filters.contains("--ignore-table='app.audit'"));
     assert_eq!(tables, " 'orders'");
+
+    Ok(())
 }
 
 #[test]
-fn mariadb_definer_filter_preserves_insert_values() {
+fn mariadb_definer_filter_preserves_insert_values() -> anyhow::Result<()> {
     let fixture = concat!(
         "INSERT INTO `payloads` VALUES ('DEFINER=`x`@`y` ',",
         "'/*!50017 DEFINER=`x`@`y`*/');\n",
@@ -179,22 +185,21 @@ fn mariadb_definer_filter_preserves_insert_values() {
         "CREATE DEFINER=`admin`@`%` VIEW `items_view` AS SELECT 1;\n",
         "ALTER ALGORITHM=UNDEFINED DEFINER=`admin`@`%` VIEW `other_view` AS SELECT 2;\n",
     );
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir()?;
     let input = directory.path().join("dump.sql");
-    std::fs::write(&input, fixture).unwrap();
+    std::fs::write(&input, fixture)?;
     let output = std::process::Command::new("sed")
         .arg("-E")
         .arg(MYSQL_DEFINER_SED_PROGRAM)
         .arg("--")
         .arg(&input)
-        .output()
-        .unwrap();
+        .output()?;
     assert!(
         output.status.success(),
         "sed failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let filtered = String::from_utf8(output.stdout).unwrap();
+    let filtered = String::from_utf8(output.stdout)?;
 
     assert!(filtered.contains(
         "INSERT INTO `payloads` VALUES ('DEFINER=`x`@`y` ',\
@@ -206,10 +211,15 @@ fn mariadb_definer_filter_preserves_insert_values() {
     assert!(filtered.contains("'/*M!100301 DEFINER=`literal`@`value`*/'"));
     assert!(filtered.contains("CREATE VIEW `items_view`"));
     assert!(filtered.contains("ALTER ALGORITHM=UNDEFINED VIEW `other_view`"));
+
+    Ok(())
 }
 
 #[test]
-fn mysql_definer_filter_rewrites_every_supported_object_to_the_target_tenant() {
+fn mysql_definer_filter_rewrites_every_supported_object_to_the_target_tenant() -> anyhow::Result<()>
+{
+    use anyhow::Context as _;
+
     let fixture = concat!(
         "INSERT INTO `payloads` VALUES ('DEFINER=`literal`@`value`');\n",
         "/*!50003 CREATE*/ /*!50017 DEFINER=`source`@`localhost`*/ ",
@@ -226,63 +236,64 @@ fn mysql_definer_filter_rewrites_every_supported_object_to_the_target_tenant() {
         "/*!50013 DEFINER=`source`@`localhost` SQL SECURITY DEFINER */\n",
         "/*!50001 VIEW `versioned_view` AS SELECT 3 */;\n",
     );
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir()?;
     let input = directory.path().join("dump.sql");
     let output = directory.path().join("filtered.sql");
-    std::fs::write(&input, fixture).unwrap();
+    std::fs::write(&input, fixture)?;
     let script = mysql_definer_filter(
-        input.to_str().unwrap(),
-        output.to_str().unwrap(),
+        input.to_str().context("expected a value from to_str")?,
+        output.to_str().context("expected a value from to_str")?,
         "target_user",
-    )
-    .unwrap();
+    )?;
     let command = std::process::Command::new("sh")
         .arg("-c")
         .arg(script)
-        .output()
-        .unwrap();
+        .output()?;
     assert!(
         command.status.success(),
         "filter failed: {}",
         String::from_utf8_lossy(&command.stderr)
     );
-    let filtered = std::fs::read_to_string(output).unwrap();
+    let filtered = std::fs::read_to_string(output)?;
 
     assert!(filtered.contains("INSERT INTO `payloads` VALUES ('DEFINER=`literal`@`value`');"));
     assert_eq!(filtered.matches("DEFINER=`target_user`@`%`").count(), 7);
     assert!(!filtered.contains("DEFINER=`source`@`localhost`"));
+
+    Ok(())
 }
 
 #[test]
-fn mysql_definer_filter_rejects_an_object_without_an_explicit_definer() {
-    let directory = tempfile::tempdir().unwrap();
+fn mysql_definer_filter_rejects_an_object_without_an_explicit_definer() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let directory = tempfile::tempdir()?;
     let input = directory.path().join("dump.sql");
     let output = directory.path().join("filtered.sql");
     std::fs::write(
         &input,
         "CREATE SQL SECURITY DEFINER VIEW `unsafe_view` AS SELECT 1;\n",
-    )
-    .unwrap();
+    )?;
     let script = mysql_definer_filter(
-        input.to_str().unwrap(),
-        output.to_str().unwrap(),
+        input.to_str().context("expected a value from to_str")?,
+        output.to_str().context("expected a value from to_str")?,
         "target_user",
-    )
-    .unwrap();
+    )?;
     let command = std::process::Command::new("sh")
         .arg("-c")
         .arg(script)
-        .output()
-        .unwrap();
+        .output()?;
 
     assert!(!command.status.success());
     assert!(
         String::from_utf8_lossy(&command.stderr).contains("unsupported or unsafe DEFINER form")
     );
+
+    Ok(())
 }
 
 #[test]
-fn postgres_toc_filter_removes_only_structural_schema_entries() {
+fn postgres_toc_filter_removes_only_structural_schema_entries() -> anyhow::Result<()> {
     let fixture = concat!(
         ";\n",
         "; Archive created at 2026-01-01\n",
@@ -291,25 +302,26 @@ fn postgres_toc_filter_removes_only_structural_schema_entries() {
         "126; 0 0 TABLE DATA app events operator\n",
         "127; 1255 456 FUNCTION app dangerous() operator\n",
     );
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir()?;
     let input = directory.path().join("dump.toc");
-    std::fs::write(&input, fixture).unwrap();
+    std::fs::write(&input, fixture)?;
     let output = std::process::Command::new("awk")
         .arg(POSTGRES_TOC_FILTER_PROGRAM)
         .arg(&input)
-        .output()
-        .unwrap();
+        .output()?;
     assert!(
         output.status.success(),
         "awk failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let filtered = String::from_utf8(output.stdout).unwrap();
+    let filtered = String::from_utf8(output.stdout)?;
 
     assert!(!filtered.contains("SCHEMA - app"));
     assert!(filtered.contains("TABLE app events"));
     assert!(filtered.contains("TABLE DATA app events"));
     assert!(filtered.contains("FUNCTION app dangerous()"));
+
+    Ok(())
 }
 
 #[test]
@@ -344,7 +356,7 @@ fn selective_postgres_dump_requires_every_pattern_to_match() {
 }
 
 #[test]
-fn mongodb_output_plan_names_single_and_multiple_collection_archives() {
+fn mongodb_output_plan_names_single_and_multiple_collection_archives() -> anyhow::Result<()> {
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
         include: vec!["orders".to_string(), "customers".to_string()],
@@ -352,8 +364,8 @@ fn mongodb_output_plan_names_single_and_multiple_collection_archives() {
         ..ImportExportSelection::default()
     };
 
-    let collections = mongodb_selected_collections(&selection).unwrap();
-    let names = output_names(Protocol::Mongodb, &selection).unwrap();
+    let collections = mongodb_selected_collections(&selection)?;
+    let names = output_names(Protocol::Mongodb, &selection)?;
 
     assert_eq!(collections, vec![Some("orders"), Some("customers")]);
     assert_eq!(
@@ -370,22 +382,24 @@ fn mongodb_output_plan_names_single_and_multiple_collection_archives() {
     };
 
     assert_eq!(
-        output_names(Protocol::Mongodb, &selection).unwrap(),
+        output_names(Protocol::Mongodb, &selection)?,
         vec!["source.mongodb.archive.gz"]
     );
     assert_eq!(
-        output_names(Protocol::Mongodb, &ImportExportSelection::default()).unwrap(),
+        output_names(Protocol::Mongodb, &ImportExportSelection::default())?,
         vec!["source.mongodb.archive.gz"]
     );
+
+    Ok(())
 }
 
 #[test]
-fn mongodb_config_uses_the_configured_connection_deadline() {
+fn mongodb_config_uses_the_configured_connection_deadline() -> anyhow::Result<()> {
     let source = RemoteImportSource {
         endpoint: super::super::security::ResolvedRemoteEndpoint {
             host: "mongodb.example.com".to_string(),
             port: 27017,
-            addresses: vec!["203.0.113.5:27017".parse().unwrap()],
+            addresses: vec!["203.0.113.5:27017".parse()?],
             tls: true,
         },
         database: Some("app".to_string()),
@@ -395,29 +409,26 @@ fn mongodb_config_uses_the_configured_connection_deadline() {
         database_index: 0,
         api_key: None,
     };
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-        .unwrap();
+        .build()?;
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
         include: vec!["orders".to_string(), "customers".to_string()],
         ..ImportExportSelection::default()
     };
-    let planned_output_names = output_names(Protocol::Mongodb, &selection).unwrap();
+    let planned_output_names = output_names(Protocol::Mongodb, &selection)?;
 
-    let script = runtime
-        .block_on(prepare_mongodb(
-            &source,
-            &selection,
-            directory.path(),
-            &planned_output_names,
-            37,
-        ))
-        .unwrap();
+    let script = runtime.block_on(prepare_mongodb(
+        &source,
+        &selection,
+        directory.path(),
+        &planned_output_names,
+        37,
+    ))?;
 
-    let client_config = std::fs::read_to_string(directory.path().join("mongodump.yml")).unwrap();
+    let client_config = std::fs::read_to_string(directory.path().join("mongodump.yml"))?;
     assert!(client_config.contains("directConnection=true"));
     assert!(client_config.contains("connectTimeoutMS=37000"));
     assert!(client_config.contains("serverSelectionTimeoutMS=37000"));
@@ -437,17 +448,15 @@ fn mongodb_config_uses_the_configured_connection_deadline() {
             .collect(),
         ..ImportExportSelection::default()
     };
-    let maximum_output_names = output_names(Protocol::Mongodb, &maximum_selection).unwrap();
-    let maximum_directory = tempfile::tempdir().unwrap();
-    let maximum_script = runtime
-        .block_on(prepare_mongodb(
-            &source,
-            &maximum_selection,
-            maximum_directory.path(),
-            &maximum_output_names,
-            37,
-        ))
-        .unwrap();
+    let maximum_output_names = output_names(Protocol::Mongodb, &maximum_selection)?;
+    let maximum_directory = tempfile::tempdir()?;
+    let maximum_script = runtime.block_on(prepare_mongodb(
+        &source,
+        &maximum_selection,
+        maximum_directory.path(),
+        &maximum_output_names,
+        37,
+    ))?;
     assert_eq!(
         maximum_script
             .matches("dump_collection --collection=")
@@ -455,15 +464,17 @@ fn mongodb_config_uses_the_configured_connection_deadline() {
         512
     );
     assert!(maximum_script.len() < 256 * 1024);
+
+    Ok(())
 }
 
 #[test]
-fn clickhouse_script_uses_a_portable_engine_allowlist() {
+fn clickhouse_script_uses_a_portable_engine_allowlist() -> anyhow::Result<()> {
     let source = RemoteImportSource {
         endpoint: super::super::security::ResolvedRemoteEndpoint {
             host: "clickhouse.example.com".to_string(),
             port: 9440,
-            addresses: vec!["203.0.113.5:9440".parse().unwrap()],
+            addresses: vec!["203.0.113.5:9440".parse()?],
             tls: true,
         },
         database: Some("app".to_string()),
@@ -473,36 +484,34 @@ fn clickhouse_script_uses_a_portable_engine_allowlist() {
         database_index: 0,
         api_key: None,
     };
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-        .unwrap();
+        .build()?;
 
-    let script = runtime
-        .block_on(prepare_clickhouse(
-            &source,
-            &ImportExportSelection::default(),
-            directory.path(),
-            37,
-        ))
-        .unwrap();
+    let script = runtime.block_on(prepare_clickhouse(
+        &source,
+        &ImportExportSelection::default(),
+        directory.path(),
+        37,
+    ))?;
 
     assert!(script.contains("MergeTree|ReplacingMergeTree|SummingMergeTree"));
     assert!(script.contains("|Log|TinyLog|StripeLog|Memory)"));
     assert!(script.contains("unsupported or non-portable table engine"));
     assert!(!script.contains("ENGINE[[:space:]]*=[[:space:]]*(URL|"));
-    let client_config =
-        std::fs::read_to_string(directory.path().join("clickhouse-client.xml")).unwrap();
+    let client_config = std::fs::read_to_string(directory.path().join("clickhouse-client.xml"))?;
     assert!(client_config.contains("<loadDefaultCAFile>true</loadDefaultCAFile>"));
     assert!(client_config.contains("<verificationMode>strict</verificationMode>"));
     assert!(client_config.contains("<name>RejectCertificateHandler</name>"));
     assert!(client_config.contains("<connect_timeout>37</connect_timeout>"));
     crate::subsystems::import_export::tests::assert_failed_clickhouse_listing(&script);
+
+    Ok(())
 }
 
 #[test]
-fn clickhouse_engine_parser_accepts_exactly_one_line_anchored_clause() {
+fn clickhouse_engine_parser_accepts_exactly_one_line_anchored_clause() -> anyhow::Result<()> {
     let parse = |show_create: &str| {
         std::process::Command::new("awk")
             .arg(CLICKHOUSE_ENGINE_AWK_PROGRAM)
@@ -517,26 +526,23 @@ fn clickhouse_engine_parser_accepts_exactly_one_line_anchored_clause() {
                 child
                     .stdin
                     .take()
-                    .unwrap()
+                    .expect("expected a value from take")
                     .write_all(show_create.as_bytes())?;
                 child.wait_with_output()
             })
-            .unwrap()
+            .expect("wait with output should succeed")
     };
 
     let allowed =
         parse("CREATE TABLE `events`\n(\n  `id` UInt64\n)\nENGINE = MergeTree\nORDER BY id\n");
     assert!(allowed.status.success());
-    assert_eq!(
-        String::from_utf8(allowed.stdout).unwrap().trim(),
-        "MergeTree"
-    );
+    assert_eq!(String::from_utf8(allowed.stdout)?.trim(), "MergeTree");
 
     let deceptive = parse(
         "CREATE TABLE `events`\n(\n  `payload` String DEFAULT 'ENGINE = MergeTree'\n)\nCOMMENT 'ENGINE = MergeTree'\nENGINE = URL('https://example.invalid')\n",
     );
     assert!(deceptive.status.success());
-    assert_eq!(String::from_utf8(deceptive.stdout).unwrap().trim(), "URL");
+    assert_eq!(String::from_utf8(deceptive.stdout)?.trim(), "URL");
 
     assert!(
         !parse("CREATE TABLE `events` (`id` UInt64)\n")
@@ -548,10 +554,12 @@ fn clickhouse_engine_parser_accepts_exactly_one_line_anchored_clause() {
             .status
             .success()
     );
+
+    Ok(())
 }
 
 #[test]
-fn clickhouse_show_create_rebases_quoted_and_unquoted_database_names() {
+fn clickhouse_show_create_rebases_quoted_and_unquoted_database_names() -> anyhow::Result<()> {
     for fixture in [
         "CREATE TABLE app.orders\n(\n    `id` UInt64\n)\nENGINE = MergeTree ORDER BY id",
         "CREATE TABLE `app`.`orders`\n(\n    `id` UInt64\n)\nENGINE = MergeTree ORDER BY id",
@@ -564,16 +572,17 @@ fn clickhouse_show_create_rebases_quoted_and_unquoted_database_names() {
             .arg("-c")
             .arg(command)
             .env("CREATE_FIXTURE", fixture)
-            .output()
-            .unwrap();
+            .output()?;
         assert!(
             output.status.success(),
             "rebase failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let output = String::from_utf8(output.stdout).unwrap();
+        let output = String::from_utf8(output.stdout)?;
         assert!(output.starts_with("CREATE TABLE `orders`\n("));
         assert!(!output.contains("CREATE TABLE app.orders"));
         assert!(!output.contains("CREATE TABLE `app`.`orders`"));
     }
+
+    Ok(())
 }

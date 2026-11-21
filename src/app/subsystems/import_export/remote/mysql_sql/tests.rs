@@ -57,7 +57,7 @@ fn rewrite_bytes_with_limit(
 }
 
 #[test]
-fn rewrites_supported_sql_contexts_without_touching_literals() {
+fn rewrites_supported_sql_contexts_without_touching_literals() -> anyhow::Result<()> {
     let cases: &[RewriteCase<'_>] = &[
         (
             "qualifiers and ordinary comments",
@@ -218,15 +218,17 @@ SELECT `target`.`table_name`.`column_name`, `target`.function_name();
 
     for (name, input, source, target, expected) in cases {
         assert_eq!(
-            rewrite_bytes(input, source, target).unwrap(),
+            rewrite_bytes(input, source, target)?,
             *expected,
             "rewrite case failed: {name}"
         );
     }
+
+    Ok(())
 }
 
 #[test]
-fn rebases_clickhouse_style_function_and_table_references() {
+fn rebases_clickhouse_style_function_and_table_references() -> anyhow::Result<()> {
     let input = br#"CREATE TABLE `items` (`id` UInt64 DEFAULT source_db.normalize(`raw`))
 ENGINE = MergeTree ORDER BY id;
 INSERT INTO `items` SELECT * FROM source_db.source_items;
@@ -238,12 +240,11 @@ INSERT INTO `items` SELECT * FROM `target_db`.source_items;
 SELECT 'source_db.literal';
 "#;
 
-    assert_eq!(
-        rewrite_bytes(input, "source_db", "target_db").unwrap(),
-        expected
-    );
+    assert_eq!(rewrite_bytes(input, "source_db", "target_db")?, expected);
     assert!(validate_database_name_with_limit(&"a".repeat(128), "source database", 128).is_ok());
     assert!(validate_database_name_with_limit(&"a".repeat(129), "source database", 128).is_err());
+
+    Ok(())
 }
 
 #[test]
@@ -279,30 +280,34 @@ JOIN JSON_TABLE(`other`.`payload`, `source`.`path` COLUMNS (value JSON PATH '$')
 }
 
 #[test]
-fn equal_database_names_leave_every_byte_unchanged() {
+fn equal_database_names_leave_every_byte_unchanged() -> anyhow::Result<()> {
     let input = b"SELECT * FROM `same`.`table` WHERE value='`same`.`literal`';\n";
 
-    assert_eq!(rewrite_bytes(input, "same", "same").unwrap(), input);
+    assert_eq!(rewrite_bytes(input, "same", "same")?, input);
+
+    Ok(())
 }
 
 #[test]
-fn rewrites_a_qualifier_split_across_stream_buffers() {
+fn rewrites_a_qualifier_split_across_stream_buffers() -> anyhow::Result<()> {
     let mut input = vec![b' '; STREAM_BUFFER_BYTES - 8];
     input.extend_from_slice(b"FROM `source`.`table`;\n");
     let mut expected = vec![b' '; STREAM_BUFFER_BYTES - 8];
     expected.extend_from_slice(b"FROM `target`.`table`;\n");
 
-    assert_eq!(rewrite_bytes(&input, "source", "target").unwrap(), expected);
+    assert_eq!(rewrite_bytes(&input, "source", "target")?, expected);
+
+    Ok(())
 }
 
 #[test]
-fn rejects_input_and_output_size_overruns() {
+fn rejects_input_and_output_size_overruns() -> anyhow::Result<()> {
     assert!(matches!(
         rewrite_bytes_with_limit(b"12345", "a", "b", 4),
         Err(MysqlSqlRewriteError::InputLimit { limit: 4 })
     ));
     let expanding = b"FROM `a`.`b`";
-    let limit = u64::try_from(expanding.len()).unwrap();
+    let limit = u64::try_from(expanding.len())?;
     assert!(matches!(
         rewrite_bytes_with_limit(expanding, "a", "longer", limit),
         Err(MysqlSqlRewriteError::OutputLimit { limit: actual }) if actual == limit
@@ -317,6 +322,8 @@ fn rejects_input_and_output_size_overruns() {
         expired.next_byte(),
         Err(MysqlSqlRewriteError::Timeout)
     ));
+
+    Ok(())
 }
 
 #[test]
@@ -364,13 +371,13 @@ fn rejects_invalid_database_names() {
 }
 
 #[tokio::test]
-async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() {
+async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() -> anyhow::Result<()> {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir()?;
     let dump = directory.path().join("source.mysql.sql");
-    std::fs::write(&dump, b"SELECT * FROM `source`.`table`;\n").unwrap();
-    std::fs::set_permissions(&dump, std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::fs::write(&dump, b"SELECT * FROM `source`.`table`;\n")?;
+    std::fs::set_permissions(&dump, std::fs::Permissions::from_mode(0o640))?;
 
     rewrite_mysql_schema_qualifiers(
         &dump,
@@ -379,26 +386,18 @@ async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() {
         1024 * 1024,
         Duration::from_secs(30),
     )
-    .await
-    .unwrap();
+    .await?;
 
+    assert_eq!(std::fs::read(&dump)?, b"SELECT * FROM `target`.`table`;\n");
     assert_eq!(
-        std::fs::read(&dump).unwrap(),
-        b"SELECT * FROM `target`.`table`;\n"
-    );
-    assert_eq!(
-        std::fs::symlink_metadata(&dump)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
+        std::fs::symlink_metadata(&dump)?.permissions().mode() & 0o7777,
         0o600
     );
 
     let victim = directory.path().join("victim.sql");
     let linked = directory.path().join("linked.mysql.sql");
-    std::fs::write(&victim, b"SELECT * FROM `source`.`victim`;\n").unwrap();
-    symlink(&victim, &linked).unwrap();
+    std::fs::write(&victim, b"SELECT * FROM `source`.`victim`;\n")?;
+    symlink(&victim, &linked)?;
 
     assert!(
         rewrite_mysql_schema_qualifiers(
@@ -412,13 +411,13 @@ async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() {
         .is_err()
     );
     assert_eq!(
-        std::fs::read(&victim).unwrap(),
+        std::fs::read(&victim)?,
         b"SELECT * FROM `source`.`victim`;\n"
     );
 
     let malformed = directory.path().join("malformed.mysql.sql");
     let malformed_contents = b"SELECT * FROM `source`.`table` WHERE value='unterminated";
-    std::fs::write(&malformed, malformed_contents).unwrap();
+    std::fs::write(&malformed, malformed_contents)?;
     assert!(
         rewrite_mysql_schema_qualifiers(
             &malformed,
@@ -430,11 +429,11 @@ async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() {
         .await
         .is_err()
     );
-    assert_eq!(std::fs::read(&malformed).unwrap(), malformed_contents);
+    assert_eq!(std::fs::read(&malformed)?, malformed_contents);
 
     let ambiguous = directory.path().join("ambiguous.mysql.sql");
     let ambiguous_contents = b"SELECT `source`.`id` FROM `other`.`orders` AS `source`;\n";
-    std::fs::write(&ambiguous, ambiguous_contents).unwrap();
+    std::fs::write(&ambiguous, ambiguous_contents)?;
     assert!(
         rewrite_mysql_schema_qualifiers(
             &ambiguous,
@@ -446,13 +445,19 @@ async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() {
         .await
         .is_err()
     );
-    assert_eq!(std::fs::read(&ambiguous).unwrap(), ambiguous_contents);
+    assert_eq!(std::fs::read(&ambiguous)?, ambiguous_contents);
 
-    assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
-        !entry
-            .unwrap()
+    assert!(
+        std::fs::read_dir(directory.path())
+            .expect("path should succeed")
+            .all(|entry| {
+                !entry
+            .expect("atomically replaces regular files and rejects symlink inputs should succeed")
             .file_name()
             .to_string_lossy()
             .starts_with(".mysql-schema-rewrite-")
-    }));
+            })
+    );
+
+    Ok(())
 }

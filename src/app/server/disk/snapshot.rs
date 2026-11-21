@@ -206,15 +206,16 @@ mod tests {
     }
 
     #[test]
-    fn btrfs_snapshots_are_hidden_siblings_of_the_volume() {
+    fn btrfs_snapshots_are_hidden_siblings_of_the_volume() -> anyhow::Result<()> {
         assert_eq!(
             btrfs_snapshot_path(
                 Path::new("/var/lib/dbev/volumes/inst_one"),
                 "dbev_bk_ab_snapshot"
-            )
-            .unwrap(),
+            )?,
             Path::new("/var/lib/dbev/volumes/.dbev_bk_ab_snapshot")
         );
+
+        Ok(())
     }
 
     #[test]

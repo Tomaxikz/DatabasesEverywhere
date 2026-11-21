@@ -104,10 +104,12 @@ fn mount_info(mount: &ProcMountInfo) -> MountInfo {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn finds_most_specific_mount_with_filesystem_type() {
+    fn finds_most_specific_mount_with_filesystem_type() -> anyhow::Result<()> {
         let mountinfo = "\
 1 0 0:1 / / rw - btrfs /dev/sda rw
 2 1 0:2 / /var/lib/databases-everywhere rw - xfs /dev/sdb rw
@@ -117,7 +119,7 @@ mod tests {
             Path::new("/var/lib/databases-everywhere/instances/inst_1"),
             &parse_mountinfo(mountinfo),
         )
-        .unwrap();
+        .context("expected a value from find_mount_in")?;
 
         assert_eq!(
             mount.mountpoint,
@@ -125,10 +127,12 @@ mod tests {
         );
         assert_eq!(mount.fstype, "xfs");
         assert_eq!(mount.source, "/dev/sdb");
+
+        Ok(())
     }
 
     #[test]
-    fn includes_mount_options() {
+    fn includes_mount_options() -> anyhow::Result<()> {
         let mountinfo = "\
 1 0 0:1 / / rw,relatime - ext4 /dev/vda3 rw,relatime,prjquota,errors=remount-ro
 ";
@@ -137,12 +141,14 @@ mod tests {
             Path::new("/var/lib/databases-everywhere"),
             &parse_mountinfo(mountinfo),
         )
-        .unwrap();
+        .context("expected a value from find_mount_in")?;
 
         assert_eq!(
             mount.options,
             vec!["errors=remount-ro", "prjquota", "relatime", "rw"]
         );
+
+        Ok(())
     }
 
     #[test]

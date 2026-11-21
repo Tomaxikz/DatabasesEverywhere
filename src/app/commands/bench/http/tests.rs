@@ -39,13 +39,16 @@ fn derives_rfc_websocket_accept_value() {
 }
 
 #[tokio::test]
-async fn measures_a_real_http_upgrade_without_waiting_for_socket_close() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+async fn measures_a_real_http_upgrade_without_waiting_for_socket_close() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) = listener.accept().await.expect("accept should succeed");
         let mut request = vec![0_u8; 8 * 1024];
-        let read = stream.read(&mut request).await.unwrap();
+        let read = stream
+            .read(&mut request)
+            .await
+            .expect("read should succeed");
         let request = String::from_utf8_lossy(&request[..read]).into_owned();
         let lowercase_request = request.to_ascii_lowercase();
         assert!(lowercase_request.contains("upgrade: websocket"));
@@ -57,7 +60,7 @@ async fn measures_a_real_http_upgrade_without_waiting_for_socket_close() {
                 name.eq_ignore_ascii_case("sec-websocket-key")
                     .then_some(value.trim())
             })
-            .unwrap();
+            .expect("expected a value from find_map");
         let accept = websocket_accept(key);
         let response = format!(
             "HTTP/1.1 101 Switching Protocols\r\n\
@@ -66,37 +69,39 @@ async fn measures_a_real_http_upgrade_without_waiting_for_socket_close() {
              Sec-WebSocket-Accept: {accept}\r\n\
              Sec-WebSocket-Protocol: dbe.jwt\r\n\r\n"
         );
-        stream.write_all(response.as_bytes()).await.unwrap();
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("as bytes should succeed");
         tokio::time::sleep(Duration::from_secs(2)).await;
     });
-    let client =
-        BenchClient::new(&format!("http://{address}"), None, "node-token", 1, false).unwrap();
+    let client = BenchClient::new(&format!("http://{address}"), None, "node-token", 1, false)?;
 
     let sample = tokio::time::timeout(
         Duration::from_secs(1),
         client.websocket_handshake("websocket-jwt", 0),
     )
-    .await
-    .unwrap();
+    .await?;
 
     assert!(sample.success, "{:?}", sample.error);
     server.abort();
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn runs_a_duration_based_mixed_load() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+async fn runs_a_duration_based_mixed_load() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
             Router::new().fallback(|| async { axum::Json(json!({"status": "running"})) }),
         )
         .await
-        .unwrap();
+        .expect("Json should succeed");
     });
-    let client =
-        BenchClient::new(&format!("http://{address}"), None, "node-token", 4, false).unwrap();
+    let client = BenchClient::new(&format!("http://{address}"), None, "node-token", 4, false)?;
 
     let run = client
         .benchmark_concurrency(
@@ -121,10 +126,14 @@ async fn runs_a_duration_based_mixed_load() {
         run.report.successful_requests
     );
     server.abort();
+
+    Ok(())
 }
 
 #[test]
-fn concurrent_aggregate_bounds_raw_samples_without_losing_totals() {
+fn concurrent_aggregate_bounds_raw_samples_without_losing_totals() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let attempted = MAX_RETAINED_REQUEST_SAMPLES + 17;
     let mut accumulator = PhaseAccumulator::new(7);
     for index in 0..attempted {
@@ -149,23 +158,24 @@ fn concurrent_aggregate_bounds_raw_samples_without_losing_totals() {
     assert_eq!(run.report.successful_requests, attempted);
     assert_eq!(run.samples.len(), MAX_RETAINED_REQUEST_SAMPLES);
     assert_eq!(run.report.dropped_request_samples, 17);
-    assert_eq!(run.report.all_latency_ms.unwrap().samples, attempted);
+    assert_eq!(run.report.all_latency_ms.context("concurrent aggregate bounds raw samples without losing totals should provide a value")?.samples, attempted);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn fixed_window_pacing_bounds_a_timed_burst() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+async fn fixed_window_pacing_bounds_a_timed_burst() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
             Router::new().fallback(|| async { axum::Json(json!({"status": "running"})) }),
         )
         .await
-        .unwrap();
+        .expect("Json should succeed");
     });
-    let client =
-        BenchClient::new(&format!("http://{address}"), None, "node-token", 4, false).unwrap();
+    let client = BenchClient::new(&format!("http://{address}"), None, "node-token", 4, false)?;
 
     let run = client
         .benchmark_concurrency(
@@ -187,4 +197,6 @@ async fn fixed_window_pacing_bounds_a_timed_burst() {
             > run.report.successful_requests_per_second
     );
     server.abort();
+
+    Ok(())
 }

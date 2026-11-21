@@ -285,18 +285,18 @@ mod tests {
     }
 
     #[test]
-    fn user_sockets_are_found_by_uid() {
-        let root = tempfile::tempdir().unwrap();
+    fn user_sockets_are_found_by_uid() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
         let mut listeners = Vec::new();
         for uid in ["1000", "1001", "1002", "0", "abc"] {
             let directory = root.path().join(uid).join("podman");
-            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::create_dir_all(&directory)?;
             let socket = directory.join("podman.sock");
             match uid {
                 "1001" => {}
                 // A regular file is not a socket.
-                "1002" => std::fs::write(socket, "").unwrap(),
-                _ => listeners.push(std::os::unix::net::UnixListener::bind(socket).unwrap()),
+                "1002" => std::fs::write(socket, "")?,
+                _ => listeners.push(std::os::unix::net::UnixListener::bind(socket)?),
             }
         }
         assert_eq!(user_podman_sockets(root.path()), [1000]);
@@ -304,13 +304,15 @@ mod tests {
             user_podman_sockets(&root.path().join("missing")),
             Vec::<u32>::new()
         );
+
+        Ok(())
     }
 
     #[test]
-    fn script_heads_are_read_only_for_small_scripts() {
-        let directory = tempfile::tempdir().unwrap();
+    fn script_heads_are_read_only_for_small_scripts() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
         let small = directory.path().join("small");
-        std::fs::write(&small, "#!/bin/sh\nexec podman \"$@\"\n").unwrap();
+        std::fs::write(&small, "#!/bin/sh\nexec podman \"$@\"\n")?;
         assert!(docker_binary(&small).is_podman_shim());
         let fifo = directory.path().join("fifo");
         rustix::fs::mknodat(
@@ -319,18 +321,19 @@ mod tests {
             rustix::fs::FileType::Fifo,
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
             0,
-        )
-        .unwrap();
+        )?;
         // Would block forever on a plain open; must return at once instead.
         assert_eq!(docker_binary(&fifo).script_head, None);
         let big = directory.path().join("big");
-        std::fs::write(&big, format!("#!/bin/sh\n{}", "#".repeat(5000))).unwrap();
+        std::fs::write(&big, format!("#!/bin/sh\n{}", "#".repeat(5000)))?;
         assert_eq!(docker_binary(&big).script_head, None);
         let link = directory.path().join("docker");
         let podman = directory.path().join("podman");
-        std::fs::write(&podman, "").unwrap();
-        std::os::unix::fs::symlink(&podman, &link).unwrap();
+        std::fs::write(&podman, "")?;
+        std::os::unix::fs::symlink(&podman, &link)?;
         assert!(docker_binary(&link).is_podman_shim());
+
+        Ok(())
     }
 
     #[test]

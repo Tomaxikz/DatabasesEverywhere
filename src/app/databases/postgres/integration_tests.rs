@@ -17,7 +17,9 @@ const TENANT_PASSWORD: &str = "integration-tenant-password";
 
 #[test]
 #[ignore = "requires a local Docker daemon and postgres:18.4 image"]
-fn postgres_18_provisions_a_restricted_tenant_on_an_admin_owned_database() {
+fn postgres_18_provisions_a_restricted_tenant_on_an_admin_owned_database() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let name = format!("dbev-postgres-test-{}", uuid::Uuid::new_v4().simple());
     let container = start_container(&name);
     wait_until_ready(&name);
@@ -39,14 +41,18 @@ fn postgres_18_provisions_a_restricted_tenant_on_an_admin_owned_database() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start tenant provisioning psql");
-    child
+        .context("start tenant provisioning psql")?;
+    let write_result = child
         .stdin
         .take()
-        .unwrap()
-        .write_all(provision_tenant_role_sql(DATABASE, TENANT).as_bytes())
-        .expect("write provisioning SQL");
-    let output = child.wait_with_output().expect("wait for provisioning");
+        .context("missing provisioning stdin")
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(provision_tenant_role_sql(DATABASE, TENANT).as_bytes())
+                .context("write provisioning SQL")
+        });
+    let output = child.wait_with_output().context("wait for provisioning")?;
+    write_result?;
     assert!(
         output.status.success(),
         "tenant provisioning failed: {}",
@@ -158,6 +164,8 @@ fn postgres_18_provisions_a_restricted_tenant_on_an_admin_owned_database() {
     );
 
     drop(container);
+
+    Ok(())
 }
 
 fn start_container(name: &str) -> DockerContainer {

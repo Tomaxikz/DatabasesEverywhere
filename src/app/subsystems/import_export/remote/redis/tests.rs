@@ -2,12 +2,14 @@ use super::*;
 use secrecy::ExposeSecret;
 
 #[test]
-fn temporary_acl_contains_only_a_hash() {
+fn temporary_acl_contains_only_a_hash() -> anyhow::Result<()> {
     let password = SecretString::from("very-secret-password");
     let acl = append_temporary_acl(b"user default off\n", "dbe_import_test", &password);
-    let acl = String::from_utf8(acl).unwrap();
+    let acl = String::from_utf8(acl)?;
     assert!(acl.contains("user dbe_import_test on #"));
     assert!(!acl.contains(password.expose_secret()));
+
+    Ok(())
 }
 
 #[test]
@@ -27,7 +29,8 @@ fn hostile_redis_errors_are_not_exposed() {
 fn unsupported_remote_version_is_not_exposed() {
     let hostile = b"redis_version:1.0.0-attacker-controlled\r\n";
 
-    let error = check_redis_version(hostile).unwrap_err();
+    let error =
+        check_redis_version(hostile).expect_err("check redis version should return an error");
 
     assert!(!error.to_string().contains("attacker-controlled"));
 }
@@ -62,7 +65,7 @@ fn redis_version_preflight_requires_a_compatible_absttl_target() {
             b"redis_version:8.0.1\r\n",
             b"redis_version:8.0.0\r\n"
         )
-        .unwrap_err()
+        .expect_err("check redis versions should return an error")
         .to_string()
         .contains("same or a newer version")
     );
@@ -72,7 +75,7 @@ fn redis_version_preflight_requires_a_compatible_absttl_target() {
             b"redis_version:4.0.14\r\n",
             b"redis_version:4.0.14\r\n"
         )
-        .unwrap_err()
+        .expect_err("check redis versions should return an error")
         .to_string()
         .contains("ABSTTL")
     );
@@ -91,13 +94,13 @@ fn valkey_version_preflight_uses_the_native_version_and_guards_redis_compatibili
     assert!(check_redis_versions(Protocol::Valkey, b"redis_version:7.2.4\r\n", valkey_9,).is_ok());
     assert!(
         check_redis_versions(Protocol::Valkey, b"redis_version:8.0.0\r\n", valkey_9,)
-            .unwrap_err()
+            .expect_err("check redis versions should return an error")
             .to_string()
             .contains("through version 7.2")
     );
     assert!(
         check_redis_versions(Protocol::Redis, valkey_9, b"redis_version:8.0.0\r\n",)
-            .unwrap_err()
+            .expect_err("check redis versions should return an error")
             .to_string()
             .contains("Valkey-to-Redis")
     );
@@ -125,23 +128,25 @@ fn redis_cluster_preflight_parses_only_unambiguous_info() {
 }
 
 #[test]
-fn redis_expiration_uses_an_absolute_deadline_and_handles_missing_keys() {
+fn redis_expiration_uses_an_absolute_deadline_and_handles_missing_keys() -> anyhow::Result<()> {
     let now = UNIX_EPOCH + Duration::from_millis(10_000);
 
-    assert_eq!(redis_restore_expiration(-2, now).unwrap(), None);
+    assert_eq!(redis_restore_expiration(-2, now)?, None);
     assert_eq!(
-        redis_restore_expiration(-1, now).unwrap(),
+        redis_restore_expiration(-1, now)?,
         Some(RedisRestoreExpiration::Persistent)
     );
     assert_eq!(
-        redis_restore_expiration(250, now).unwrap(),
+        redis_restore_expiration(250, now)?,
         Some(RedisRestoreExpiration::AbsoluteUnixMilliseconds(10_250))
     );
     assert_eq!(
-        redis_restore_expiration(0, now).unwrap(),
+        redis_restore_expiration(0, now)?,
         Some(RedisRestoreExpiration::AbsoluteUnixMilliseconds(10_001))
     );
     assert!(redis_restore_expiration(-3, now).is_err());
+
+    Ok(())
 }
 
 #[test]
@@ -161,19 +166,21 @@ fn redis_deadlines_reserve_the_final_quarter_for_rollback() {
 }
 
 #[test]
-fn redis_remaining_timeout_is_capped_and_rejects_expired_deadlines() {
+fn redis_remaining_timeout_is_capped_and_rejects_expired_deadlines() -> anyhow::Result<()> {
     let now = Instant::now();
     let deadline = now + Duration::from_secs(10);
 
     assert_eq!(
-        remaining_redis_timeout_at(now, deadline, Duration::from_secs(3), "test phase").unwrap(),
+        remaining_redis_timeout_at(now, deadline, Duration::from_secs(3), "test phase")?,
         Duration::from_secs(3)
     );
     assert_eq!(
-        remaining_redis_timeout_at(now, deadline, Duration::from_secs(30), "test phase").unwrap(),
+        remaining_redis_timeout_at(now, deadline, Duration::from_secs(30), "test phase")?,
         Duration::from_secs(10)
     );
     assert!(remaining_redis_timeout_at(now, now, Duration::MAX, "test phase").is_err());
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -184,7 +191,7 @@ async fn redis_absolute_deadline_cancels_an_unfinished_phase() {
         std::future::pending::<Result<(), ApiError>>(),
     )
     .await
-    .unwrap_err();
+    .expect_err("now should return an error");
 
     assert!(
         error
@@ -194,30 +201,27 @@ async fn redis_absolute_deadline_cancels_an_unfinished_phase() {
 }
 
 #[tokio::test]
-async fn acl_metadata_helper_preserves_mode_and_existing_owner() {
+async fn acl_metadata_helper_preserves_mode_and_existing_owner() -> anyhow::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir()?;
     let existing = directory.path().join("users.acl");
     let temporary = directory.path().join(".users.acl.test");
-    tokio::fs::write(&existing, b"user default off\n")
-        .await
-        .unwrap();
-    tokio::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640))
-        .await
-        .unwrap();
-    let expected = read_acl_metadata(&existing).await.unwrap();
+    tokio::fs::write(&existing, b"user default off\n").await?;
+    tokio::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).await?;
+    let expected = read_acl_metadata(&existing).await?;
     let file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
-        .await
-        .unwrap();
+        .await?;
 
-    apply_acl_metadata(&file, expected, true).await.unwrap();
+    apply_acl_metadata(&file, expected, true).await?;
 
-    let actual = file.metadata().await.unwrap();
+    let actual = file.metadata().await?;
     assert_eq!(actual.uid(), expected.uid);
     assert_eq!(actual.gid(), expected.gid);
     assert_eq!(actual.mode() & 0o7777, expected.mode);
+
+    Ok(())
 }

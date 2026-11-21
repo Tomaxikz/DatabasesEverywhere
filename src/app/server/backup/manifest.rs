@@ -377,17 +377,16 @@ mod tests {
     }
 
     #[test]
-    fn built_in_and_strategy_contracts_validate() {
-        offline_details().validate(BackupLayout::Physical).unwrap();
+    fn built_in_and_strategy_contracts_validate() -> anyhow::Result<()> {
+        offline_details().validate(BackupLayout::Physical)?;
         ManifestDetails::built_in(
             BackupLayout::Logical,
             ConsistencyLevel::PerObject,
             offline_details().capture,
             EngineRecord::default(),
         )
-        .validate(BackupLayout::Logical)
-        .unwrap();
-        online_details().validate(BackupLayout::Physical).unwrap();
+        .validate(BackupLayout::Logical)?;
+        online_details().validate(BackupLayout::Physical)?;
         assert!(matches!(
             online_details().restore_format(),
             RestoreFormat::StrategyCapture {
@@ -396,6 +395,8 @@ mod tests {
                 ..
             }
         ));
+
+        Ok(())
     }
 
     #[test]
@@ -416,12 +417,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_and_formats_do_not_parse() {
-        let mut value = serde_json::to_value(online_details()).unwrap();
+    fn unknown_fields_and_formats_do_not_parse() -> anyhow::Result<()> {
+        let mut value = serde_json::to_value(online_details())?;
         value["format"] = serde_json::json!("filesystem_snapshot");
         assert!(serde_json::from_value::<ManifestDetails>(value).is_err());
-        let mut value = serde_json::to_value(online_details()).unwrap();
+        let mut value = serde_json::to_value(online_details())?;
         value["future_field"] = serde_json::json!(true);
         assert!(serde_json::from_value::<ManifestDetails>(value).is_err());
+
+        Ok(())
     }
 }

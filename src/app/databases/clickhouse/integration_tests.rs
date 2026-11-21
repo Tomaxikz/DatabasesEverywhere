@@ -16,21 +16,20 @@ const SHARED_PASSWORD: &str = "shared-integration-password";
 
 #[tokio::test]
 #[ignore = "requires DBE_CLICKHOUSE_BINARY; validates the real config merge without starting a database"]
-async fn hosted_console_config_removes_inherited_file_logging() {
+async fn hosted_console_config_removes_inherited_file_logging() -> anyhow::Result<()> {
     let binary = std::env::var_os("DBE_CLICKHOUSE_BINARY").expect("set DBE_CLICKHOUSE_BINARY");
     for shared in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let config = directory.path().join("config.xml");
-        std::fs::write(&config, r#"<clickhouse><logger><level>trace</level><log>/unwanted/server.log</log><errorlog>/unwanted/error.log</errorlog><console>0</console><size>1000M</size><count>10</count></logger><query_log><database>system</database><table>query_log</table></query_log></clickhouse>"#).unwrap();
+        std::fs::write(
+            &config,
+            r#"<clickhouse><logger><level>trace</level><log>/unwanted/server.log</log><errorlog>/unwanted/error.log</errorlog><console>0</console><size>1000M</size><count>10</count></logger><query_log><database>system</database><table>query_log</table></query_log></clickhouse>"#,
+        )?;
         let overrides = directory.path().join("config.d");
         if shared {
-            super::docker::write_shared_hosted_config(&overrides)
-                .await
-                .unwrap();
+            super::docker::write_shared_hosted_config(&overrides).await?;
         } else {
-            super::docker::write_hosted_config(&overrides)
-                .await
-                .unwrap();
+            super::docker::write_hosted_config(&overrides).await?;
         }
         for (key, expected) in [
             ("logger.log", ""),
@@ -53,16 +52,17 @@ async fn hosted_console_config_removes_inherited_file_logging() {
                 .args(["extract-from-config", "--config-file"])
                 .arg(&config)
                 .args(["--key", key, "--try"])
-                .output()
-                .unwrap();
+                .output()?;
             assert_success(&output, "merge console-only logging configuration");
             assert_eq!(
-                String::from_utf8(output.stdout).unwrap().trim(),
+                String::from_utf8(output.stdout)?.trim(),
                 expected,
                 "shared={shared}, key={key}"
             );
         }
     }
+
+    Ok(())
 }
 
 fn shared_sql_scenario() -> String {
@@ -133,10 +133,12 @@ fn run_local_tool(arguments: &[&str], path: Option<&std::path::Path>) -> Output 
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("expected a value from take")
         .write_all(shared_sql_scenario().as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+        .expect("as bytes should succeed");
+    child
+        .wait_with_output()
+        .expect("wait with output should succeed")
 }
 
 #[test]
@@ -151,8 +153,8 @@ fn shared_sql_parses_on_clickhouse() {
 
 #[test]
 #[ignore = "requires DBE_CLICKHOUSE_BINARY with ClickHouse 26.4+ local access storage; no Docker or network listeners"]
-fn shared_sql_executes_and_reapplies_on_clickhouse_local() {
-    let directory = tempfile::tempdir().unwrap();
+fn shared_sql_executes_and_reapplies_on_clickhouse_local() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let output = run_local_tool(
         &[
             "local",
@@ -166,11 +168,13 @@ fn shared_sql_executes_and_reapplies_on_clickhouse_local() {
         &output,
         "execute shared SQL with the real ClickHouse engine",
     );
-    let rows = String::from_utf8(output.stdout).unwrap();
+    let rows = String::from_utf8(output.stdout)?;
     assert_eq!(
         rows.lines().collect::<Vec<_>>(),
         ["3", "1", "1", "3", "20000", "0", "0", "0", "0"]
     );
+
+    Ok(())
 }
 
 #[test]

@@ -306,6 +306,8 @@ impl GatewaySupervisor {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
@@ -335,12 +337,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connections_drain_naturally_after_listener_admission_closes() {
+    async fn connections_drain_naturally_after_listener_admission_closes() -> anyhow::Result<()> {
         let supervisor = GatewaySupervisor::new();
         assert!(supervisor.begin(1));
         supervisor.mark_ready();
         let tracker = supervisor.connection_tracker();
-        let connection = tracker.try_track().unwrap();
+        let connection = tracker
+            .try_track()
+            .context("expected a value from try_track")?;
         supervisor.shutdown();
         assert!(tracker.try_track().is_none());
 
@@ -359,6 +363,8 @@ mod tests {
                 remaining: 0,
             }
         );
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -367,7 +373,9 @@ mod tests {
         assert!(supervisor.begin(1));
         supervisor.mark_ready();
         let tracker = supervisor.connection_tracker();
-        let connection = tracker.try_track().unwrap();
+        let connection = tracker
+            .try_track()
+            .expect("expected a value from try_track");
         let mut forced = tracker.subscribe_force_shutdown();
         supervisor.shutdown();
 

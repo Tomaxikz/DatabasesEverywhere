@@ -657,10 +657,12 @@ fn read_u32_le(payload: &[u8], offset: usize) -> Result<u32, MariadbProxyError> 
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn parses_native_password_handshake_response() {
+    fn parses_native_password_handshake_response() -> anyhow::Result<()> {
         let gateway_seed = new_gateway_auth_seed();
         let mut payload = Vec::new();
         let capabilities = CLIENT_PROTOCOL_41
@@ -678,15 +680,17 @@ mod tests {
         payload.extend_from_slice(b"mysql_1\0");
         payload.extend_from_slice(b"mysql_native_password\0");
 
-        let route = parse_client_handshake_response(&payload).unwrap();
+        let route = parse_client_handshake_response(&payload)?;
 
         assert_eq!(route.username, "app_mysql_1");
         assert_eq!(route.database, "mysql_1");
         assert_eq!(route.auth_response, auth_response);
+
+        Ok(())
     }
 
     #[test]
-    fn accepts_jdbc_handshake_without_an_initial_database() {
+    fn accepts_jdbc_handshake_without_an_initial_database() -> anyhow::Result<()> {
         let gateway_seed = new_gateway_auth_seed();
         let mut payload = Vec::new();
         let capabilities = CLIENT_PROTOCOL_41 | CLIENT_PLUGIN_AUTH | CLIENT_SECURE_CONNECTION;
@@ -700,15 +704,17 @@ mod tests {
         payload.extend_from_slice(&auth_response);
         payload.extend_from_slice(b"mysql_native_password\0");
 
-        let route = parse_client_handshake_response(&payload).unwrap();
+        let route = parse_client_handshake_response(&payload)?;
 
         assert_eq!(route.username, "app_mysql_1");
         assert!(route.database.is_empty());
         assert_eq!(route.auth_response, auth_response);
+
+        Ok(())
     }
 
     #[test]
-    fn derives_backend_token_from_client_native_token() {
+    fn derives_backend_token_from_client_native_token() -> anyhow::Result<()> {
         let gateway_seed = new_gateway_auth_seed();
         let password = "mysql-password-1";
         let backend_seed = b"backend-seed-1234567";
@@ -716,10 +722,11 @@ mod tests {
         let stage_2 = native_password_sha1_stage2_hex(password);
 
         let derived =
-            derive_native_backend_token(&client_token, &gateway_seed, backend_seed, &stage_2)
-                .unwrap();
+            derive_native_backend_token(&client_token, &gateway_seed, backend_seed, &stage_2)?;
 
         assert_eq!(derived, native_password_token(password, backend_seed));
+
+        Ok(())
     }
 
     #[test]
@@ -736,37 +743,38 @@ mod tests {
             b"backend-seed-1234567",
             &stage_2,
         )
-        .unwrap_err();
+        .expect_err("derive native backend token should return an error");
 
         assert!(matches!(error, MariadbProxyError::AuthenticationFailed));
     }
 
     #[test]
-    fn gateway_handshake_exposes_flavor_version_and_auth_plugin() {
+    fn gateway_handshake_exposes_flavor_version_and_auth_plugin() -> anyhow::Result<()> {
         let gateway_seed = new_gateway_auth_seed();
         for flavor in [GatewayFlavor::Mysql, GatewayFlavor::Mariadb] {
-            let payload = gateway_handshake_payload(&gateway_seed, flavor, false).unwrap();
+            let payload = gateway_handshake_payload(&gateway_seed, flavor, false)?;
             let mut offset = 1;
-            let server_version = read_null_string(&payload, &mut offset).unwrap();
+            let server_version = read_null_string(&payload, &mut offset)?;
             offset += 4 + 8 + 1 + 2 + 1 + 2 + 2;
             let auth_len = payload[offset] as usize;
             offset += 1 + 10;
             let auth_part_2_len = auth_len.saturating_sub(8).max(13);
             offset += auth_part_2_len;
-            let plugin = read_null_string(&payload, &mut offset).unwrap();
+            let plugin = read_null_string(&payload, &mut offset)?;
 
             assert_eq!(server_version, flavor.server_version());
             assert_eq!(plugin, GATEWAY_AUTH_PLUGIN);
         }
+
+        Ok(())
     }
 
     #[test]
-    fn truncated_backend_auth_length_returns_an_error_instead_of_panicking() {
+    fn truncated_backend_auth_length_returns_an_error_instead_of_panicking() -> anyhow::Result<()> {
         let mut payload =
-            gateway_handshake_payload(b"12345678901234567890", GatewayFlavor::Mariadb, false)
-                .unwrap();
+            gateway_handshake_payload(b"12345678901234567890", GatewayFlavor::Mariadb, false)?;
         let mut offset = 1;
-        read_null_string(&payload, &mut offset).unwrap();
+        read_null_string(&payload, &mut offset)?;
         offset += 4 + 8 + 1 + 2 + 1 + 2 + 2;
         payload.truncate(offset);
         // A long server version passes the minimum-size check even when the
@@ -776,6 +784,8 @@ mod tests {
             parse_backend_handshake(&payload),
             Err(MariadbProxyError::MalformedPacket)
         ));
+
+        Ok(())
     }
 
     #[test]
@@ -790,12 +800,11 @@ mod tests {
     }
 
     #[test]
-    fn connector_j_ascii_seed_parsing_preserves_the_exact_challenge() {
+    fn connector_j_ascii_seed_parsing_preserves_the_exact_challenge() -> anyhow::Result<()> {
         let gateway_seed = new_gateway_auth_seed();
-        let payload =
-            gateway_handshake_payload(&gateway_seed, GatewayFlavor::Mysql, false).unwrap();
+        let payload = gateway_handshake_payload(&gateway_seed, GatewayFlavor::Mysql, false)?;
         let mut offset = 1;
-        assert_eq!(read_null_string(&payload, &mut offset).unwrap(), "8.0.11");
+        assert_eq!(read_null_string(&payload, &mut offset)?, "8.0.11");
         offset += 4;
         let seed_1_start = offset;
         offset += 8 + 1 + 2 + 1 + 2 + 2;
@@ -808,15 +817,17 @@ mod tests {
         let connector_seed_2 = connector_fixed_seed_2
             .split(|byte| *byte == 0)
             .next()
-            .unwrap();
+            .context("expected a value from next")?;
         let mut connector_seed = seed_1.to_vec();
         connector_seed.extend_from_slice(connector_seed_2);
 
         assert_eq!(connector_seed, gateway_seed);
+
+        Ok(())
     }
 
     #[test]
-    fn mysql_caching_sha2_greeting_still_authenticates_public_client() {
+    fn mysql_caching_sha2_greeting_still_authenticates_public_client() -> anyhow::Result<()> {
         let password = "mysql-password-1";
         let gateway_seed = new_gateway_auth_seed();
         let stage_2 = native_password_sha1_stage2_hex(password);
@@ -831,28 +842,28 @@ mod tests {
             auth_plugin: CACHING_SHA2_PASSWORD_PLUGIN.to_string(),
         };
 
-        let response =
-            backend_handshake_response(&handshake, &route, &gateway_seed, &stage_2, Some(password))
-                .unwrap();
+        let response = backend_handshake_response(
+            &handshake,
+            &route,
+            &gateway_seed,
+            &stage_2,
+            Some(password),
+        )?;
         let mut offset = 4 + 4 + 1 + 23;
-        assert_eq!(
-            read_null_string(&response, &mut offset).unwrap(),
-            route.username
-        );
+        assert_eq!(read_null_string(&response, &mut offset)?, route.username);
         let auth_length = response[offset] as usize;
         assert_eq!(
             auth_length, 32,
             "caching_sha2 must send its SHA-256 challenge response"
         );
         offset += 1 + auth_length;
+        assert_eq!(read_null_string(&response, &mut offset)?, route.database);
         assert_eq!(
-            read_null_string(&response, &mut offset).unwrap(),
-            route.database
-        );
-        assert_eq!(
-            read_null_string(&response, &mut offset).unwrap(),
+            read_null_string(&response, &mut offset)?,
             CACHING_SHA2_PASSWORD_PLUGIN
         );
+
+        Ok(())
     }
 
     #[test]
@@ -921,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn mysql_native_auth_switch_derives_backend_token() {
+    fn mysql_native_auth_switch_derives_backend_token() -> anyhow::Result<()> {
         let password = "mysql-password-1";
         let gateway_seed = new_gateway_auth_seed();
         let backend_seed = b"backend-seed-1234567";
@@ -942,57 +953,65 @@ mod tests {
             &gateway_seed,
             &native_password_sha1_stage2_hex(password),
             Some(password),
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(response, native_password_token(password, backend_seed));
+
+        Ok(())
     }
 
     #[test]
-    fn caching_sha2_full_auth_payload_is_nul_terminated() {
-        assert_eq!(
-            caching_sha2_plaintext_password("secret").unwrap(),
-            b"secret\0"
-        );
+    fn caching_sha2_full_auth_payload_is_nul_terminated() -> anyhow::Result<()> {
+        assert_eq!(caching_sha2_plaintext_password("secret")?, b"secret\0");
         assert!(matches!(
             caching_sha2_plaintext_password("bad\0secret"),
             Err(MariadbProxyError::InvalidBackendPassword)
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn parses_only_documented_caching_sha2_continuations() {
+    fn parses_only_documented_caching_sha2_continuations() -> anyhow::Result<()> {
         assert_eq!(
-            caching_sha2_continuation(&[1, 3]).unwrap(),
+            caching_sha2_continuation(&[1, 3])?,
             Some(CachingSha2Continuation::FastAuthenticationComplete)
         );
         assert_eq!(
-            caching_sha2_continuation(&[1, 4]).unwrap(),
+            caching_sha2_continuation(&[1, 4])?,
             Some(CachingSha2Continuation::FullAuthenticationRequired)
         );
         assert!(matches!(
             caching_sha2_continuation(&[1, 9]),
             Err(MariadbProxyError::MalformedPacket)
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn auth_switch_parser_excludes_the_wire_terminator_from_the_seed() {
+    fn auth_switch_parser_excludes_the_wire_terminator_from_the_seed() -> anyhow::Result<()> {
         let mut payload = vec![0xfe];
         payload.extend_from_slice(b"mysql_native_password\0");
         payload.extend_from_slice(b"12345678901234567890\0");
 
-        let switch = auth_switch_request(&payload).unwrap();
+        let switch =
+            auth_switch_request(&payload).context("expected a value from auth_switch_request")?;
 
         assert_eq!(switch.auth_plugin, NATIVE_PASSWORD_PLUGIN);
         assert_eq!(switch.auth_seed, b"12345678901234567890");
+
+        Ok(())
     }
 
     #[tokio::test]
     async fn rejects_declared_packet_over_routing_limit_before_payload_read() {
         let (mut client, mut gateway) = tokio::io::duplex(16);
         tokio::spawn(async move {
-            client.write_all(&[1, 0, 1, 0]).await.unwrap();
+            client
+                .write_all(&[1, 0, 1, 0])
+                .await
+                .expect("write all should succeed");
         });
 
         assert!(matches!(

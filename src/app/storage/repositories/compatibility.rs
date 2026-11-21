@@ -130,6 +130,8 @@ fn compatibility_from_row(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::{
         server::{metadata::InstanceMetadata, test_support},
@@ -138,12 +140,13 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn attestation_is_replaced_atomically_and_deleted_with_the_instance() {
-        let directory = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(directory.path()).await.unwrap();
+    async fn attestation_is_replaced_atomically_and_deleted_with_the_instance() -> anyhow::Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let pool = sqlite::connect(directory.path()).await?;
         let repository = InstanceRepository::new(pool);
         let metadata = sample_metadata();
-        repository.upsert(&metadata).await.unwrap();
+        repository.upsert(&metadata).await?;
 
         repository
             .record_compatibility(&CompatibilityAttestation {
@@ -156,8 +159,7 @@ mod tests {
                 compatible: true,
                 diagnostic: None,
             })
-            .await
-            .unwrap();
+            .await?;
         repository
             .record_compatibility(&CompatibilityAttestation {
                 instance_id: metadata.instance_id.clone(),
@@ -169,28 +171,27 @@ mod tests {
                 compatible: false,
                 diagnostic: Some("unsupported test version".to_string()),
             })
-            .await
-            .unwrap();
+            .await?;
 
         let attestation = repository
             .compatibility_attestation(&metadata.instance_id)
-            .await
-            .unwrap()
-            .unwrap();
+            .await?
+            .context("compatibility attestation should provide a value")?;
         assert_eq!(attestation.container_id, "abcdef123456789012");
         assert_eq!(attestation.image_id, "sha256:new-image-id");
         assert_eq!(attestation.probe_revision, 2);
         assert_eq!(attestation.version, "9.7.0");
         assert!(!attestation.compatible);
 
-        repository.delete(&metadata.instance_id).await.unwrap();
+        repository.delete(&metadata.instance_id).await?;
         assert!(
             repository
                 .compatibility_attestation(&metadata.instance_id)
-                .await
-                .unwrap()
+                .await?
                 .is_none()
         );
+
+        Ok(())
     }
 
     fn sample_metadata() -> InstanceMetadata {

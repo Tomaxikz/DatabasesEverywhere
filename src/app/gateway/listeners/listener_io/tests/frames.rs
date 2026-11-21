@@ -100,7 +100,7 @@ proptest! {
         values in prop::collection::vec(any::<u16>(), 1..6),
         chunk_sizes in prop::collection::vec(1usize..32, 1..16),
     ) {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("build should succeed");
         for protocol in [Protocol::Postgres, Protocol::Mysql, Protocol::Mariadb, Protocol::Mongodb] {
             let frames: Vec<u8> = values.iter().flat_map(|&v| read_query_frame(protocol, v)).collect();
             let mut remaining = frames.as_slice();
@@ -115,7 +115,7 @@ proptest! {
             let client = io::join(StreamReader::new(futures::stream::iter(chunks)), io::sink());
             let mut backend = io::join(io::empty(), Vec::new());
             let activity = activity();
-            runtime.block_on(forward_frames(protocol, client, &mut backend, activity.clone())).unwrap();
+            runtime.block_on(forward_frames(protocol, client, &mut backend, activity.clone())).expect("forward frames should succeed");
             prop_assert_eq!(backend.writer(), &frames, "protocol {}", protocol);
             prop_assert_eq!(activity.snapshot().accepted.read, values.len() as u64);
         }
@@ -123,7 +123,8 @@ proptest! {
 }
 
 #[tokio::test]
-async fn small_pipelined_frames_share_a_read_and_each_use_one_backend_write() {
+async fn small_pipelined_frames_share_a_read_and_each_use_one_backend_write() -> anyhow::Result<()>
+{
     for (protocol, frame) in [
         (Protocol::Postgres, postgres_frame(b'Q', b"SELECT 1\0")),
         (Protocol::Mysql, mysql_packet(0, b"\x03SELECT 1")),
@@ -143,17 +144,18 @@ async fn small_pipelined_frames_share_a_read_and_each_use_one_backend_write() {
         );
         let mut backend = io::join(io::empty(), Writes::default());
         let activity = activity();
-        forward_frames(protocol, &mut client, &mut backend, activity.clone())
-            .await
-            .unwrap();
+        forward_frames(protocol, &mut client, &mut backend, activity.clone()).await?;
         assert_eq!(client.reader().reads, 1, "{protocol}");
         assert_eq!(backend.writer().0, [frame.clone(), frame], "{protocol}");
         assert_eq!(activity.snapshot().accepted.read, 2);
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn slow_postgres_upload_forwards_header_and_allows_replies_before_body() {
+async fn slow_postgres_upload_forwards_header_and_allows_replies_before_body() -> anyhow::Result<()>
+{
     let (mut client, gateway_client) = io::duplex(32);
     let (gateway_backend, mut backend) = io::duplex(2);
     let activity = activity();
@@ -163,25 +165,25 @@ async fn slow_postgres_upload_forwards_header_and_allows_replies_before_body() {
         activity.clone(),
     ));
     let header = [b'Q', 0, 0, 1, 0];
-    client.write_all(&header).await.unwrap();
+    client.write_all(&header).await?;
     let mut forwarded = [0; 5];
-    tokio::time::timeout(Duration::from_secs(2), backend.read_exact(&mut forwarded))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), backend.read_exact(&mut forwarded)).await??;
     assert_eq!(forwarded, header);
-    backend.write_all(b"!").await.unwrap();
-    assert_eq!(client.read_u8().await.unwrap(), b'!');
-    client.shutdown().await.unwrap();
+    backend.write_all(b"!").await?;
+    assert_eq!(client.read_u8().await?, b'!');
+    client.shutdown().await?;
     assert!(
-        matches!(proxy.await.unwrap(), Err(ListenerError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
+        matches!(proxy.await?, Err(ListenerError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
     );
     assert_eq!(activity.snapshot().accepted.other, 0);
     assert_eq!(activity.snapshot().accepted.read, 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn dedicated_mysql_counts_a_full_size_query_only_after_its_final_packet() {
+async fn dedicated_mysql_counts_a_full_size_query_only_after_its_final_packet() -> anyhow::Result<()>
+{
     let start = b"\xff\xff\xff\x00\x03SELECT ";
     let padding = (MYSQL_MAX_SINGLE_PACKET_PAYLOAD + 4 - start.len()) as u64;
     for (end, expected_reads) in [(&[][..], 0), (&[0, 0, 0, 1][..], 1)] {
@@ -198,10 +200,11 @@ async fn dedicated_mysql_counts_a_full_size_query_only_after_its_final_packet() 
             activity.clone(),
             Default::default(),
         )
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(activity.snapshot().accepted.read, expected_reads);
     }
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -238,11 +241,9 @@ async fn large_shared_packets_are_validated_and_forwarded_in_order() {
 }
 
 #[tokio::test]
-async fn waiting_for_scan_capacity_respects_session_cancellation_and_deadline() {
-    let _busy = SQL_SCAN_SLOTS
-        .acquire_many(MAX_SQL_SCANS as u32)
-        .await
-        .unwrap();
+async fn waiting_for_scan_capacity_respects_session_cancellation_and_deadline() -> anyhow::Result<()>
+{
+    let _busy = SQL_SCAN_SLOTS.acquire_many(MAX_SQL_SCANS as u32).await?;
     tokio::time::pause();
     for cancel in [true, false] {
         let sessions = TenantSessions::default();
@@ -277,8 +278,10 @@ async fn waiting_for_scan_capacity_respects_session_cancellation_and_deadline() 
         };
         assert!(matches!(proxy.await, Err(ListenerError::Io(e)) if e.kind() == expected));
         assert!(budget.reserve(32 * 1024 * 1024).is_ok());
-        assert_eq!(backend.read(&mut [0]).await.unwrap(), 0);
+        assert_eq!(backend.read(&mut [0]).await?, 0);
     }
+
+    Ok(())
 }
 
 #[tokio::test]

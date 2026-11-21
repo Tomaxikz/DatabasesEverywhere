@@ -23,10 +23,14 @@ pub(crate) async fn shared_roundtrip(
     let mut runtime = runtime.clone();
     let attestation = crate::server::placement::runtime::probe_compatibility(docker, &runtime)
         .await
-        .unwrap();
+        .expect("probe compatibility should succeed");
     runtime.database_version = Some(attestation.version);
     runtime.compatibility = Some(attestation.compatibility);
-    state.placements.save(&runtime).await.unwrap();
+    state
+        .placements
+        .save(&runtime)
+        .await
+        .expect("save should succeed");
     let mut instances: Vec<InstanceMetadata> = Vec::new();
     for (index, (database, username, password)) in tenants.into_iter().enumerate() {
         let id = format!("transfer_tenant_{index}");
@@ -43,7 +47,7 @@ pub(crate) async fn shared_roundtrip(
         state
             .placements
             .reserve(ReserveTenant {
-                owner: runtime.owner.clone().unwrap(),
+                owner: runtime.owner.clone().expect("expected a value from clone"),
                 instance_id: &id,
                 runtime_id: &runtime.runtime_id,
                 database,
@@ -51,9 +55,17 @@ pub(crate) async fn shared_roundtrip(
                 limits,
             })
             .await
-            .unwrap();
-        state.placements.mark_provisioned(&id).await.unwrap();
-        state.manager.upsert(instance.clone()).await.unwrap();
+            .expect("reserve should succeed");
+        state
+            .placements
+            .mark_provisioned(&id)
+            .await
+            .expect("mark provisioned should succeed");
+        state
+            .manager
+            .upsert(instance.clone())
+            .await
+            .expect("upsert should succeed");
         instances.push(instance);
     }
     let target = &instances[0];
@@ -68,12 +80,17 @@ pub(crate) async fn shared_roundtrip(
     let before = docker
         .verified_container_identity(runtime.protocol, &runtime.runtime_id)
         .await
-        .unwrap();
+        .expect("verified container identity should succeed");
     assert!(before.is_some());
     logical::create_shared_backup(&state, target, artifact.clone(), MAX_BYTES)
         .await
         .expect("export the target tenant through the production backup path");
-    assert!(std::fs::metadata(&artifact).unwrap().len() > 0);
+    assert!(
+        std::fs::metadata(&artifact)
+            .expect("metadata should succeed")
+            .len()
+            > 0
+    );
     mutate.await;
     logical::restore_shared_backup(&state, target, &artifact, MAX_BYTES, MAX_BYTES)
         .await
@@ -89,7 +106,7 @@ pub(crate) async fn shared_roundtrip(
         docker
             .inspect_instance(runtime.protocol, &runtime.runtime_id)
             .await
-            .unwrap()
+            .expect("inspect instance should succeed")
             .status,
         crate::runtime::docker::DockerContainerStatus::Running
     );
@@ -97,7 +114,7 @@ pub(crate) async fn shared_roundtrip(
         docker
             .verified_container_identity(runtime.protocol, &runtime.runtime_id)
             .await
-            .unwrap(),
+            .expect("verified container identity should succeed"),
         before,
         "restoring A must not replace or restart its pool"
     );

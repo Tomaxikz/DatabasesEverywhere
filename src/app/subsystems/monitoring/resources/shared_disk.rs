@@ -610,7 +610,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn stopped_pool_measurements_stay_strict_but_reporting_is_nullable() {
+    async fn stopped_pool_measurements_stay_strict_but_reporting_is_nullable() -> anyhow::Result<()>
+    {
         use super::super::{ResourceView, resource_report};
         let (state, _dir) = crate::subsystems::test_support::database(Default::default()).await;
         let mut runtime = crate::server::placement::test_support::runtime(
@@ -619,14 +620,12 @@ mod tests {
             "mysql:8.4",
         );
         runtime.status = EngineRuntimeStatus::Failed;
-        state.placements.save(&runtime).await.unwrap();
+        state.placements.save(&runtime).await?;
         let mut tenant = crate::server::test_support::shared_metadata();
         tenant.limits.disk_enforced = false;
         state.instances.upsert_fenced(tenant.clone()).await;
         assert!(usage(&state, &tenant).await.is_err());
-        let report = resource_report(&state, &tenant, ResourceView::Tenant)
-            .await
-            .unwrap();
+        let report = resource_report(&state, &tenant, ResourceView::Tenant).await?;
         assert_eq!(report.disk.used_bytes, None);
         assert!(state.instances.routes_fenced(&tenant.instance_id).await);
 
@@ -641,12 +640,12 @@ mod tests {
                     },
                 )
                 .await;
-            let report = resource_report(&state, &tenant, ResourceView::Tenant)
-                .await
-                .unwrap();
+            let report = resource_report(&state, &tenant, ResourceView::Tenant).await?;
             assert_eq!(report.disk.used_bytes, expected);
         }
         assert!(usage(&state, &tenant).await.is_err());
+
+        Ok(())
     }
 
     fn hard_tenant() -> InstanceMetadata {

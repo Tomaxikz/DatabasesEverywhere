@@ -94,6 +94,8 @@ fn named_token(name: String, token: String, scopes: Vec<String>) -> NamedToken {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
@@ -115,15 +117,19 @@ mod tests {
     }
 
     #[test]
-    fn accepts_config_token() {
+    fn accepts_config_token() -> anyhow::Result<()> {
         let token = ApiToken::from_config(&crate::config::Config {
             token_id: "panel-a".to_string(),
             token: "secret-a".to_string(),
             ..Default::default()
         });
 
-        let accepted = token.from_auth_header(Some("Bearer secret-a")).unwrap();
+        let accepted = token
+            .from_auth_header(Some("Bearer secret-a"))
+            .context("expected a value from from_auth_header")?;
         assert_eq!(accepted.name.as_ref(), "panel-a");
         assert!(accepted.has_scope(scopes::INSTANCES_READ));
+
+        Ok(())
     }
 }

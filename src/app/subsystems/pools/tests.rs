@@ -22,15 +22,17 @@ async fn auth(state: &crate::routes::http::router::AppState) -> ApiRequestContex
     let (mut parts, _) = Request::builder()
         .header("Authorization", "Bearer secret")
         .body(())
-        .unwrap()
+        .expect("body should succeed")
         .into_parts();
     ApiRequestContext::from_request_parts(&mut parts, state)
         .await
-        .unwrap()
+        .expect("from request parts should succeed")
 }
 
 #[tokio::test]
-async fn issued_pool_tokens_bind_owner_generation_and_scope() {
+async fn issued_pool_tokens_bind_owner_generation_and_scope() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let (state, _dir) = test_support::database(Config {
         token_id: "test-panel".into(),
         jwt_signing_key: "test-jwt-signing-key-0123456789abcdef-02".into(),
@@ -38,25 +40,26 @@ async fn issued_pool_tokens_bind_owner_generation_and_scope() {
     })
     .await;
     let mut pool = runtime("server-a", Protocol::Postgres, "postgres:18.4");
-    pool.owner.as_mut().unwrap().panel_id = state.config.token_id.clone();
-    state.placements.save(&pool).await.unwrap();
+    pool.owner
+        .as_mut()
+        .context("expected a value from as_mut")?
+        .panel_id = state.config.token_id.clone();
+    state.placements.save(&pool).await?;
     let body = serde_json::json!({"subject":"test-user", "server_id":"server-a", "pools":[pool.runtime_id],
         "scopes":["pools:monitor","pools:logs"], "ttl_seconds":60});
     let token = issue_ws_token(
         State(state.clone()),
         auth(&state).await,
-        ApiJson(serde_json::from_value(body.clone()).unwrap()),
+        ApiJson(serde_json::from_value(body.clone())?),
     )
-    .await
-    .unwrap()
+    .await?
     .into_body();
     let claims = jwt::validate_ws_token(
         &token.token,
         state.config.websocket_jwt_secret(),
         scopes::POOLS_MONITOR,
         None,
-    )
-    .unwrap();
+    )?;
     assert!(claims.pools[0].matches(&pool));
     assert!(!claims.allows_instance("any-database"));
     assert!(
@@ -82,16 +85,21 @@ async fn issued_pool_tokens_bind_owner_generation_and_scope() {
     ] {
         let mut bad = body.clone();
         bad[field] = value;
-        let request: IssueWsTokenRequest = serde_json::from_value(bad).unwrap();
+        let request: IssueWsTokenRequest = serde_json::from_value(bad)?;
         let error = issue_ws_token(State(state.clone()), auth(&state).await, ApiJson(request))
             .await
-            .unwrap_err();
+            .expect_err("ApiJson should return an error");
         assert_eq!(error.status().as_u16(), expected, "{field}: {error}");
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn failed_clickhouse_pool_tenants_remain_listable_without_disk_samples() {
+async fn failed_clickhouse_pool_tenants_remain_listable_without_disk_samples() -> anyhow::Result<()>
+{
+    use anyhow::Context as _;
+
     use crate::{
         server::metadata::InstanceStatus,
         server::placement::{DeploymentMode, ReserveTenant},
@@ -103,7 +111,7 @@ async fn failed_clickhouse_pool_tenants_remain_listable_without_disk_samples() {
         "clickhouse/clickhouse-server:26.4.4.38",
     );
     pool.limits.disk_mib = 64 * 1024;
-    state.placements.save(&pool).await.unwrap();
+    state.placements.save(&pool).await?;
     let mut tenant = crate::server::test_support::metadata("oom-tenant", Protocol::Clickhouse);
     tenant.owner = pool.owner.clone();
     tenant.deployment_mode = DeploymentMode::Shared;
@@ -114,59 +122,62 @@ async fn failed_clickhouse_pool_tenants_remain_listable_without_disk_samples() {
     state
         .placements
         .reserve(ReserveTenant {
-            owner: pool.owner.clone().unwrap(),
+            owner: pool.owner.clone().context("expected a value from clone")?,
             instance_id: &tenant.instance_id,
             runtime_id: &pool.runtime_id,
             database: &tenant.database.name,
             username: &tenant.database.username,
             limits: &tenant.limits,
         })
-        .await
-        .unwrap();
+        .await?;
     state
         .placements
         .mark_provisioned(&tenant.instance_id)
-        .await
-        .unwrap();
-    state.manager.upsert(tenant).await.unwrap();
+        .await?;
+    state.manager.upsert(tenant).await?;
     pool = state
         .placements
         .get(&pool.runtime_id)
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .context("get should provide a value")?;
     for status in [
         EngineRuntimeStatus::Failed,
         EngineRuntimeStatus::Stopped,
         EngineRuntimeStatus::Quarantined,
     ] {
         pool.status = status;
-        state.placements.save(&pool).await.unwrap();
+        state.placements.save(&pool).await?;
         let report = crate::subsystems::monitoring::resources::list_pool_tenants(
             State(state.clone()),
             auth(&state).await,
             ApiPath(pool.runtime_id.clone()),
         )
-        .await
-        .unwrap()
+        .await?
         .into_body();
-        let json = serde_json::to_value(report).unwrap();
-        assert_eq!(json.as_array().unwrap().len(), 1);
+        let json = serde_json::to_value(report)?;
+        assert_eq!(
+            json.as_array()
+                .context("as array should provide a value")?
+                .len(),
+            1
+        );
         assert_eq!(json[0]["instance_id"], "oom-tenant");
         assert!(
             json[0]["resources"]["disk"]
                 .get("used_bytes")
-                .unwrap()
+                .context("get should provide a value")?
                 .is_null()
         );
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn pool_lock_wait_does_not_hold_node_admission() {
+async fn pool_lock_wait_does_not_hold_node_admission() -> anyhow::Result<()> {
     let (state, _dir) = test_support::database(Config::default()).await;
     let pool = runtime("server-a", Protocol::Mysql, "mysql:8.4");
-    state.placements.save(&pool).await.unwrap();
+    state.placements.save(&pool).await?;
     let held = state.instance_locks.lock(&pool.runtime_id).await;
     let worker = tokio::spawn({
         let state = state.clone();
@@ -174,21 +185,17 @@ async fn pool_lock_wait_does_not_hold_node_admission() {
         async move { super::power::PoolGuard::acquire(&state, &id).await }
     });
     tokio::task::yield_now().await;
-    let admission = timeout(Duration::from_secs(1), state.instance_locks.lock_creation())
-        .await
-        .unwrap();
+    let admission = timeout(Duration::from_secs(1), state.instance_locks.lock_creation()).await?;
     drop(admission);
     drop(held);
-    let (_, guard) = timeout(Duration::from_secs(1), worker)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let (_, guard) = timeout(Duration::from_secs(1), worker).await???;
     drop(guard);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn power_rejects_unfinished_image_work_before_touching_docker() {
+async fn power_rejects_unfinished_image_work_before_touching_docker() -> anyhow::Result<()> {
     let (state, _dir) = test_support::database(Config::default()).await;
     let mut pool = runtime("server-a", Protocol::Mysql, "mysql:8.4");
     for (status, pending) in [
@@ -198,32 +205,33 @@ async fn power_rejects_unfinished_image_work_before_touching_docker() {
     ] {
         pool.status = status;
         pool.pending_image = pending;
-        state.placements.save(&pool).await.unwrap();
+        state.placements.save(&pool).await?;
         let error = super::power::change(
             &state,
             &pool.runtime_id,
             crate::subsystems::instances::LifecycleAction::Start,
         )
         .await
-        .unwrap_err();
+        .expect_err("change should return an error");
         assert!(matches!(error, ApiError::Conflict(_)));
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn pool_status_and_child_request_are_distinct_resources() {
+async fn pool_status_and_child_request_are_distinct_resources() -> anyhow::Result<()> {
     let (state, _dir) = test_support::database(Config::default()).await;
     let pool = runtime("server-a", Protocol::Postgres, "postgres:18.4");
-    state.placements.save(&pool).await.unwrap();
+    state.placements.save(&pool).await?;
     let response = super::status(
         State(state.clone()),
         auth(&state).await,
         ApiPath(pool.runtime_id.clone()),
     )
-    .await
-    .unwrap()
+    .await?
     .into_body();
-    let json = serde_json::to_value(response).unwrap();
+    let json = serde_json::to_value(response)?;
     assert_eq!(json["runtime_id"], pool.runtime_id);
     assert_eq!(json["status"], "running");
     assert!(json.get("data").is_none() && json.get("instance_id").is_none());
@@ -232,22 +240,26 @@ async fn pool_status_and_child_request_are_distinct_resources() {
         "limits":{"cpu_cores":1,"memory_mib":1024,"disk_mib":4096,"max_tenants":8}
     });
     assert!(serde_json::from_value::<super::operations::CreatePool>(old).is_err());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn pending_images_and_stopped_intent_survive_storage_and_block_route_recovery() {
+async fn pending_images_and_stopped_intent_survive_storage_and_block_route_recovery()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     use crate::server::metadata::DesiredInstanceState;
     let (state, _dir) = test_support::database(Config::default()).await;
     let mut pool = runtime("pending-pool", Protocol::Mysql, "mysql:8.4");
     pool.pending_image = Some("sha256:attested-image".into());
     pool.desired_state = DesiredInstanceState::Stopped;
-    state.placements.save(&pool).await.unwrap();
+    state.placements.save(&pool).await?;
     let stored = state
         .placements
         .get(&pool.runtime_id)
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .context("get should provide a value")?;
     assert_eq!(stored.pending_image, pool.pending_image);
     assert_eq!(stored.desired_state, DesiredInstanceState::Stopped);
     // Offline runtime deliberately cannot execute commands. Recovery must
@@ -264,20 +276,22 @@ async fn pending_images_and_stopped_intent_survive_storage_and_block_route_recov
         let result = crate::server::placement::tenant::recovery::reconcile_runtime_tenants_locked(
             &state, &pool,
         )
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(result.checked, 0);
     }
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn pool_mutations_reject_durable_migrations_even_before_target_provisioning() {
+async fn pool_mutations_reject_durable_migrations_even_before_target_provisioning()
+-> anyhow::Result<()> {
     let (state, _dir) = test_support::database(Config::default()).await;
     let pool = runtime("destination", Protocol::Mysql, "mysql:8.4");
-    state.placements.save(&pool).await.unwrap();
+    state.placements.save(&pool).await?;
     let mut source = crate::server::test_support::metadata("source", Protocol::Mysql);
     source.owner = pool.owner.clone();
-    state.manager.upsert(source.clone()).await.unwrap();
+    state.manager.upsert(source.clone()).await?;
     state
         .placements
         .migrations()
@@ -287,10 +301,11 @@ async fn pool_mutations_reject_durable_migrations_even_before_target_provisionin
             Some(&pool.runtime_id),
             None,
         )
-        .await
-        .unwrap();
+        .await?;
     let result = super::power::PoolGuard::acquire(&state, &pool.runtime_id).await;
     assert!(
         matches!(result, Err(ApiError::Conflict(message)) if message.contains("active database migration"))
     );
+
+    Ok(())
 }

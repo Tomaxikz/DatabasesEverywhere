@@ -59,11 +59,13 @@ fn qdrant_topology_rejects_distributed_or_multi_peer_sources() {
 #[test]
 fn qdrant_version_errors_do_not_echo_remote_text() {
     let invalid = "secret-source-version";
-    let error = check_snapshot_compatibility(invalid, "1.13.1").unwrap_err();
+    let error = check_snapshot_compatibility(invalid, "1.13.1")
+        .expect_err("check snapshot compatibility should return an error");
     assert!(!error.to_string().contains(invalid));
 
     let incompatible = "9.0-secret-source-version";
-    let error = check_snapshot_compatibility(incompatible, "1.13.1").unwrap_err();
+    let error = check_snapshot_compatibility(incompatible, "1.13.1")
+        .expect_err("check snapshot compatibility should return an error");
     assert!(!error.to_string().contains(incompatible));
 }
 
@@ -118,11 +120,13 @@ fn qdrant_bridge_start_records_its_generation_atomically() {
 }
 
 #[test]
-fn an_empty_full_source_is_valid() {
+fn an_empty_full_source_is_valid() -> anyhow::Result<()> {
     assert_eq!(
-        selected_collections(Vec::new(), &ImportExportSelection::default()).unwrap(),
+        selected_collections(Vec::new(), &ImportExportSelection::default())?,
         Vec::<String>::new()
     );
+
+    Ok(())
 }
 
 #[test]
@@ -147,7 +151,7 @@ fn incoming_collection_cannot_resolve_through_a_target_alias() {
         &["unrelated".to_string()],
         &[qdrant_alias("orders", "unrelated")],
     )
-    .unwrap_err();
+    .expect_err("qdrant alias should return an error");
 
     assert!(error.to_string().contains("target alias"));
 }
@@ -160,7 +164,7 @@ fn incoming_alias_cannot_shadow_a_target_collection() {
         &["orders".to_string()],
         &[],
     )
-    .unwrap_err();
+    .expect_err("to string should return an error");
 
     assert!(error.to_string().contains("target collection"));
 }

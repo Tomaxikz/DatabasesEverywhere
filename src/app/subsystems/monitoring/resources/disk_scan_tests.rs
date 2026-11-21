@@ -3,14 +3,16 @@ use std::{fs, os::unix::fs::symlink, time::Duration};
 use super::ResourceCache;
 
 #[tokio::test]
-async fn background_refresh_skips_only_a_matching_scanner_measurement() {
+async fn background_refresh_skips_only_a_matching_scanner_measurement() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     use crate::{
         config::{Config, DiskLimitMode},
         databases::protocol::Protocol,
         server::{paths::InstancePaths, test_support::metadata},
     };
 
-    let volumes = tempfile::tempdir().unwrap();
+    let volumes = tempfile::tempdir()?;
     let mut config = Config::default();
     config.paths.volumes = volumes.path().display().to_string();
     config.disk.mode = DiskLimitMode::SoftScanner;
@@ -18,17 +20,15 @@ async fn background_refresh_skips_only_a_matching_scanner_measurement() {
     let mut instance = metadata("inst_monitor", Protocol::Qdrant);
     instance.limits.disk_enforcement_method = "fuse_quota".to_owned();
     instance.limits.disk_mib = 128;
-    let data = InstancePaths::new(&state.config.paths, &instance.instance_id)
-        .unwrap()
-        .data;
-    fs::create_dir_all(&data).unwrap();
-    fs::write(data.join("data.bin"), b"1234567").unwrap();
+    let data = InstancePaths::new(&state.config.paths, &instance.instance_id)?.data;
+    fs::create_dir_all(&data)?;
+    fs::write(data.join("data.bin"), b"1234567")?;
     let target = super::disk::scanner_target(&instance, data);
     state
         .soft_disk_limiter
         .ensure_start_allowed(&target)
         .await
-        .unwrap();
+        .map_err(anyhow::Error::msg)?;
     let cache = &state.resource_cache;
 
     // Both legacy Qdrant and explicitly scanner-backed reports use physical usage.
@@ -52,40 +52,43 @@ async fn background_refresh_skips_only_a_matching_scanner_measurement() {
         cache
             .cached_disk_usage(&instance.instance_id)
             .await
-            .unwrap()
+            .context("cached disk usage should provide a value")?
             .used_bytes,
         7
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn disk_scan_counts_regular_files_without_following_symlinks() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn disk_scan_counts_regular_files_without_following_symlinks() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let data = temporary.path().join("data");
     let outside = temporary.path().join("outside");
-    fs::create_dir_all(data.join("nested")).unwrap();
-    fs::create_dir(&outside).unwrap();
-    fs::write(data.join("root.bin"), [0_u8; 7]).unwrap();
-    fs::write(data.join("nested/child.bin"), [0_u8; 11]).unwrap();
-    fs::write(outside.join("secret.bin"), [0_u8; 101]).unwrap();
-    symlink(&outside, data.join("outside-link")).unwrap();
+    fs::create_dir_all(data.join("nested"))?;
+    fs::create_dir(&outside)?;
+    fs::write(data.join("root.bin"), [0_u8; 7])?;
+    fs::write(data.join("nested/child.bin"), [0_u8; 11])?;
+    fs::write(outside.join("secret.bin"), [0_u8; 101])?;
+    symlink(&outside, data.join("outside-link"))?;
 
     assert_eq!(
         ResourceCache::default()
             .scan_directory(data, Duration::from_secs(1))
-            .await
-            .unwrap(),
+            .await?,
         18
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn disk_scan_rejects_a_symlink_root() {
-    let temporary = tempfile::tempdir().unwrap();
+async fn disk_scan_rejects_a_symlink_root() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
     let data = temporary.path().join("data");
     let linked = temporary.path().join("linked");
-    fs::create_dir(&data).unwrap();
-    symlink(&data, &linked).unwrap();
+    fs::create_dir(&data)?;
+    symlink(&data, &linked)?;
 
     assert!(
         ResourceCache::default()
@@ -93,6 +96,8 @@ async fn disk_scan_rejects_a_symlink_root() {
             .await
             .is_err()
     );
+
+    Ok(())
 }
 
 #[test]
@@ -103,21 +108,21 @@ fn wide_scan_fits_a_small_descriptor_budget() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap();
+            .expect("build should succeed");
         let used = runtime
             .block_on(ResourceCache::default().scan_directory(root.into(), Duration::from_secs(5)))
-            .unwrap();
+            .expect("from secs should succeed");
         assert_eq!(used, 512);
         return;
     }
 
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir().expect("tempdir should succeed");
     for index in 0..512 {
         let child = temporary.path().join(format!("child-{index}"));
-        fs::create_dir(&child).unwrap();
-        fs::write(child.join("data"), b"x").unwrap();
+        fs::create_dir(&child).expect("create dir should succeed");
+        fs::write(child.join("data"), b"x").expect("write should succeed");
     }
-    let mut child = Command::new(std::env::current_exe().unwrap());
+    let mut child = Command::new(std::env::current_exe().expect("current exe should succeed"));
     child
         .args([
             "--exact",
@@ -142,7 +147,7 @@ fn wide_scan_fits_a_small_descriptor_budget() {
             Ok(())
         });
     }
-    let output = child.output().unwrap();
+    let output = child.output().expect("output should succeed");
     assert!(
         output.status.success(),
         "{}\n{}",

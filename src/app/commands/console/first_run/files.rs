@@ -132,52 +132,57 @@ mod tests {
     use super::*;
 
     fn mode(path: &Path) -> u32 {
-        fs::metadata(path).unwrap().mode() & 0o7777
+        fs::metadata(path).expect("metadata should succeed").mode() & 0o7777
     }
 
     #[test]
-    fn new_files_are_private_and_never_replace_a_config() {
-        let root = tempfile::tempdir().unwrap();
+    fn new_files_are_private_and_never_replace_a_config() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
         let directory = root.path().join("etc/databases-everywhere");
         let path = directory.join("config.yml");
-        assert!(!exists(&path).unwrap());
-        write_private(&path, "first\n", false, false).unwrap();
-        assert!(exists(&path).unwrap());
+        assert!(!exists(&path)?);
+        write_private(&path, "first\n", false, false)?;
+        assert!(exists(&path)?);
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&directory), 0o700);
 
-        let error = write_private(&path, "second\n", false, false).unwrap_err();
+        let error = write_private(&path, "second\n", false, false)
+            .expect_err("write private should return an error");
         assert!(error.to_string().contains("already exists"), "{error:#}");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "first\n");
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1, "no temp left");
+        assert_eq!(fs::read_to_string(&path)?, "first\n");
+        assert_eq!(fs::read_dir(&directory)?.count(), 1, "no temp left");
 
-        write_private(&path, "third\n", true, false).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "third\n");
+        write_private(&path, "third\n", true, false)?;
+        assert_eq!(fs::read_to_string(&path)?, "third\n");
+
+        Ok(())
     }
 
     #[test]
-    fn an_existing_directory_is_tightened_and_symlinks_are_refused() {
-        let root = tempfile::tempdir().unwrap();
+    fn an_existing_directory_is_tightened_and_symlinks_are_refused() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
         let directory = root.path().join("conf");
-        fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
-        write_private(&directory.join("config.yml"), "x", false, false).unwrap();
+        fs::create_dir(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))?;
+        write_private(&directory.join("config.yml"), "x", false, false)?;
         assert_eq!(mode(&directory), 0o700);
 
         let link = root.path().join("link");
-        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        std::os::unix::fs::symlink(&directory, &link)?;
         assert!(write_private(&link.join("other.yml"), "x", false, false).is_err());
         // A dangling symlink at the config path counts as an existing config.
         let dangling = directory.join("dangling.yml");
-        std::os::unix::fs::symlink(root.path().join("missing"), &dangling).unwrap();
-        assert!(exists(&dangling).unwrap());
+        std::os::unix::fs::symlink(root.path().join("missing"), &dangling)?;
+        assert!(exists(&dangling)?);
         assert!(write_private(&dangling, "x", false, false).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn config_locations_match_what_setup_accepts() {
-        check_location(Path::new("/etc/databases-everywhere/config.yml")).unwrap();
-        check_location(Path::new("/srv/dbev/conf/node.yml")).unwrap();
+    fn config_locations_match_what_setup_accepts() -> anyhow::Result<()> {
+        check_location(Path::new("/etc/databases-everywhere/config.yml"))?;
+        check_location(Path::new("/srv/dbev/conf/node.yml"))?;
         for path in [
             "config.yml",
             "etc/databases-everywhere/config.yml",
@@ -187,5 +192,7 @@ mod tests {
         ] {
             assert!(check_location(Path::new(path)).is_err(), "{path}");
         }
+
+        Ok(())
     }
 }

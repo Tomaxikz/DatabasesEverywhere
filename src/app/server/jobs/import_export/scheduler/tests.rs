@@ -56,9 +56,9 @@ fn fixed_dynamic_scheduler(capacity: SchedulerCapacity) -> ImportExportScheduler
 }
 
 #[tokio::test]
-async fn dynamic_budget_blocks_until_resources_are_released() {
+async fn dynamic_budget_blocks_until_resources_are_released() -> anyhow::Result<()> {
     let scheduler = fixed_dynamic_scheduler(dynamic_capacity(8, 100, 100, 4));
-    let first = scheduler.acquire(cost(80, 80, 3)).await.unwrap();
+    let first = scheduler.acquire(cost(80, 80, 3)).await?;
     let waiting = {
         let scheduler = scheduler.clone();
         tokio::spawn(async move { scheduler.acquire(cost(30, 30, 2)).await })
@@ -66,11 +66,14 @@ async fn dynamic_budget_blocks_until_resources_are_released() {
     tokio::task::yield_now().await;
     assert_eq!(scheduler.snapshot().waiting_jobs, 1);
     drop(first);
-    assert!(waiting.await.unwrap().is_ok());
+    assert!(waiting.await?.is_ok());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn auto_capacity_refreshes_and_falling_headroom_blocks_new_dispatches() {
+async fn auto_capacity_refreshes_and_falling_headroom_blocks_new_dispatches() -> anyhow::Result<()>
+{
     let provider = Arc::new(MutableResourceProvider {
         memory_mib: std::sync::atomic::AtomicU64::new(1000),
         cpu_units: std::sync::atomic::AtomicUsize::new(4),
@@ -83,7 +86,7 @@ async fn auto_capacity_refreshes_and_falling_headroom_blocks_new_dispatches() {
         provider_dyn,
         Duration::ZERO,
     );
-    let first = scheduler.acquire(cost(400, 10, 3)).await.unwrap();
+    let first = scheduler.acquire(cost(400, 10, 3)).await?;
     provider
         .memory_mib
         .store(300, std::sync::atomic::Ordering::Release);
@@ -101,7 +104,7 @@ async fn auto_capacity_refreshes_and_falling_headroom_blocks_new_dispatches() {
     tokio::task::yield_now().await;
     assert_eq!(scheduler.snapshot().waiting_jobs, 1);
     drop(first);
-    let second = waiting.await.unwrap().unwrap();
+    let second = waiting.await??;
     assert_eq!(scheduler.snapshot().active_jobs, 1);
     drop(second);
 
@@ -117,6 +120,8 @@ async fn auto_capacity_refreshes_and_falling_headroom_blocks_new_dispatches() {
     let snapshot = fixed.snapshot();
     assert_eq!(snapshot.capacity.memory_budget_mib, 700);
     assert_eq!(snapshot.capacity.cpu_units, 7);
+
+    Ok(())
 }
 
 #[test]
@@ -177,7 +182,7 @@ fn unreadable_live_sample_fails_closed_and_requires_confirmed_recovery() {
 }
 
 #[tokio::test]
-async fn manual_mode_uses_only_the_fixed_active_ceiling() {
+async fn manual_mode_uses_only_the_fixed_active_ceiling() -> anyhow::Result<()> {
     let scheduler = ImportExportScheduler::new(
         SchedulerCapacity {
             mode: SchedulerMode::Manual,
@@ -188,8 +193,8 @@ async fn manual_mode_uses_only_the_fixed_active_ceiling() {
         },
         &config(),
     );
-    let first = scheduler.acquire(cost(100, 100, 10)).await.unwrap();
-    let second = scheduler.acquire(cost(100, 100, 10)).await.unwrap();
+    let first = scheduler.acquire(cost(100, 100, 10)).await?;
+    let second = scheduler.acquire(cost(100, 100, 10)).await?;
     let third = {
         let scheduler = scheduler.clone();
         tokio::spawn(async move { scheduler.acquire(cost(1, 1, 1)).await })
@@ -198,21 +203,23 @@ async fn manual_mode_uses_only_the_fixed_active_ceiling() {
     assert_eq!(scheduler.snapshot().active_jobs, 2);
     assert_eq!(scheduler.snapshot().waiting_jobs, 1);
     drop(first);
-    assert!(third.await.unwrap().is_ok());
+    assert!(third.await?.is_ok());
     drop(second);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn small_jobs_may_bypass_a_large_head_only_to_the_configured_limit() {
+async fn small_jobs_may_bypass_a_large_head_only_to_the_configured_limit() -> anyhow::Result<()> {
     let scheduler = fixed_dynamic_scheduler(dynamic_capacity(4, 100, 100, 4));
-    let held = scheduler.acquire(cost(60, 60, 2)).await.unwrap();
+    let held = scheduler.acquire(cost(60, 60, 2)).await?;
     let large = {
         let scheduler = scheduler.clone();
         tokio::spawn(async move { scheduler.acquire(cost(80, 80, 3)).await })
     };
     tokio::task::yield_now().await;
-    let small_one = scheduler.acquire(cost(20, 20, 1)).await.unwrap();
-    let small_two = scheduler.acquire(cost(20, 20, 1)).await.unwrap();
+    let small_one = scheduler.acquire(cost(20, 20, 1)).await?;
+    let small_two = scheduler.acquire(cost(20, 20, 1)).await?;
     let third = {
         let scheduler = scheduler.clone();
         tokio::spawn(async move { scheduler.acquire(cost(10, 10, 1)).await })
@@ -223,14 +230,16 @@ async fn small_jobs_may_bypass_a_large_head_only_to_the_configured_limit() {
     drop(small_one);
     drop(small_two);
     drop(held);
-    assert!(large.await.unwrap().is_ok());
-    assert!(third.await.unwrap().is_ok());
+    assert!(large.await?.is_ok());
+    assert!(third.await?.is_ok());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn close_rejects_and_wakes_waiting_jobs_without_revoking_active_work() {
+async fn close_rejects_and_wakes_waiting_jobs_without_revoking_active_work() -> anyhow::Result<()> {
     let scheduler = fixed_dynamic_scheduler(dynamic_capacity(1, 100, 100, 1));
-    let active = scheduler.acquire(cost(10, 10, 1)).await.unwrap();
+    let active = scheduler.acquire(cost(10, 10, 1)).await?;
     let waiting = {
         let scheduler = scheduler.clone();
         tokio::spawn(async move { scheduler.acquire(cost(10, 10, 1)).await })
@@ -238,22 +247,27 @@ async fn close_rejects_and_wakes_waiting_jobs_without_revoking_active_work() {
     tokio::task::yield_now().await;
     scheduler.close();
     assert_eq!(
-        waiting.await.unwrap().unwrap_err(),
+        waiting.await?.expect_err("close rejects and wakes waiting jobs without revoking active work should return an error"),
         SchedulerAcquireError::Closed
     );
     assert_eq!(
-        scheduler.acquire(cost(1, 1, 1)).await.unwrap_err(),
+        scheduler
+            .acquire(cost(1, 1, 1))
+            .await
+            .expect_err("cost should return an error"),
         SchedulerAcquireError::Closed
     );
     assert_eq!(scheduler.snapshot().active_jobs, 1);
     drop(active);
     assert_eq!(scheduler.snapshot().active_jobs, 0);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn cancelling_a_queued_acquire_removes_its_waiter() {
+async fn cancelling_a_queued_acquire_removes_its_waiter() -> anyhow::Result<()> {
     let scheduler = fixed_dynamic_scheduler(dynamic_capacity(1, 100, 100, 1));
-    let active = scheduler.acquire(cost(10, 10, 1)).await.unwrap();
+    let active = scheduler.acquire(cost(10, 10, 1)).await?;
     let waiting = {
         let scheduler = scheduler.clone();
         tokio::spawn(async move { scheduler.acquire(cost(10, 10, 1)).await })
@@ -265,6 +279,8 @@ async fn cancelling_a_queued_acquire_removes_its_waiter() {
     assert_eq!(scheduler.snapshot().waiting_jobs, 0);
     drop(active);
     assert_eq!(scheduler.snapshot().active_jobs, 0);
+
+    Ok(())
 }
 
 #[test]
@@ -291,7 +307,7 @@ fn dropping_receiver_after_dispatch_releases_sent_permit() {
 }
 
 #[tokio::test]
-async fn explicit_dynamic_memory_budget_never_admits_oversized_jobs() {
+async fn explicit_dynamic_memory_budget_never_admits_oversized_jobs() -> anyhow::Result<()> {
     let capacity = dynamic_capacity(8, 128, 1000, 1);
     let mut fixed = config();
     fixed.dynamic_memory_budget_mib = 128;
@@ -299,24 +315,29 @@ async fn explicit_dynamic_memory_budget_never_admits_oversized_jobs() {
     fixed.dynamic_cpu_units = 1;
     let scheduler = ImportExportScheduler::new(capacity, &fixed);
     assert_eq!(
-        scheduler.acquire(cost(320, 10, 3)).await.unwrap_err(),
+        scheduler
+            .acquire(cost(320, 10, 3))
+            .await
+            .expect_err("cost should return an error"),
         SchedulerAcquireError::InsufficientCapacity
     );
-    let fitting = scheduler.acquire(cost(1, 1, 1)).await.unwrap();
+    let fitting = scheduler.acquire(cost(1, 1, 1)).await?;
     assert_eq!(scheduler.snapshot().active_jobs, 1);
     assert_eq!(scheduler.snapshot().waiting_jobs, 0);
     drop(fitting);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn cpu_and_io_weights_allow_one_memory_safe_job_in_isolation() {
+async fn cpu_and_io_weights_allow_one_memory_safe_job_in_isolation() -> anyhow::Result<()> {
     let capacity = dynamic_capacity(8, 1000, 10, 1);
     let mut fixed = config();
     fixed.dynamic_memory_budget_mib = 1000;
     fixed.dynamic_io_budget_mib = 10;
     fixed.dynamic_cpu_units = 1;
     let scheduler = ImportExportScheduler::new(capacity, &fixed);
-    let weighted = scheduler.acquire(cost(100, 20, 3)).await.unwrap();
+    let weighted = scheduler.acquire(cost(100, 20, 3)).await?;
     let follower = {
         let scheduler = scheduler.clone();
         tokio::spawn(async move { scheduler.acquire(cost(1, 1, 1)).await })
@@ -324,11 +345,16 @@ async fn cpu_and_io_weights_allow_one_memory_safe_job_in_isolation() {
     tokio::task::yield_now().await;
     assert!(!follower.is_finished());
     drop(weighted);
-    drop(follower.await.unwrap().unwrap());
+    drop(follower.await??);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn automatic_dynamic_budget_times_out_instead_of_retaining_admission_forever() {
+async fn automatic_dynamic_budget_times_out_instead_of_retaining_admission_forever()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let provider = Arc::new(MutableResourceProvider {
         memory_mib: std::sync::atomic::AtomicU64::new(500),
         cpu_units: std::sync::atomic::AtomicUsize::new(4),
@@ -345,23 +371,31 @@ async fn automatic_dynamic_budget_times_out_instead_of_retaining_admission_forev
         tokio::spawn(async move { scheduler.acquire(cost(800, 10, 1)).await })
     };
     tokio::task::yield_now().await;
-    let fitting = scheduler.acquire(cost(100, 10, 1)).await.unwrap();
+    let fitting = scheduler.acquire(cost(100, 10, 1)).await?;
     assert!(!oversized.is_finished());
     drop(fitting);
     {
         let mut state = scheduler.shared.state.lock();
-        state.waiting.front_mut().unwrap().queued_at =
-            Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
+        state
+            .waiting
+            .front_mut()
+            .context("expected a value from front_mut")?
+            .queued_at = Instant::now()
+            .checked_sub(Duration::from_secs(61))
+            .context("expected a value from checked_sub")?;
     }
     let _ = scheduler.snapshot();
     assert_eq!(
-        oversized.await.unwrap().unwrap_err(),
+        oversized.await?.expect_err("automatic dynamic budget times out instead of retaining admission forever should return an error"),
         SchedulerAcquireError::InsufficientCapacity
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn live_low_headroom_blocks_oversized_escape_and_wakes_after_recovery() {
+async fn live_low_headroom_blocks_oversized_escape_and_wakes_after_recovery() -> anyhow::Result<()>
+{
     let provider = Arc::new(MutableResourceProvider {
         memory_mib: std::sync::atomic::AtomicU64::new(1000),
         cpu_units: std::sync::atomic::AtomicUsize::new(4),
@@ -389,16 +423,14 @@ async fn live_low_headroom_blocks_oversized_escape_and_wakes_after_recovery() {
     provider
         .memory_mib
         .store(1000, std::sync::atomic::Ordering::Release);
-    let permit = tokio::time::timeout(Duration::from_secs(1), waiting)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let permit = tokio::time::timeout(Duration::from_secs(1), waiting).await???;
     drop(permit);
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn live_blocked_head_does_not_deadlock_fitting_followers() {
+async fn live_blocked_head_does_not_deadlock_fitting_followers() -> anyhow::Result<()> {
     let provider = Arc::new(MutableResourceProvider {
         memory_mib: std::sync::atomic::AtomicU64::new(1),
         cpu_units: std::sync::atomic::AtomicUsize::new(4),
@@ -417,7 +449,7 @@ async fn live_blocked_head_does_not_deadlock_fitting_followers() {
     tokio::task::yield_now().await;
 
     for _ in 0..4 {
-        let follower = scheduler.acquire(cost(1, 1, 1)).await.unwrap();
+        let follower = scheduler.acquire(cost(1, 1, 1)).await?;
         assert!(!blocked.is_finished());
         drop(follower);
     }
@@ -426,12 +458,10 @@ async fn live_blocked_head_does_not_deadlock_fitting_followers() {
     provider
         .memory_mib
         .store(1000, std::sync::atomic::Ordering::Release);
-    let permit = tokio::time::timeout(Duration::from_secs(1), blocked)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let permit = tokio::time::timeout(Duration::from_secs(1), blocked).await???;
     drop(permit);
+
+    Ok(())
 }
 
 #[test]
@@ -449,7 +479,7 @@ fn recommendation_respects_scarce_and_unavailable_resources() {
 }
 
 #[tokio::test]
-async fn default_auto_budgets_fit_one_maximum_wipe_and_physical_restore() {
+async fn default_auto_budgets_fit_one_maximum_wipe_and_physical_restore() -> anyhow::Result<()> {
     let provider = Arc::new(MutableResourceProvider {
         memory_mib: std::sync::atomic::AtomicU64::new(32 * 1024),
         cpu_units: std::sync::atomic::AtomicUsize::new(1),
@@ -489,8 +519,10 @@ async fn default_auto_budgets_fit_one_maximum_wipe_and_physical_restore() {
         provider,
         Duration::ZERO,
     );
-    drop(scheduler.acquire(wipe).await.unwrap());
-    drop(scheduler.acquire(physical_restore).await.unwrap());
+    drop(scheduler.acquire(wipe).await?);
+    drop(scheduler.acquire(physical_restore).await?);
+
+    Ok(())
 }
 
 #[test]
@@ -622,19 +654,19 @@ fn cgroup_paths_are_controller_specific_and_cannot_escape_the_mount() {
 }
 
 #[test]
-fn unlimited_systemd_cgroup_uses_host_capacity() {
-    let directory = tempfile::tempdir().unwrap();
+fn unlimited_systemd_cgroup_uses_host_capacity() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
     let root = directory.path();
     let slice = root.join("system.slice");
     let service = slice.join("databases-everywhere.service");
-    std::fs::create_dir_all(&service).unwrap();
-    std::fs::write(root.join("cgroup.controllers"), "cpu memory\n").unwrap();
+    std::fs::create_dir_all(&service)?;
+    std::fs::write(root.join("cgroup.controllers"), "cpu memory\n")?;
 
     for base in [root, slice.as_path(), service.as_path()] {
-        std::fs::write(base.join("memory.max"), "max\n").unwrap();
-        std::fs::write(base.join("cpu.max"), "max 100000\n").unwrap();
+        std::fs::write(base.join("memory.max"), "max\n")?;
+        std::fs::write(base.join("cpu.max"), "max 100000\n")?;
     }
-    std::fs::write(service.join("memory.current"), (937 * MIB).to_string()).unwrap();
+    std::fs::write(service.join("memory.current"), (937 * MIB).to_string())?;
 
     assert!(cgroup_memory_sample_complete(
         &[root],
@@ -676,4 +708,6 @@ fn unlimited_systemd_cgroup_uses_host_capacity() {
     );
     assert_eq!(capacity.memory_budget_mib, 6_870);
     assert_eq!(capacity.cpu_units, 8);
+
+    Ok(())
 }

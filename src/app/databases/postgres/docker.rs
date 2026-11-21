@@ -185,7 +185,7 @@ mod tests {
         spec.env
             .iter()
             .find(|environment| environment.key == key)
-            .unwrap()
+            .expect("expected a value from find")
             .value
             .expose_secret()
     }

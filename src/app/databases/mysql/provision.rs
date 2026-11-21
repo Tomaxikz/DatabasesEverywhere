@@ -159,10 +159,12 @@ pub fn auth_string_sql_fragments(sql: &str) -> Result<(&str, &str), MysqlProvisi
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[test]
-    fn tenant_provisioning_uses_one_protected_caching_sha2_password() {
+    fn tenant_provisioning_uses_one_protected_caching_sha2_password() -> anyhow::Result<()> {
         let sql = tenant_user_sql("app_db", "app_user");
 
         assert!(sql.contains("CREATE DATABASE IF NOT EXISTS `app_db`"));
@@ -171,17 +173,25 @@ mod tests {
         assert!(!sql.contains("REVOKE ALL PRIVILEGES"));
         assert!(sql.contains(PASSWORD_B64_PLACEHOLDER));
         assert!(!sql.contains("mysql_native_password"));
-        let disable_binlog = sql.find("SET SESSION sql_log_bin = 0;").unwrap();
-        let disable_general_log = sql.find("SET SESSION sql_log_off = 1;").unwrap();
-        let password = sql.find("SET @dbev_password").unwrap();
+        let disable_binlog = sql
+            .find("SET SESSION sql_log_bin = 0;")
+            .context("expected a value from find")?;
+        let disable_general_log = sql
+            .find("SET SESSION sql_log_off = 1;")
+            .context("expected a value from find")?;
+        let password = sql
+            .find("SET @dbev_password")
+            .context("expected a value from find")?;
 
         assert!(disable_binlog < password);
         assert!(disable_general_log < password);
-        let (before, after) = password_sql_fragments(&sql).unwrap();
+        let (before, after) = password_sql_fragments(&sql)?;
 
         assert!(!before.contains(PASSWORD_B64_PLACEHOLDER));
         assert!(!after.contains(PASSWORD_B64_PLACEHOLDER));
         assert_eq!(sql.matches(PASSWORD_B64_PLACEHOLDER).count(), 1);
+
+        Ok(())
     }
 
     #[test]
@@ -219,9 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn captures_and_restores_existing_authentication_state_without_plaintext() {
+    fn captures_and_restores_existing_authentication_state_without_plaintext() -> anyhow::Result<()>
+    {
         let capture = tenant_auth_state_sql("user'name");
-        let restore = restore_tenant_auth_sql("user`name", "caching_sha2_password").unwrap();
+        let restore = restore_tenant_auth_sql("user`name", "caching_sha2_password")?;
 
         assert!(capture.contains("User = 'user''name'"));
         assert!(capture.contains("TO_BASE64(authentication_string)"));
@@ -229,6 +240,8 @@ mod tests {
         assert!(restore.contains("`caching_sha2_password` AS"));
         assert!(restore.contains(AUTH_STRING_B64_PLACEHOLDER));
         assert!(!restore.contains("CREATE USER"));
+
+        Ok(())
     }
 
     #[test]

@@ -269,6 +269,8 @@ fn parse_decimal(bytes: &[u8]) -> Result<usize, RedisParseError> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     fn hello(arguments: &[&[u8]]) -> Vec<u8> {
@@ -276,20 +278,22 @@ mod tests {
     }
 
     #[test]
-    fn hello_client_name_is_not_an_auth_option() {
+    fn hello_client_name_is_not_an_auth_option() -> anyhow::Result<()> {
         let packet = hello(&[
             b"HELLO", b"3", b"SETNAME", b"AUTH", b"AUTH", b"default", b"secret",
         ]);
-        let route = parse_initial_route(&packet).unwrap();
+        let route = parse_initial_route(&packet)?;
         assert_eq!(route.username(), Some("default"));
         assert_eq!(
             route.password_route_sha256(),
             password_route_sha256(b"secret")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn hello_rewrite_preserves_client_name_and_pipelined_bytes() {
+    fn hello_rewrite_preserves_client_name_and_pipelined_bytes() -> anyhow::Result<()> {
         let mut packet = hello(&[
             b"HELLO", b"3", b"SETNAME", b"AUTH", b"AUTH", b"default", b"secret",
         ]);
@@ -299,35 +303,35 @@ mod tests {
             username: Some("default".into()),
             password: b"secret".to_vec(),
         };
-        let rewritten = route
-            .rewrite_with_resolved_username(&packet, consumed, "tenant")
-            .unwrap();
+        let rewritten = route.rewrite_with_resolved_username(&packet, consumed, "tenant")?;
         let mut expected = hello(&[
             b"HELLO", b"3", b"SETNAME", b"AUTH", b"AUTH", b"tenant", b"secret",
         ]);
         expected.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
         assert_eq!(rewritten, expected);
+
+        Ok(())
     }
 
     #[test]
-    fn hello_uses_and_rewrites_the_last_auth_option_like_the_backend() {
+    fn hello_uses_and_rewrites_the_last_auth_option_like_the_backend() -> anyhow::Result<()> {
         let packet = hello(&[
             b"HELLO", b"2", b"AUTH", b"ignored", b"old", b"AUTH", b"default", b"secret",
         ]);
-        let route = parse_initial_route(&packet).unwrap();
+        let route = parse_initial_route(&packet)?;
         assert_eq!(route.username(), Some("default"));
         assert_eq!(
             route.password_route_sha256(),
             password_route_sha256(b"secret")
         );
         assert_eq!(
-            route
-                .rewrite_with_resolved_username(&packet, packet.len(), "tenant")
-                .unwrap(),
+            route.rewrite_with_resolved_username(&packet, packet.len(), "tenant")?,
             hello(&[
                 b"HELLO", b"2", b"AUTH", b"ignored", b"old", b"AUTH", b"tenant", b"secret"
             ])
         );
+
+        Ok(())
     }
 
     #[test]
@@ -357,19 +361,18 @@ mod tests {
     }
 
     #[test]
-    fn initial_frame_boundaries_are_exact() {
+    fn initial_frame_boundaries_are_exact() -> anyhow::Result<()> {
         let error = parse_initial_route(
             b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n*1\r\n$4\r\nPING\r\n",
         )
-        .unwrap_err();
+        .expect_err("parse initial route should return an error");
 
         assert!(matches!(error, RedisParseError::Unsupported));
 
         let (route, consumed) = parse_initial_frame_route(
             b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n*1\r\n$4\r\nPING\r\n",
-        )
-        .unwrap()
-        .unwrap();
+        )?
+        .context("parse initial frame route should provide a value")?;
 
         assert_eq!(route.username(), Some("app"));
         assert_eq!(
@@ -379,35 +382,42 @@ mod tests {
 
         let result = parse_initial_frame_route(b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npa");
 
-        assert_eq!(result.unwrap(), None);
+        assert_eq!(result?, None);
 
-        let error = parse_initial_frame_route(b"*2\r\n$4\r\nAUTH\r\n$4\r\npassx\r\n").unwrap_err();
+        let error = parse_initial_frame_route(b"*2\r\n$4\r\nAUTH\r\n$4\r\npassx\r\n")
+            .expect_err("parse initial frame route should return an error");
+
+        assert!(matches!(error, RedisParseError::Unsupported));
+
+        let error = parse_initial_route(b"AUTH pass\r\n")
+            .expect_err("parse initial route should return an error");
 
         assert!(matches!(error, RedisParseError::Unsupported));
 
-        let error = parse_initial_route(b"AUTH pass\r\n").unwrap_err();
-
-        assert!(matches!(error, RedisParseError::Unsupported));
+        Ok(())
     }
 
     #[test]
-    fn rewrites_legacy_password_only_auth_to_the_resolved_acl_user() {
+    fn rewrites_legacy_password_only_auth_to_the_resolved_acl_user() -> anyhow::Result<()> {
         let original = b"*2\r\n$4\r\nAUTH\r\n$4\r\npass\r\n*1\r\n$4\r\nPING\r\n";
-        let (route, consumed) = parse_initial_frame_route(original).unwrap().unwrap();
-        let rewritten = route
-            .rewrite_with_resolved_username(original, consumed, "tenant_a")
-            .unwrap();
+        let (route, consumed) = parse_initial_frame_route(original)?
+            .context("parse initial frame route should provide a value")?;
+        let rewritten = route.rewrite_with_resolved_username(original, consumed, "tenant_a")?;
         assert_eq!(
             rewritten,
             b"*3\r\n$4\r\nAUTH\r\n$8\r\ntenant_a\r\n$4\r\npass\r\n*1\r\n$4\r\nPING\r\n"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn debug_never_exposes_the_resp_password() {
-        let route = parse_initial_route(b"*2\r\n$4\r\nAUTH\r\n$12\r\nsuper-secret\r\n").unwrap();
+    fn debug_never_exposes_the_resp_password() -> anyhow::Result<()> {
+        let route = parse_initial_route(b"*2\r\n$4\r\nAUTH\r\n$12\r\nsuper-secret\r\n")?;
         let debug = format!("{route:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("super-secret"));
+
+        Ok(())
     }
 }

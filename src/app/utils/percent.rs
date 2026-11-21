@@ -56,8 +56,11 @@ mod tests {
     }
 
     #[test]
-    fn strict_decoding_refuses_malformed_escapes_and_non_utf8() {
-        assert_eq!(decode_strict("a%20b+c%2f").unwrap(), "a b+c/");
+    fn strict_decoding_refuses_malformed_escapes_and_non_utf8() -> anyhow::Result<()> {
+        assert_eq!(
+            decode_strict("a%20b+c%2f").map_err(|error| anyhow::anyhow!("{error:?}"))?,
+            "a b+c/"
+        );
         for malformed in ["%", "%4", "%zz", "a%2"] {
             assert_eq!(
                 decode_strict(malformed),
@@ -66,5 +69,7 @@ mod tests {
             );
         }
         assert_eq!(decode_strict("%ff"), Err(DecodeError::Utf8));
+
+        Ok(())
     }
 }

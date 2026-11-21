@@ -51,36 +51,37 @@ type SystemdCase<'a> = (
 );
 
 #[tokio::test]
-async fn physical_restore_scan_uses_configured_entry_budget() {
-    let temp = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(&temp.path().join("metadata"))
-        .await
-        .unwrap();
+async fn physical_restore_scan_uses_configured_entry_budget() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pool = sqlite::connect(&temp.path().join("metadata")).await?;
     let manager = InstanceManager::new(InstanceStore::default(), InstanceRepository::new(pool));
     let volumes = temp.path().join("volumes");
-    fs::create_dir_all(volumes.join("one")).unwrap();
-    fs::create_dir_all(volumes.join("two")).unwrap();
+    fs::create_dir_all(volumes.join("one"))?;
+    fs::create_dir_all(volumes.join("two"))?;
     assert!(
         quarantine_restore_workspaces(&manager, &volumes, 1)
             .await
             .is_err()
     );
     assert_eq!(
-        quarantine_restore_workspaces(&manager, &volumes, 2)
-            .await
-            .unwrap(),
+        quarantine_restore_workspaces(&manager, &volumes, 2).await?,
         0
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal() {
-    let temp = tempfile::tempdir().unwrap();
+async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal()
+-> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let temp = tempfile::tempdir()?;
     let metadata_root = temp.path().join("metadata");
-    let pool = sqlite::connect(&metadata_root).await.unwrap();
+    let pool = sqlite::connect(&metadata_root).await?;
     let repository = InstanceRepository::new(pool.clone());
     let manager = InstanceManager::new(InstanceStore::default(), repository.clone());
-    manager.upsert(recovery_test_metadata()).await.unwrap();
+    manager.upsert(recovery_test_metadata()).await?;
 
     let jobs = ImportExportJobRepository::new(pool);
     jobs.insert(&ImportExportJob {
@@ -94,13 +95,12 @@ async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal(
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:01Z".to_string(),
     })
-    .await
-    .unwrap();
-    assert!(jobs.running_import_ids().await.unwrap().is_empty());
+    .await?;
+    assert!(jobs.running_import_ids().await?.is_empty());
 
     let tmp_root = temp.path().join("tmp");
     let recovery_root = tmp_root.join("import-export");
-    tokio::fs::create_dir_all(&recovery_root).await.unwrap();
+    tokio::fs::create_dir_all(&recovery_root).await?;
     tokio::fs::write(
         recovery_root.join(".dbe-import-recovery-00000000-0000-4000-8000-000000000001.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -111,91 +111,98 @@ async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal(
             "import_mode": "wipe",
             "rollback_file": "rollback.postgres.sql",
             "created_at": "2026-01-01T00:00:00Z"
-        }))
-        .unwrap(),
+        }))?,
     )
-    .await
-    .unwrap();
+    .await?;
 
-    assert_eq!(
-        quarantine_import_manifests(&manager, &tmp_root)
-            .await
-            .unwrap(),
-        1
-    );
+    assert_eq!(quarantine_import_manifests(&manager, &tmp_root).await?, 1);
 
     let reloaded = InstanceManager::new(InstanceStore::default(), repository);
-    reloaded.load_from_storage().await.unwrap();
+    reloaded.load_from_storage().await?;
     assert_eq!(
-        reloaded.store().get("inst_recovery").await.unwrap().status,
+        reloaded
+            .store()
+            .get("inst_recovery")
+            .await
+            .context("get should provide a value")?
+            .status,
         InstanceStatus::Quarantined
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn retained_physical_restore_workspace_quarantines_target() {
-    let temp = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(&temp.path().join("metadata"))
-        .await
-        .unwrap();
+async fn retained_physical_restore_workspace_quarantines_target() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let temp = tempfile::tempdir()?;
+    let pool = sqlite::connect(&temp.path().join("metadata")).await?;
     let repository = InstanceRepository::new(pool);
     let manager = InstanceManager::new(InstanceStore::default(), repository.clone());
-    manager.upsert(recovery_test_metadata()).await.unwrap();
+    manager.upsert(recovery_test_metadata()).await?;
 
     let volumes = temp.path().join("volumes");
     tokio::fs::create_dir_all(
         volumes
             .join(".dbe-restore-inst_recovery-00000000-0000-4000-8000-000000000001/previous-data"),
     )
-    .await
-    .unwrap();
+    .await?;
 
     assert_eq!(
-        quarantine_restore_workspaces(&manager, &volumes, 4096)
-            .await
-            .unwrap(),
+        quarantine_restore_workspaces(&manager, &volumes, 4096).await?,
         1
     );
     let reloaded = InstanceManager::new(InstanceStore::default(), repository);
-    reloaded.load_from_storage().await.unwrap();
-    let metadata = reloaded.store().get("inst_recovery").await.unwrap();
+    reloaded.load_from_storage().await?;
+    let metadata = reloaded
+        .store()
+        .get("inst_recovery")
+        .await
+        .context("missing inst_recovery entry")?;
     assert_eq!(metadata.status, InstanceStatus::Quarantined);
     assert_eq!(
         metadata.desired_state,
         crate::server::metadata::DesiredInstanceState::Stopped
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn physical_restore_recovery_scan_does_not_follow_workspace_symlinks() {
-    let temp = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(&temp.path().join("metadata"))
-        .await
-        .unwrap();
+async fn physical_restore_recovery_scan_does_not_follow_workspace_symlinks() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let temp = tempfile::tempdir()?;
+    let pool = sqlite::connect(&temp.path().join("metadata")).await?;
     let repository = InstanceRepository::new(pool);
     let manager = InstanceManager::new(InstanceStore::default(), repository);
-    manager.upsert(recovery_test_metadata()).await.unwrap();
+    manager.upsert(recovery_test_metadata()).await?;
 
     let volumes = temp.path().join("volumes");
     let elsewhere = temp.path().join("elsewhere");
-    fs::create_dir_all(&volumes).unwrap();
-    fs::create_dir_all(&elsewhere).unwrap();
+    fs::create_dir_all(&volumes)?;
+    fs::create_dir_all(&elsewhere)?;
     symlink(
         &elsewhere,
         volumes.join(".dbe-restore-inst_recovery-00000000-0000-4000-8000-000000000001"),
-    )
-    .unwrap();
+    )?;
 
     assert_eq!(
-        quarantine_restore_workspaces(&manager, &volumes, 4096)
-            .await
-            .unwrap(),
+        quarantine_restore_workspaces(&manager, &volumes, 4096).await?,
         0
     );
     assert_eq!(
-        manager.store().get("inst_recovery").await.unwrap().status,
+        manager
+            .store()
+            .get("inst_recovery")
+            .await
+            .context("get should provide a value")?
+            .status,
         InstanceStatus::Running
     );
+
+    Ok(())
 }
 
 fn recovery_test_metadata() -> InstanceMetadata {
@@ -311,22 +318,23 @@ fn daemon_boot_preserves_running_containers() {
 }
 
 #[tokio::test]
-async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
+async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     use crate::server::metadata::DesiredInstanceState;
     use crate::server::placement::{EngineRuntimeStatus, test_support as pools};
 
     let (state, dir) = crate::subsystems::test_support::database(Config::default()).await;
     let mut metadata = test_support::metadata("blocked_boot", Protocol::Postgres);
     metadata.status = InstanceStatus::Failed;
-    state.manager.upsert(metadata.clone()).await.unwrap();
+    state.manager.upsert(metadata.clone()).await?;
     let mut pool = pools::runtime("pool_boot", Protocol::Mysql, "mysql:8.4");
     pool.status = EngineRuntimeStatus::Stopped;
-    state.placements.save(&pool).await.unwrap();
-    let sqlite = sqlite::connect(dir.path()).await.unwrap();
+    state.placements.save(&pool).await?;
+    let sqlite = sqlite::connect(dir.path()).await?;
     sqlx::query("UPDATE engine_runtimes SET startup_attempts = 2")
         .execute(&sqlite)
-        .await
-        .unwrap();
+        .await?;
 
     // Admission stops before mount preparation or activation. The offline
     // engine cannot confirm the shared pool is down, so its failure must be
@@ -339,8 +347,7 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
             &state.instance_locks,
             metadata.clone()
         )
-        .await
-        .unwrap(),
+        .await?,
         Some(InstanceStatus::Failed)
     );
     assert!(start_shared_runtimes(&state).await.is_err());
@@ -348,9 +355,8 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
         state
             .placements
             .get("pool_boot")
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .context("get should provide a value")?
             .status,
         EngineRuntimeStatus::Quarantined
     );
@@ -366,7 +372,7 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
 
     metadata.status = InstanceStatus::Stopped;
     metadata.desired_state = DesiredInstanceState::Stopped;
-    state.manager.upsert(metadata.clone()).await.unwrap();
+    state.manager.upsert(metadata.clone()).await?;
     assert_eq!(
         start_known_instance(
             &state.config,
@@ -375,10 +381,11 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
             &state.instance_locks,
             metadata
         )
-        .await
-        .unwrap(),
+        .await?,
         None
     );
+
+    Ok(())
 }
 
 #[test]
@@ -470,11 +477,11 @@ fn disk_reconciliation_never_downgrades_an_existing_quarantine() {
 }
 
 #[test]
-fn qdrant_fuse_migration_preserves_container_project_grouping() {
+fn qdrant_fuse_migration_preserves_container_project_grouping() -> anyhow::Result<()> {
     let config = Config::default();
     let mut metadata = recovery_test_metadata();
     metadata.protocol = Protocol::Qdrant;
-    let paths = InstancePaths::new(&config.paths, &metadata.instance_id).unwrap();
+    let paths = InstancePaths::new(&config.paths, &metadata.instance_id)?;
 
     let spec = qdrant_migration_spec(
         &config,
@@ -490,6 +497,8 @@ fn qdrant_fuse_migration_preserves_container_project_grouping() {
     );
 
     assert_eq!(spec.project_id.as_deref(), Some("panel-project"));
+
+    Ok(())
 }
 
 #[test]
@@ -521,87 +530,101 @@ fn queued_soft_disk_decision_is_stale_after_a_limit_increase() {
 }
 
 #[test]
-fn hardens_existing_runtime_directory_permissions() {
-    let temp = tempfile::tempdir().unwrap();
+fn hardens_existing_runtime_directory_permissions() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).unwrap();
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::create_dir(&runtime)?;
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o777))?;
 
-    harden_runtime_dir(&runtime).unwrap();
+    harden_runtime_dir(&runtime)?;
 
-    let mode = fs::metadata(runtime).unwrap().permissions().mode() & 0o777;
+    let mode = fs::metadata(runtime)?.permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
+
+    Ok(())
 }
 
 #[test]
-fn rejects_symlinked_runtime_directory() {
-    let temp = tempfile::tempdir().unwrap();
+fn rejects_symlinked_runtime_directory() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let target = temp.path().join("target");
     let runtime = temp.path().join("runtime");
-    fs::create_dir(&target).unwrap();
-    symlink(&target, &runtime).unwrap();
+    fs::create_dir(&target)?;
+    symlink(&target, &runtime)?;
 
-    let error = harden_runtime_dir(&runtime).unwrap_err();
+    let error =
+        harden_runtime_dir(&runtime).expect_err("harden runtime dir should return an error");
 
     assert!(error.to_string().contains("not a symlink"));
+
+    Ok(())
 }
 
 #[test]
-fn rejects_symlinked_runtime_path_ancestor() {
-    let temp = tempfile::tempdir().unwrap();
+fn rejects_symlinked_runtime_path_ancestor() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let target = temp.path().join("target");
     let linked_parent = temp.path().join("linked-parent");
-    fs::create_dir(&target).unwrap();
-    symlink(&target, &linked_parent).unwrap();
+    fs::create_dir(&target)?;
+    symlink(&target, &linked_parent)?;
 
-    let error = validate_runtime_ancestors(&linked_parent.join("runtime"), false).unwrap_err();
+    let error = validate_runtime_ancestors(&linked_parent.join("runtime"), false)
+        .expect_err("validate runtime ancestors should return an error");
 
     assert!(error.to_string().contains("must be a real directory"));
+
+    Ok(())
 }
 
 #[test]
-fn securely_creates_nested_runtime_directories() {
-    let temp = tempfile::tempdir().unwrap();
+fn securely_creates_nested_runtime_directories() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let runtime = temp.path().join("nested").join("runtime");
 
-    create_runtime_dirs(&runtime).unwrap();
+    create_runtime_dirs(&runtime)?;
 
     assert!(runtime.is_dir());
-    assert_eq!(
-        fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
+    assert_eq!(fs::metadata(&runtime)?.permissions().mode() & 0o777, 0o700);
+
+    Ok(())
 }
 
 #[test]
-fn secure_runtime_creation_rejects_symlinked_component() {
-    let temp = tempfile::tempdir().unwrap();
+fn secure_runtime_creation_rejects_symlinked_component() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let target = temp.path().join("target");
     let linked_parent = temp.path().join("linked-parent");
-    fs::create_dir(&target).unwrap();
-    symlink(&target, &linked_parent).unwrap();
+    fs::create_dir(&target)?;
+    symlink(&target, &linked_parent)?;
 
-    let error = create_runtime_dirs(&linked_parent.join("runtime")).unwrap_err();
+    let error = create_runtime_dirs(&linked_parent.join("runtime"))
+        .expect_err("create runtime dirs should return an error");
 
     assert!(error.to_string().contains("not a symlink"));
     assert!(!target.join("runtime").exists());
+
+    Ok(())
 }
 
 #[test]
-fn rejects_runtime_path_ancestor_writable_by_other_users() {
-    let temp = tempfile::tempdir().unwrap();
+fn rejects_runtime_path_ancestor_writable_by_other_users() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
     let parent = temp.path().join("unsafe-parent");
-    fs::create_dir(&parent).unwrap();
-    fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::create_dir(&parent)?;
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o777))?;
 
-    let error = validate_runtime_ancestors(&parent.join("runtime"), false).unwrap_err();
+    let error = validate_runtime_ancestors(&parent.join("runtime"), false)
+        .expect_err("validate runtime ancestors should return an error");
 
     assert!(error.to_string().contains("writable by group or others"));
+
+    Ok(())
 }
 
 #[test]
 fn rejects_runtime_directory_owned_by_another_uid() {
-    let error = require_runtime_owner(Path::new("/runtime"), 1001, 1000).unwrap_err();
+    let error = require_runtime_owner(Path::new("/runtime"), 1001, 1000)
+        .expect_err("require runtime owner should return an error");
 
     assert!(error.to_string().contains("owned by uid 1001"));
 }
@@ -688,52 +711,60 @@ fn generated_systemd_service_tracks_engine_socket_and_security_policy() {
 }
 
 #[test]
-fn rootless_podman_custom_paths_require_traversable_ancestors() {
+fn rootless_podman_custom_paths_require_traversable_ancestors() -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let temp = tempfile::tempdir().unwrap();
-    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let temp = tempfile::tempdir()?;
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
     let managed = temp.path().join("managed");
-    fs::create_dir(&managed).unwrap();
-    let metadata = fs::metadata(temp.path()).unwrap();
+    fs::create_dir(&managed)?;
+    let metadata = fs::metadata(temp.path())?;
 
-    check_rootless_path_access(&managed, metadata.uid(), metadata.gid()).unwrap();
+    check_rootless_path_access(&managed, metadata.uid(), metadata.gid())?;
     let error = check_rootless_path_access(
         &managed,
         metadata.uid().saturating_add(1),
         metadata.gid().saturating_add(1),
     )
-    .unwrap_err();
+    .expect_err("saturating add should return an error");
     assert!(error.to_string().contains("cannot traverse"));
+
+    Ok(())
 }
 
 #[test]
-fn daemon_lock_is_private_and_exclusive() {
-    let temp = tempfile::tempdir().unwrap();
-    let locks = temp.path().join("locks");
-    fs::create_dir(&locks).unwrap();
-    harden_runtime_dir(&locks).unwrap();
+fn daemon_lock_is_private_and_exclusive() -> anyhow::Result<()> {
+    use anyhow::Context as _;
 
-    let first = acquire_daemon_lock(&locks).unwrap();
+    let temp = tempfile::tempdir()?;
+    let locks = temp.path().join("locks");
+    fs::create_dir(&locks)?;
+    harden_runtime_dir(&locks)?;
+
+    let first = acquire_daemon_lock(&locks)?;
     let lock_path = locks.join(DAEMON_LOCK_FILE);
-    let mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+    let mode = fs::metadata(&lock_path)?.permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 
-    let error = acquire_daemon_lock(&locks).err().unwrap();
+    let error = acquire_daemon_lock(&locks)
+        .err()
+        .context("expected a value from err")?;
     assert!(error.to_string().contains("another dbev daemon"));
     drop(first);
 
-    acquire_daemon_lock(&locks).unwrap();
+    acquire_daemon_lock(&locks)?;
+
+    Ok(())
 }
 
 #[test]
-fn rootless_podman_traversal_prepares_import_export_and_keeps_job_sandboxes_private() {
+fn rootless_podman_traversal_prepares_import_export_and_keeps_job_sandboxes_private()
+-> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let temp = tempfile::tempdir().unwrap();
-    let metadata = fs::metadata(temp.path()).unwrap();
-    crate::io::ownership::allow_directory_traversal(temp.path(), metadata.uid(), metadata.gid())
-        .unwrap();
+    let temp = tempfile::tempdir()?;
+    let metadata = fs::metadata(temp.path())?;
+    crate::io::ownership::allow_directory_traversal(temp.path(), metadata.uid(), metadata.gid())?;
     let data = temp.path().join("data");
     let run = temp.path().join("run");
     let logs = temp.path().join("logs");
@@ -753,28 +784,21 @@ fn rootless_podman_traversal_prepares_import_export_and_keeps_job_sandboxes_priv
 
     let rootless_uid = metadata.uid().max(1);
     let rootless_gid = metadata.gid();
-    super::runtime_paths::prepare_rootless_paths_for_owner(&config, rootless_uid, rootless_gid)
-        .unwrap();
+    super::runtime_paths::prepare_rootless_paths_for_owner(&config, rootless_uid, rootless_gid)?;
 
     assert_eq!(
-        fs::metadata(&import_export).unwrap().permissions().mode() & 0o777,
+        fs::metadata(&import_export)?.permissions().mode() & 0o777,
         0o710
     );
     // A dedicated run root above the sockets root always carries the grant,
     // so binding the API socket below it later keeps that mode.
-    assert_eq!(
-        fs::metadata(&run).unwrap().permissions().mode() & 0o777,
-        0o710
-    );
+    assert_eq!(fs::metadata(&run)?.permissions().mode() & 0o777, 0o710);
     assert_eq!(
         super::runtime_paths::private_run_ancestor(&config),
         Some(run.clone())
     );
-    crate::io::ownership::secure_private_dir_keeping_traversal(&run).unwrap();
-    assert_eq!(
-        fs::metadata(&run).unwrap().permissions().mode() & 0o777,
-        0o710
-    );
+    crate::io::ownership::secure_private_dir_keeping_traversal(&run)?;
+    assert_eq!(fs::metadata(&run)?.permissions().mode() & 0o777, 0o710);
 
     // Shared or protected run roots are never re-moded, nor is a run root
     // that is not above the sockets root.
@@ -794,12 +818,11 @@ fn rootless_podman_traversal_prepares_import_export_and_keeps_job_sandboxes_priv
     assert_eq!(super::runtime_paths::private_run_ancestor(&elsewhere), None);
 
     let sandbox = import_export.join(".dbe-shared-restore-00000000000040008000000000000001");
-    crate::io::files::ensure_private_dir(&sandbox).unwrap();
-    assert_eq!(
-        fs::metadata(&sandbox).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
-    check_rootless_path_access(&sandbox, rootless_uid, rootless_gid).unwrap();
+    crate::io::files::ensure_private_dir(&sandbox)?;
+    assert_eq!(fs::metadata(&sandbox)?.permissions().mode() & 0o777, 0o700);
+    check_rootless_path_access(&sandbox, rootless_uid, rootless_gid)?;
+
+    Ok(())
 }
 
 #[test]

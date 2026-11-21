@@ -653,6 +653,8 @@ impl PeakBaseline {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     #[tokio::test]
@@ -685,7 +687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clickhouse_preparation_only_marks_the_pool_prepared() {
+    async fn clickhouse_preparation_only_marks_the_pool_prepared() -> anyhow::Result<()> {
         let (state, _directory) =
             crate::subsystems::test_support::database(Default::default()).await;
         let runtime = test_runtime(Protocol::Clickhouse);
@@ -695,7 +697,7 @@ mod tests {
         pool.clickhouse_checkpoint = Some(42);
         pool.failures = 3;
 
-        prepare_pool(&state, &runtime, &mut pool).await.unwrap();
+        prepare_pool(&state, &runtime, &mut pool).await?;
 
         assert!(pool.prepared);
         assert_eq!(
@@ -707,6 +709,8 @@ mod tests {
         );
         assert_eq!(pool.clickhouse_checkpoint, Some(42));
         assert_eq!(pool.failures, 3);
+
+        Ok(())
     }
 
     #[test]
@@ -900,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn clickhouse_tenant_churn_does_not_hide_an_existing_tenants_interval() {
+    fn clickhouse_tenant_churn_does_not_hide_an_existing_tenants_interval() -> anyhow::Result<()> {
         let capabilities = Capabilities {
             cpu: true,
             memory: true,
@@ -935,7 +939,9 @@ mod tests {
             SampleMode::Interval,
             capabilities,
             totals,
-            pool.baselines.get_mut("tenant-a").unwrap(),
+            pool.baselines
+                .get_mut("tenant-a")
+                .context("missing tenant-a entry")?,
             &tenant_a.username,
             &tenant_a.created_at,
         );
@@ -955,6 +961,8 @@ mod tests {
             b,
             (Some(0), Some(0), Some(OperationCounts::default()), false)
         );
+
+        Ok(())
     }
 
     #[test]
