@@ -122,7 +122,13 @@ pub(super) enum Job {
         backup_id: String,
         reason: String,
     },
-    Reveal(String),
+    Reveal {
+        instance_id: String,
+        protocol: Protocol,
+        host: String,
+        port: u16,
+        database: String,
+    },
     Sample(Option<String>),
 }
 
@@ -135,7 +141,7 @@ impl Job {
             Self::Delete { instance_id, .. } => format!("deleting {instance_id}"),
             Self::Backup(id, mode) => format!("{} backup of {id}", mode.as_str()),
             Self::Restore { instance_id, .. } => format!("restoring {instance_id}"),
-            Self::Reveal(_) | Self::Sample(_) => return None,
+            Self::Reveal { .. } | Self::Sample(_) => return None,
         })
     }
 }
@@ -163,10 +169,18 @@ pub(super) enum Outcome {
     },
 }
 
+fn listed_instance<'a>(instances: &'a [Instance], id: &str) -> Option<&'a Instance> {
+    let index = instances
+        .binary_search_by(|instance| instance.instance_id.as_str().cmp(id))
+        .ok()?;
+    instances.get(index)
+}
+
 pub(super) struct App {
     pub system: Option<SystemInfo>,
     pub api_url: String,
     pub public_host: String,
+    /// Sorted by instance ID whenever a refresh completes.
     pub instances: Vec<Instance>,
     pub loaded: bool,
     pub selected: usize,
@@ -334,12 +348,7 @@ impl App {
         jobs.extend(
             self.creating
                 .iter()
-                .filter(|id| {
-                    !self
-                        .instances
-                        .iter()
-                        .any(|instance| &instance.instance_id == *id)
-                })
+                .filter(|id| listed_instance(&self.instances, id).is_none())
                 .map(|id| Job::Progress(id.clone())),
         );
         jobs
@@ -377,11 +386,8 @@ impl App {
                 self.loaded = true;
                 self.refreshing = false;
                 self.refresh_error = None;
-                self.progress.retain(|id, _| {
-                    self.instances
-                        .iter()
-                        .any(|instance| &instance.instance_id == id)
-                });
+                self.progress
+                    .retain(|id, _| listed_instance(&self.instances, id).is_some());
                 if let Some(id) = keep
                     && let Some(index) = self
                         .visible()
@@ -393,10 +399,7 @@ impl App {
                 self.clamp_selection();
             }
             Outcome::Progress(id, status) => {
-                let listed = self
-                    .instances
-                    .iter()
-                    .any(|instance| instance.instance_id == id);
+                let listed = listed_instance(&self.instances, &id).is_some();
                 if !listed && self.creating.contains(&id) {
                     self.finish_creation(&id, &status);
                 } else {
@@ -529,9 +532,10 @@ impl App {
     }
 
     fn on_instance_action(&mut self, key: KeyEvent) -> Vec<Job> {
-        let Some(id) = self.current_id() else {
+        let Some(instance) = self.current() else {
             return Vec::new();
         };
+        let id = instance.instance_id.clone();
         match key.code {
             KeyCode::Char('s') => return vec![Job::Power(id, PowerAction::Start)],
             KeyCode::Char('x') => {
@@ -565,7 +569,15 @@ impl App {
                 self.backup_selected = 0;
                 return vec![Job::Backups(id)];
             }
-            KeyCode::Char('p') | KeyCode::Enter => return vec![Job::Reveal(id)],
+            KeyCode::Char('p') | KeyCode::Enter => {
+                return vec![Job::Reveal {
+                    instance_id: id,
+                    protocol: instance.protocol,
+                    host: instance.public.host.clone(),
+                    port: instance.public.port,
+                    database: instance.database.name.clone(),
+                }];
+            }
             _ => {}
         }
         Vec::new()

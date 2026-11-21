@@ -4,6 +4,14 @@ use crate::server::monitoring::{ActivityBucket, OperationCounts};
 
 pub const MAX_HISTORY_ROWS: u16 = 1_440;
 
+const BUCKET_COLUMNS: &str =
+    "instance_id, instance_generation, bucket_start_unix, duration_seconds,
+    stats_epoch, gap, operations_observed,
+    accepted_read, accepted_write, accepted_ddl, accepted_other,
+    rejected_read, rejected_write, rejected_ddl, rejected_other,
+    active_connections, opened_connections, rx_bytes, tx_bytes,
+    cpu_time_micros, peak_query_memory_bytes";
+
 #[derive(Debug, Clone)]
 pub struct ActivityRepository {
     pool: SqlitePool,
@@ -21,26 +29,47 @@ impl ActivityRepository {
             return Ok(());
         }
 
+        // Keep each statement below 999 bound parameters, including the input position.
         let mut transaction = self.pool.begin().await?;
-        for bucket in buckets {
-            sqlx::query(
-                r#"
-                INSERT INTO tenant_activity_buckets (
-                    instance_id, instance_generation, bucket_start_unix, duration_seconds,
-                    stats_epoch, gap, operations_observed,
-                    accepted_read, accepted_write, accepted_ddl, accepted_other,
-                    rejected_read, rejected_write, rejected_ddl, rejected_other,
-                    active_connections, opened_connections, rx_bytes, tx_bytes,
-                    cpu_time_micros, peak_query_memory_bytes
-                )
-                SELECT
-                    ?1, ?2, ?3, ?4, ?5, ?6,
-                    ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                    ?16, ?17, ?18, ?19, ?20, ?21
+        for batch in buckets.chunks(32) {
+            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+                "WITH incoming (position, {BUCKET_COLUMNS}) AS ("
+            ));
+            query.push_values(batch.iter().enumerate(), |mut row, (position, bucket)| {
+                row.push_bind(position as i64)
+                    .push_bind(&bucket.instance_id)
+                    .push_bind(&bucket.instance_generation)
+                    .push_bind(bucket.bucket_start_unix)
+                    .push_bind(i64::from(bucket.duration_seconds))
+                    .push_bind(&bucket.stats_epoch)
+                    .push_bind(bucket.gap)
+                    .push_bind(bucket.operations_observed)
+                    .push_bind(clamp_to_i64(bucket.accepted.read))
+                    .push_bind(clamp_to_i64(bucket.accepted.write))
+                    .push_bind(clamp_to_i64(bucket.accepted.ddl))
+                    .push_bind(clamp_to_i64(bucket.accepted.other))
+                    .push_bind(clamp_to_i64(bucket.rejected.read))
+                    .push_bind(clamp_to_i64(bucket.rejected.write))
+                    .push_bind(clamp_to_i64(bucket.rejected.ddl))
+                    .push_bind(clamp_to_i64(bucket.rejected.other))
+                    .push_bind(clamp_to_i64(bucket.active_connections))
+                    .push_bind(clamp_to_i64(bucket.opened_connections))
+                    .push_bind(clamp_to_i64(bucket.rx_bytes))
+                    .push_bind(clamp_to_i64(bucket.tx_bytes))
+                    .push_bind(bucket.cpu_time_micros.map(clamp_to_i64))
+                    .push_bind(bucket.peak_query_memory_bytes.map(clamp_to_i64));
+            });
+            // Apply repeated keys in input order so the last sample wins on replay.
+            query.push(format_args!(
+                r#")
+                INSERT INTO tenant_activity_buckets ({BUCKET_COLUMNS})
+                SELECT {BUCKET_COLUMNS} FROM incoming
                 WHERE EXISTS (
                     SELECT 1 FROM instance_metadata
-                    WHERE instance_id = ?1 AND created_at = ?2
+                    WHERE instance_id = incoming.instance_id
+                      AND created_at = incoming.instance_generation
                 )
+                ORDER BY position
                 ON CONFLICT(instance_id, instance_generation, bucket_start_unix) DO UPDATE SET
                     duration_seconds = excluded.duration_seconds,
                     stats_epoch = excluded.stats_epoch,
@@ -60,33 +89,10 @@ impl ActivityRepository {
                     tx_bytes = excluded.tx_bytes,
                     cpu_time_micros = excluded.cpu_time_micros,
                     peak_query_memory_bytes = excluded.peak_query_memory_bytes
-                "#,
-            )
-            .bind(&bucket.instance_id)
-            .bind(&bucket.instance_generation)
-            .bind(bucket.bucket_start_unix)
-            .bind(i64::from(bucket.duration_seconds))
-            .bind(&bucket.stats_epoch)
-            .bind(bucket.gap)
-            .bind(bucket.operations_observed)
-            .bind(clamp_to_i64(bucket.accepted.read))
-            .bind(clamp_to_i64(bucket.accepted.write))
-            .bind(clamp_to_i64(bucket.accepted.ddl))
-            .bind(clamp_to_i64(bucket.accepted.other))
-            .bind(clamp_to_i64(bucket.rejected.read))
-            .bind(clamp_to_i64(bucket.rejected.write))
-            .bind(clamp_to_i64(bucket.rejected.ddl))
-            .bind(clamp_to_i64(bucket.rejected.other))
-            .bind(clamp_to_i64(bucket.active_connections))
-            .bind(clamp_to_i64(bucket.opened_connections))
-            .bind(clamp_to_i64(bucket.rx_bytes))
-            .bind(clamp_to_i64(bucket.tx_bytes))
-            .bind(bucket.cpu_time_micros.map(clamp_to_i64))
-            .bind(bucket.peak_query_memory_bytes.map(clamp_to_i64))
-            .execute(&mut *transaction)
-            .await?;
+                "#
+            ));
+            query.build().execute(&mut *transaction).await?;
         }
-
         transaction.commit().await?;
         Ok(())
     }
@@ -101,28 +107,22 @@ impl ActivityRepository {
         limit: u16,
     ) -> Result<Vec<ActivityBucket>, ActivityStorageError> {
         let limit = limit.clamp(1, MAX_HISTORY_ROWS);
-        let rows = sqlx::query(
-            r#"
-            SELECT instance_id, instance_generation, bucket_start_unix, duration_seconds,
-                   stats_epoch, gap, operations_observed,
-                   accepted_read, accepted_write, accepted_ddl, accepted_other,
-                   rejected_read, rejected_write, rejected_ddl, rejected_other,
-                   active_connections, opened_connections, rx_bytes, tx_bytes,
-                   cpu_time_micros, peak_query_memory_bytes
-            FROM tenant_activity_buckets
-            WHERE instance_id = ?1
-              AND instance_generation = ?2
-              AND (?3 IS NULL OR bucket_start_unix < ?3)
-            ORDER BY bucket_start_unix DESC
-            LIMIT ?4
-            "#,
-        )
-        .bind(instance_id)
-        .bind(instance_generation)
-        .bind(before)
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await?;
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+            "SELECT {BUCKET_COLUMNS} FROM tenant_activity_buckets WHERE instance_id = "
+        ));
+        query
+            .push_bind(instance_id)
+            .push(" AND instance_generation = ")
+            .push_bind(instance_generation);
+        if let Some(before) = before {
+            query.push(" AND bucket_start_unix < ").push_bind(before);
+        }
+        let rows = query
+            .push(" ORDER BY bucket_start_unix DESC LIMIT ")
+            .push_bind(i64::from(limit))
+            .build()
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut buckets = rows
             .into_iter()
@@ -271,7 +271,9 @@ mod tests {
         let mut first = bucket("tenant-a", 60);
         repository.save(&[first.clone()]).await?;
         first.accepted.read = 9;
-        repository.save(&[first.clone(), first.clone()]).await?;
+        let mut earlier = first.clone();
+        earlier.accepted.read = 3;
+        repository.save(&[earlier, first]).await?;
         repository
             .save(&[bucket("tenant-a", 120), bucket("tenant-a", 180)])
             .await?;
@@ -287,6 +289,22 @@ mod tests {
         assert_eq!(history[0].cpu_time_micros, None);
         assert_eq!(history[0].peak_query_memory_bytes, Some(0));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn later_chunk_failure_rolls_back_the_whole_batch() -> anyhow::Result<()> {
+        let (pool, repository) = repository().await;
+        seed(&pool, "tenant-a", "generation-a").await;
+        let mut samples: Vec<_> = (0..64).map(|n| bucket("tenant-a", n * 60)).collect();
+        samples[40].duration_seconds = 0;
+        assert!(repository.save(&samples).await.is_err());
+        assert!(
+            repository
+                .history("tenant-a", "generation-a", None, 1)
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 

@@ -166,21 +166,15 @@ impl Runner {
         let client = self.client.clone();
         let config = Arc::clone(&self.config);
         let sender = self.sender.clone();
-        let instances = app.instances.clone();
         tokio::spawn(async move {
-            let outcome = execute(&client, &config, &instances, job).await;
+            let outcome = execute(&client, &config, job).await;
             // The console may have quit; a dropped result is fine.
             let _ = sender.send(outcome);
         });
     }
 }
 
-async fn execute(
-    client: &ApiClient,
-    config: &Config,
-    instances: &[api::Instance],
-    job: Job,
-) -> Outcome {
+async fn execute(client: &ApiClient, config: &Config, job: Job) -> Outcome {
     let label = job.label().unwrap_or_default();
     let done = |result: anyhow::Result<()>, refresh: bool| match result {
         Ok(()) => Outcome::Done {
@@ -252,31 +246,28 @@ async fn execute(
                 usage,
             }
         }
-        Job::Reveal(id) => {
-            let Some(instance) = instances.iter().find(|instance| instance.instance_id == id)
-            else {
-                return Outcome::Failed {
-                    label: format!("credentials of {id}"),
-                    error: "the instance is no longer listed".to_string(),
-                };
-            };
-            match credentials::reveal(config, &id).await {
-                Ok(revealed) => Outcome::Revealed(Box::new(Revealed {
-                    instance_id: id,
-                    protocol: instance.protocol,
-                    host: instance.public.host.clone(),
-                    port: instance.public.port,
-                    database: instance.database.name.clone(),
-                    username: revealed.username,
-                    password: revealed.password,
-                    admin: revealed.admin,
-                    shown_at: std::time::Instant::now(),
-                })),
-                Err(error) => Outcome::Failed {
-                    label: format!("credentials of {id}"),
-                    error: format!("{error:#}"),
-                },
-            }
-        }
+        Job::Reveal {
+            instance_id,
+            protocol,
+            host,
+            port,
+            database,
+        } => match credentials::reveal(config, &instance_id).await {
+            Ok(revealed) => Outcome::Revealed(Box::new(Revealed {
+                instance_id,
+                protocol,
+                host,
+                port,
+                database,
+                username: revealed.username,
+                password: revealed.password,
+                admin: revealed.admin,
+                shown_at: std::time::Instant::now(),
+            })),
+            Err(error) => Outcome::Failed {
+                label: format!("credentials of {instance_id}"),
+                error: format!("{error:#}"),
+            },
+        },
     }
 }
