@@ -359,13 +359,13 @@ struct RuntimeUsage {
 }
 
 /// Dedicated instances still produce one target each because their runtime ID is their instance ID.
-pub(super) fn runtime_targets(
-    instances: &[InstanceMetadata],
-    runtimes: &[EngineRuntime],
+pub(super) fn runtime_targets<'a>(
+    instances: impl IntoIterator<Item = &'a InstanceMetadata>,
+    runtimes: Vec<(String, Protocol)>,
 ) -> HashMap<String, RuntimeSampleTarget> {
     let mut targets = HashMap::<String, RuntimeSampleTarget>::new();
     let mut invalid = HashSet::new();
-    for metadata in instances.iter().filter(|metadata| {
+    for metadata in instances.into_iter().filter(|metadata| {
         matches!(
             metadata.status,
             InstanceStatus::Booting | InstanceStatus::Running
@@ -396,35 +396,24 @@ pub(super) fn runtime_targets(
             },
         );
     }
-    for runtime in runtimes.iter().filter(|runtime| {
-        runtime.deployment_mode == DeploymentMode::Shared
-            && matches!(
-                runtime.status,
-                EngineRuntimeStatus::Booting | EngineRuntimeStatus::Running
-            )
-    }) {
-        if invalid.contains(&runtime.runtime_id) {
+    for (runtime_id, protocol) in runtimes {
+        if invalid.contains(&runtime_id) {
             continue;
         }
-        if let Some(existing) = targets.get(&runtime.runtime_id) {
-            if existing.protocol != runtime.protocol {
+        if let Some(existing) = targets.get(&runtime_id) {
+            if existing.protocol != protocol {
                 tracing::error!(
-                    runtime_id = %runtime.runtime_id,
+                    runtime_id = %runtime_id,
                     expected_protocol = %existing.protocol,
-                    runtime_protocol = %runtime.protocol,
+                    runtime_protocol = %protocol,
                     "shared runtime and tenant metadata disagree on protocol; ignoring the invalid target"
                 );
-                targets.remove(&runtime.runtime_id);
-                invalid.insert(runtime.runtime_id.clone());
+                targets.remove(&runtime_id);
+                invalid.insert(runtime_id);
             }
             continue;
         }
-        targets.insert(
-            runtime.runtime_id.clone(),
-            RuntimeSampleTarget {
-                protocol: runtime.protocol,
-            },
-        );
+        targets.insert(runtime_id, RuntimeSampleTarget { protocol });
     }
     targets
 }
@@ -613,8 +602,16 @@ struct RuntimeStatsTask {
 }
 
 async fn sync_tasks(state: &AppState, tasks: &mut HashMap<String, RuntimeStatsTask>) {
-    let instances = state.instances.list().await;
-    let runtimes = match state.placements.list().await {
+    let instances = state
+        .instances
+        .snapshots_matching(|meta| {
+            matches!(
+                meta.status,
+                InstanceStatus::Running | InstanceStatus::Booting
+            )
+        })
+        .await;
+    let runtimes = match state.placements.active_shared_runtime_ids().await {
         Ok(runtimes) => runtimes,
         Err(error) => {
             tracing::warn!(
@@ -624,7 +621,7 @@ async fn sync_tasks(state: &AppState, tasks: &mut HashMap<String, RuntimeStatsTa
             Vec::new()
         }
     };
-    let desired = runtime_targets(&instances, &runtimes);
+    let desired = runtime_targets(instances.iter().map(AsRef::as_ref), runtimes);
     let finished_or_stopped = tasks
         .iter()
         .filter_map(|(runtime_id, task)| {

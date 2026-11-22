@@ -16,6 +16,8 @@ use crate::server::placement::DeploymentMode;
 use crate::utils::limits::mib_to_bytes;
 use axum::extract::State;
 use futures::{StreamExt, TryStreamExt};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::OnceCell;
 
 #[utoipa::path(
     get,
@@ -30,10 +32,32 @@ pub async fn list_resources(
     auth: ApiRequestContext,
 ) -> ApiResult<Vec<ResourceReport>> {
     auth.require_scope(scopes::RESOURCES_ADMIN)?;
-    let reports = futures::stream::iter(state.instances.list().await)
-        .map(|metadata| {
-            let state = state.clone();
-            async move { resource_report(&state, &metadata, ResourceView::Admin).await }
+    let instances = state.instances.snapshots_matching(|_| true).await;
+    let mut capacities = HashMap::new();
+    let reports = futures::stream::iter(instances)
+        .map(|meta| {
+            let state = &state;
+            let cell = (meta.deployment_mode == DeploymentMode::Shared).then(|| {
+                let key = (meta.runtime_id().to_owned(), meta.protocol);
+                Arc::clone(
+                    capacities
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(OnceCell::new())),
+                )
+            });
+            async move {
+                let capacity = match cell {
+                    Some(cell) => Some(
+                        *cell
+                            .get_or_try_init(|| {
+                                pools::load_pool_capacity(state, meta.runtime_id(), meta.protocol)
+                            })
+                            .await?,
+                    ),
+                    None => None,
+                };
+                build_resource_report(state, &meta, ResourceView::Admin, capacity).await
+            }
         })
         .buffer_unordered(RESOURCE_FANOUT_LIMIT)
         .try_collect()
@@ -64,18 +88,22 @@ pub async fn node_resource_summary(
             "failed to load runtime allocation",
         ))?;
     let allocations = sampler::summarize_allocations(&instances, &runtimes);
-    let resource_reports = futures::stream::iter(instances.iter().cloned())
-        .map(|metadata| {
-            let state = state.clone();
-            async move {
-                (
-                    metadata.deployment_mode,
-                    resource_report(&state, &metadata, ResourceView::Tenant).await,
-                )
-            }
-        })
-        .buffer_unordered(RESOURCE_FANOUT_LIMIT)
-        .collect::<Vec<_>>();
+    let resource_reports = futures::stream::iter(
+        instances
+            .into_iter()
+            .filter(|meta| meta.deployment_mode == DeploymentMode::Dedicated),
+    )
+    .map(|metadata| {
+        let state = state.clone();
+        async move {
+            (
+                metadata.deployment_mode,
+                resource_report(&state, &metadata).await,
+            )
+        }
+    })
+    .buffer_unordered(RESOURCE_FANOUT_LIMIT)
+    .collect::<Vec<_>>();
     let shared_runtime_usage = sampler::sample_shared_runtime_usage(&state, &runtimes);
     let volumes_root = state.config.paths.volumes_root();
     let (host_cpu, host_memory, host_disk, resource_reports, shared_runtime_usage) = tokio::join!(
@@ -148,23 +176,24 @@ pub async fn instance_resources(
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    Ok(ApiResponse::ok(
-        resource_report(&state, &metadata, ResourceView::Tenant).await?,
-    ))
+    Ok(ApiResponse::ok(resource_report(&state, &metadata).await?))
 }
 
 pub(crate) async fn resource_report(
     state: &AppState,
     metadata: &InstanceMetadata,
+) -> Result<ResourceReport, ApiError> {
+    build_resource_report(state, metadata, ResourceView::Tenant, None).await
+}
+
+async fn build_resource_report(
+    state: &AppState,
+    metadata: &InstanceMetadata,
     view: ResourceView,
+    pool_capacity: Option<pools::PoolCapacity>,
 ) -> Result<ResourceReport, ApiError> {
     let runtime_id = metadata.runtime_id();
     let shared = metadata.deployment_mode == DeploymentMode::Shared;
-    let pool_capacity = if view == ResourceView::Admin {
-        pools::load_pool_capacity(state, metadata).await?
-    } else {
-        None
-    };
     let stats = state.resource_cache.runtime_stats(runtime_id).await;
     let (network_rx_bytes, network_tx_bytes) = state
         .resource_cache

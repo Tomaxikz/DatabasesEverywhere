@@ -19,9 +19,7 @@ use crate::routes::http::router::AppState;
 use crate::server::metadata::InstanceMetadata;
 use crate::subsystems::instances::progress::InstallProgress;
 use crate::subsystems::monitoring::activity::{TenantActivity, tenant_activity};
-use crate::subsystems::monitoring::resources::{
-    ResourceReport, ResourceScope, ResourceView, resource_report,
-};
+use crate::subsystems::monitoring::resources::{ResourceReport, ResourceScope, resource_report};
 use crate::utils::time::now_unix;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -245,7 +243,7 @@ pub(super) async fn monitoring_instance(
 ) -> MonitoringInstance {
     let instance_generation = metadata.created_at.clone();
     let activity = tenant_activity(state, &metadata).await;
-    match resource_report(state, &metadata, ResourceView::Tenant).await {
+    match resource_report(state, &metadata).await {
         Ok(resources) => MonitoringInstance {
             instance_id: metadata.instance_id,
             instance_generation,

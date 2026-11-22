@@ -56,7 +56,13 @@ pub(super) async fn usage(state: &AppState, metadata: &InstanceMetadata) -> Resu
         let runtime = load_runtime(state, metadata.runtime_id(), metadata.protocol).await?;
         refresh_hard_usage(state, &runtime, metadata, SAMPLE_STALE_AFTER).await?;
     } else {
-        sample_soft_runtime(state, metadata.runtime_id(), metadata.protocol).await?;
+        sample_soft_runtime(
+            state,
+            metadata.runtime_id(),
+            metadata.protocol,
+            Some(&metadata.instance_id),
+        )
+        .await?;
     }
     match state
         .resource_cache
@@ -186,17 +192,29 @@ async fn sample_runtime(
         .await;
     }
 
-    sample_soft_runtime(state, runtime_id, protocol).await
+    sample_soft_runtime(state, runtime_id, protocol, None).await
 }
 
 async fn sample_soft_runtime(
     state: &AppState,
     runtime_id: &str,
     protocol: crate::databases::protocol::Protocol,
+    requested_instance: Option<&str>,
 ) -> Result<(), String> {
     // Membership may have changed since grouping. Hold the lifecycle lock from
     // this fresh pool lookup through measurement and enforcement.
     let _runtime_operation = state.instance_locks.lock(runtime_id).await;
+    // Another caller may have refreshed this pool while this request waited.
+    // Periodic quota checks always take a new measurement.
+    if let Some(id) = requested_instance
+        && state
+            .resource_cache
+            .cached_disk_usage(id)
+            .await
+            .is_some_and(|sample| sample.sampled_at.elapsed() < SAMPLE_STALE_AFTER)
+    {
+        return Ok(());
+    }
     let tenants = state
         .instances
         .shared_runtime_members(runtime_id)
@@ -615,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn stopped_pool_measurements_stay_strict_but_reporting_is_nullable() -> anyhow::Result<()>
     {
-        use super::super::{ResourceView, resource_report};
+        use super::super::resource_report;
         let (state, _dir) = crate::subsystems::test_support::database(Default::default()).await;
         let mut runtime = crate::server::placement::test_support::runtime(
             "pool-a",
@@ -628,7 +646,7 @@ mod tests {
         tenant.limits.disk_enforced = false;
         state.instances.upsert_fenced(tenant.clone()).await;
         assert!(usage(&state, &tenant).await.is_err());
-        let report = resource_report(&state, &tenant, ResourceView::Tenant).await?;
+        let report = resource_report(&state, &tenant).await?;
         assert_eq!(report.disk.used_bytes, None);
         assert!(state.instances.routes_fenced(&tenant.instance_id).await);
 
@@ -643,11 +661,36 @@ mod tests {
                     },
                 )
                 .await;
-            let report = resource_report(&state, &tenant, ResourceView::Tenant).await?;
+            let report = resource_report(&state, &tenant).await?;
             assert_eq!(report.disk.used_bytes, expected);
         }
         assert!(usage(&state, &tenant).await.is_err());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waiting_tenant_read_reuses_pool_refresh_but_periodic_sampling_still_runs()
+    -> anyhow::Result<()> {
+        let (state, _dir) = crate::subsystems::test_support::database(Default::default()).await;
+        let mut tenant = crate::server::test_support::shared_metadata();
+        tenant.limits.disk_enforced = false;
+        state.instances.upsert(tenant.clone()).await;
+
+        let guard = state.instance_locks.lock(tenant.runtime_id()).await;
+        let read = usage(&state, &tenant);
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
+        store_sample(&state, &tenant, 42).await;
+        drop(guard);
+
+        assert_eq!(read.await.map_err(anyhow::Error::msg)?, 42);
+        // The fixture has no physical runtime. A forced sample must attempt to load it.
+        assert!(
+            sample_soft_runtime(&state, tenant.runtime_id(), tenant.protocol, None)
+                .await
+                .is_err()
+        );
         Ok(())
     }
 

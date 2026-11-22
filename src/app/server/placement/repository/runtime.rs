@@ -48,6 +48,20 @@ impl PlacementRepository {
         rows.iter().map(|row| self.read_runtime(row)).collect()
     }
 
+    pub(crate) async fn active_shared_runtime_ids(
+        &self,
+    ) -> Result<Vec<(String, Protocol)>, PlacementRepositoryError> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT runtime_id, protocol FROM engine_runtimes
+             WHERE deployment_mode = 'shared' AND status IN ('booting', 'running')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, protocol)| Ok((id, parse_protocol(protocol)?)))
+            .collect()
+    }
+
     pub async fn get(
         &self,
         runtime_id: &str,

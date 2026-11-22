@@ -7,8 +7,8 @@ use tokio::time::Instant;
 use super::reports::PoolUsageReport;
 use super::{
     ApiError, ApiRequestContext, ApiResponse, ApiResult, AppState, CachedRuntimeStats,
-    DISK_REFRESH_INTERVAL, InstanceMetadata, InstanceStatus, Protocol, RUNTIME_STATS_STALE_AFTER,
-    ResourceView, mib_to_bytes, resource_report,
+    DISK_REFRESH_INTERVAL, InstanceStatus, Protocol, RUNTIME_STATS_STALE_AFTER, ResourceView,
+    mib_to_bytes, resource_report,
     sampler::{
         RuntimeStatsSnapshot, SharedDiskUsage, SharedDiskUsageSource, sample_shared_runtime_usage,
     },
@@ -183,24 +183,22 @@ fn capacity_unavailable() -> ApiError {
 
 pub(super) async fn load_pool_capacity(
     state: &AppState,
-    metadata: &InstanceMetadata,
-) -> Result<Option<PoolCapacity>, ApiError> {
-    if metadata.deployment_mode == DeploymentMode::Dedicated {
-        return Ok(None);
-    }
+    runtime_id: &str,
+    protocol: Protocol,
+) -> Result<PoolCapacity, ApiError> {
     let runtime = state
         .placements
-        .get(metadata.runtime_id())
+        .get(runtime_id)
         .await
         .map_err(|_| capacity_unavailable())?
         .ok_or_else(capacity_unavailable)?;
-    if runtime.deployment_mode != DeploymentMode::Shared || runtime.protocol != metadata.protocol {
+    if runtime.deployment_mode != DeploymentMode::Shared || runtime.protocol != protocol {
         return Err(capacity_unavailable());
     }
-    Ok(Some(PoolCapacity {
+    Ok(PoolCapacity {
         cpu_limit_cores: runtime.limits.cpu_cores,
         memory_limit_bytes: mib_to_bytes(runtime.limits.memory_mib),
-    }))
+    })
 }
 
 #[utoipa::path(
@@ -268,7 +266,7 @@ pub(crate) async fn list_pool_tenants(
     let members = crate::subsystems::pools::tenants(&state, &runtime).await?;
     let mut tenants = Vec::with_capacity(members.len());
     for metadata in members {
-        let resources = resource_report(&state, &metadata, ResourceView::Tenant).await?;
+        let resources = resource_report(&state, &metadata).await?;
         tenants.push(SharedPoolTenant {
             instance_id: metadata.instance_id,
             database: metadata.database.name,
@@ -629,6 +627,7 @@ impl From<SharedDiskUsageSource> for PoolMetricSource {
 
 #[cfg(test)]
 mod tests {
+    use crate::server::metadata::InstanceMetadata;
     use anyhow::Context as _;
 
     use std::time::Duration;

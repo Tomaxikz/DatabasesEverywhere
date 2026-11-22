@@ -537,7 +537,7 @@ fn runtime_sample_targets_follow_runtimes_not_tenants() {
     second.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     second.runtime_id = "mysql_pool_one".to_string();
 
-    let targets = sampler::runtime_targets(&[first, second], &[]);
+    let targets = sampler::runtime_targets(&[first, second], vec![]);
 
     assert_eq!(targets.len(), 1);
     assert_eq!(
@@ -554,7 +554,7 @@ fn runtime_sample_targets_follow_runtimes_not_tenants() {
             InstanceLimits::default(),
         )
     });
-    let targets = sampler::runtime_targets(&dedicated, &[]);
+    let targets = sampler::runtime_targets(&dedicated, vec![]);
     assert_eq!(targets.len(), 2);
     assert!(targets.contains_key("dedicated_one"));
     assert!(targets.contains_key("dedicated_two"));
@@ -567,7 +567,8 @@ fn runtime_sample_targets_follow_runtimes_not_tenants() {
     stopped.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     stopped.runtime_id = "mysql_pool_idle".to_string();
     let runtime = shared_runtime("mysql_pool_idle", Protocol::Mysql);
-    let targets = sampler::runtime_targets(&[stopped], &[runtime]);
+    let targets =
+        sampler::runtime_targets(&[stopped], vec![(runtime.runtime_id, runtime.protocol)]);
     assert_eq!(
         targets.get("mysql_pool_idle"),
         Some(&sampler::RuntimeSampleTarget {
