@@ -206,3 +206,14 @@ If the version tag already points elsewhere, the workflow archives the original
 tag at `archive/releases/<version>/<old-tag-object-id>` and moves the version
 tag after the release checks pass. It updates the existing release and its Linux
 binaries. Draft runs require a new version or a tag on the selected commit.
+
+GitHub can require `Workflows: write` to create an archive tag on a commit
+with older workflow files. For automatic archiving in that case, set
+`RELEASE_ARCHIVE_TOKEN` in the `production-release` environment to a
+fine-grained token scoped to this repository with `Contents: write` and
+`Workflows: write`. Only the archive push uses it. If publication later fails,
+the archive can remain and a retry reuses it.
+
+For a one-time recovery, an authorized maintainer can run the archive-only
+`git push` printed by the failed tag step, then rerun the failed job.
+The job checks the previous version tag before moving it.

@@ -96,7 +96,7 @@ security:
   remote_import:
     enabled: true
     # Plaintext source credentials are rejected unless this is explicitly
-    # enabled. TLS remains the default on every remote import request.
+    # enabled. Remote Qdrant sources with an API key always require TLS.
     allow_plaintext: false
     # Public addresses are accepted by default. A private RFC1918, ULA, or
     # carrier-grade NAT address is accepted only when its exact requested host

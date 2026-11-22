@@ -9,7 +9,7 @@
 
   <properties>
     <mysql.connector.version>26.7.0</mysql.connector.version>
-    <mariadb.connector.version>3.5.10</mariadb.connector.version>
+    <mariadb.connector.version>3.5.11</mariadb.connector.version>
     <hikari.version>7.1.0</hikari.version>
     <slf4j.version>2.0.19</slf4j.version>
   </properties>

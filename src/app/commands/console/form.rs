@@ -4,7 +4,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::api::{CreateLimits, CreateRequest};
-use crate::databases::protocol::Protocol;
+use crate::{
+    databases::protocol::Protocol, subsystems::instances::requests::validate_database_password,
+};
 
 pub(super) const CLI_PROJECT_ID: &str = "dbev-cli";
 const GENERATED_PASSWORD_LEN: usize = 24;
@@ -289,9 +291,8 @@ impl CreateForm {
             }
         }
         let password = self.value(Field::Password);
-        if password.is_empty() || password.contains(['\0', '\r', '\n']) {
-            return Err("Password must be non-empty and on one line".to_string());
-        }
+        validate_database_password(self.protocol(), &password)
+            .map_err(|error| error.to_string())?;
         let public_host = required(Field::PublicHost)?;
         let public_port = match text(Field::PublicPort) {
             port if port.is_empty() => None,

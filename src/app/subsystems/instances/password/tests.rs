@@ -11,7 +11,14 @@ use super::*;
 #[test]
 fn password_validation_rejects_empty_multiline_oversized_and_non_header_secrets() {
     assert!(validate_password(Protocol::Postgres, &SecretString::from("")).is_err());
-    assert!(validate_password(Protocol::Postgres, &SecretString::from("line1\nline2")).is_err());
+    assert!(validate_password(Protocol::Postgres, &SecretString::from("short")).is_err());
+    assert!(
+        validate_password(
+            Protocol::Postgres,
+            &SecretString::from("first line\nsecond line")
+        )
+        .is_err()
+    );
     assert!(
         validate_password(
             Protocol::Postgres,
@@ -20,7 +27,13 @@ fn password_validation_rejects_empty_multiline_oversized_and_non_header_secrets(
         .is_err()
     );
     assert!(validate_password(Protocol::Qdrant, &SecretString::from("valid-api-key")).is_ok());
-    assert!(validate_password(Protocol::Qdrant, &SecretString::from("invalid\u{7f}")).is_err());
+    assert!(
+        validate_password(
+            Protocol::Qdrant,
+            &SecretString::from("invalid api key\u{7f}")
+        )
+        .is_err()
+    );
 }
 
 #[test]

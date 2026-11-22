@@ -2480,7 +2480,7 @@ components:
           format: password
           writeOnly: true
           maxLength: 4096
-          minLength: 1
+          minLength: 12
           pattern: ^[^\u0000\r\n]+$
         public_host:
           type: string
@@ -4495,6 +4495,7 @@ components:
           - string
           - 'null'
           format: password
+          description: Remote Qdrant API key. Supplying a key requires TLS.
           writeOnly: true
           maxLength: 4096
       additionalProperties: false
@@ -4508,7 +4509,7 @@ components:
           format: password
           writeOnly: true
           maxLength: 4096
-          minLength: 1
+          minLength: 12
           pattern: ^[^\u0000\r\n]+$
       additionalProperties: false
     ResetInstancePasswordResponse:

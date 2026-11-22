@@ -77,6 +77,7 @@ pub struct RemoteImportRequest {
     #[serde(default)]
     #[schema(maximum = 4294967295_u64)]
     pub database_index: Option<u32>,
+    /// Remote Qdrant API key. Supplying a key requires TLS.
     #[serde(default)]
     #[schema(value_type = Option<String>, format = Password, max_length = 4096, write_only)]
     pub api_key: Option<SecretString>,
@@ -166,6 +167,12 @@ pub(crate) async fn validate_remote_source(
         request.database_index,
         request.api_key.as_ref(),
     )?;
+
+    if protocol == Protocol::Qdrant && request.api_key.is_some() && !request.tls {
+        return Err(ApiError::BadRequest(
+            "remote Qdrant imports with an API key require TLS".into(),
+        ));
+    }
 
     let endpoint_request = RemoteEndpointRequest {
         host: request.host,

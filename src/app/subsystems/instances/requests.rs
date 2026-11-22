@@ -15,6 +15,7 @@ use crate::{
     },
 };
 
+const MIN_PASSWORD_CHARACTERS: usize = 12;
 pub(crate) const MAX_PASSWORD_CHARACTERS: usize = 4 * 1024;
 const MAX_IDENTIFIER_LENGTH: usize = 63;
 const MAX_DISK_MIB: u64 = u64::MAX / (1024 * 1024);
@@ -38,7 +39,7 @@ pub struct CreateInstanceRequest {
     pub database: String,
     #[schema(example = "app_server_123")]
     pub username: String,
-    #[schema(format = Password, write_only, min_length = 1, max_length = 4096, pattern = r"^[^\u0000\r\n]+$")]
+    #[schema(format = Password, write_only, min_length = 12, max_length = 4096, pattern = r"^[^\u0000\r\n]+$")]
     pub password: String,
     #[schema(example = "db.example.com")]
     pub public_host: String,
@@ -163,12 +164,13 @@ pub(crate) fn validate_database_password(
     protocol: Protocol,
     password: &str,
 ) -> Result<(), ApiError> {
-    if password.is_empty() {
-        return Err(ApiError::BadRequest(
-            "password must not be empty".to_string(),
-        ));
+    let length = password.chars().count();
+    if length < MIN_PASSWORD_CHARACTERS {
+        return Err(ApiError::BadRequest(format!(
+            "password must be at least {MIN_PASSWORD_CHARACTERS} characters"
+        )));
     }
-    if password.chars().count() > MAX_PASSWORD_CHARACTERS {
+    if length > MAX_PASSWORD_CHARACTERS {
         return Err(ApiError::BadRequest(format!(
             "password must not exceed {MAX_PASSWORD_CHARACTERS} characters"
         )));
@@ -303,7 +305,7 @@ mod tests {
     fn shared_creation_requires_explicit_owner_and_disk_only_limits() -> anyhow::Result<()> {
         let valid = serde_json::json!({
             "instance_id":"tenant-a", "protocol":"mysql", "deployment_mode":"shared", "pool_id":"pool_test",
-            "database":"tenant_db", "username":"tenant_user", "password":"secret",
+            "database":"tenant_db", "username":"tenant_user", "password":"example passphrase",
             "public_host":"db.example.test", "server_id":"server-a", "limits":{"disk_mib":1024}
         });
         validate_create_request(&serde_json::from_value(valid.clone())?)?;
@@ -393,15 +395,19 @@ mod tests {
     #[test]
     fn create_password_validation_rejects_unsafe_values_for_every_protocol() {
         for protocol in Protocol::ALL {
-            assert!(validate_database_password(protocol, "").is_err());
-            assert!(validate_database_password(protocol, "line\nbreak").is_err());
-            assert!(validate_database_password(protocol, "nul\0byte").is_err());
+            assert!(validate_database_password(protocol, &"é".repeat(11)).is_err());
+            assert!(validate_database_password(protocol, "abcdefghijkl").is_ok());
+            assert!(
+                validate_database_password(protocol, &"x".repeat(MAX_PASSWORD_CHARACTERS)).is_ok()
+            );
+            assert!(validate_database_password(protocol, "password with\nbreak").is_err());
+            assert!(validate_database_password(protocol, "password with\0byte").is_err());
             assert!(
                 validate_database_password(protocol, &"x".repeat(MAX_PASSWORD_CHARACTERS + 1))
                     .is_err()
             );
         }
-        assert!(validate_database_password(Protocol::Qdrant, "bad\u{7f}header").is_err());
+        assert!(validate_database_password(Protocol::Qdrant, "invalid header\u{7f}").is_err());
         assert!(validate_database_password(Protocol::Postgres, "valid password").is_ok());
     }
 
@@ -435,7 +441,7 @@ mod tests {
             "protocol": "postgres",
             "database": "test_db",
             "username": "test_user",
-            "password": "secret",
+            "password": "example passphrase",
             "public_host": "127.0.0.1",
             "purge_stale_resources": true
         }))?;
@@ -452,7 +458,7 @@ mod tests {
             "protocol": "postgres",
             "database": "test_db",
             "username": "test_user",
-            "password": "secret",
+            "password": "example passphrase",
             "public_host": "127.0.0.1"
         }))?;
 
@@ -474,7 +480,7 @@ mod tests {
                 "limits": {"disk_mib": 1024},
                 "database": "test_db",
                 "username": "test_user",
-                "password": "secret",
+                "password": "example passphrase",
                 "public_host": "127.0.0.1"
             }))?;
 
@@ -512,7 +518,7 @@ mod tests {
                 "deployment_mode": "dedicated",
                 "database": "test_db",
                 "username": "test_user",
-                "password": "secret",
+                "password": "example passphrase",
                 "public_host": "127.0.0.1"
             }))?;
 
@@ -565,7 +571,7 @@ mod tests {
                 "limits": {"disk_mib": 1024},
                 "database": "test_db",
                 "username": "test_user",
-                "password": "secret",
+                "password": "example passphrase",
                 "public_host": "127.0.0.1"
             }))?;
             validate_create_request(&request)?;
@@ -598,7 +604,7 @@ mod tests {
                 "limits": if deployment_mode == DeploymentMode::Shared { Some(serde_json::json!({"disk_mib":1024})) } else { None },
                 "database": "dbe_control",
                 "username": "test_user",
-                "password": "secret",
+                "password": "example passphrase",
                 "public_host": "127.0.0.1"
             }))?;
 
@@ -621,7 +627,7 @@ mod tests {
                 "limits": {"disk_mib": 1024},
                 "database": database,
                 "username": "test_user",
-                "password": "secret",
+                "password": "example passphrase",
                 "public_host": "127.0.0.1"
             }))?;
 

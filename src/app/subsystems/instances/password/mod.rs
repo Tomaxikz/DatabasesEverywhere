@@ -54,7 +54,7 @@ use supervision::{
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResetInstancePasswordRequest {
-    #[schema(format = Password, write_only, min_length = 1, max_length = 4096, pattern = r"^[^\u0000\r\n]+$")]
+    #[schema(format = Password, write_only, min_length = 12, max_length = 4096, pattern = r"^[^\u0000\r\n]+$")]
     pub password: String,
 }
 

@@ -299,6 +299,26 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Historical commits can require Workflows write permission. Use the
+      # optional credential only for the archive, which does not trigger Release.
+      - name: Archive previous release tag
+        if: >-
+          github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+          needs.release-gate.outputs.draft != 'true' && needs.release-gate.outputs.previous_tag != '' &&
+          needs.release-gate.outputs.previous_tag != needs.release-gate.outputs.target_tag
+        working-directory: release-source
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
+          PREVIOUS_TAG: ${{ needs.release-gate.outputs.previous_tag }}
+          GH_TOKEN: ${{ secrets.RELEASE_ARCHIVE_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$GH_TOKEN" ]]; then
+            git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin \
+              "$PREVIOUS_TAG:refs/tags/archive/releases/$VERSION/$PREVIOUS_TAG"
+          fi
+
       - name: Publish version tag
         if: needs.release-gate.outputs.draft != 'true'
         working-directory: release-source
@@ -315,8 +335,13 @@ jobs:
           if [[ -n "$PREVIOUS_TAG" && "$PREVIOUS_TAG" != "$TARGET_TAG" ]]; then
             refs+=("$PREVIOUS_TAG:refs/tags/archive/releases/$VERSION/$PREVIOUS_TAG")
           fi
-          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push \
-            --atomic --force-with-lease="$ref:$PREVIOUS_TAG" origin "${refs[@]}"
+          if ! git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push \
+            --atomic --force-with-lease="$ref:$PREVIOUS_TAG" origin "${refs[@]}"; then
+            if (( ${#refs[@]} == 2 )); then
+              echo "If GitHub rejected the archive for missing workflows permission, configure RELEASE_ARCHIVE_TOKEN or push the archive tag with an authorized account: git push origin ${refs[1]}" >&2
+            fi
+            exit 1
+          fi
 
       - name: Create release
         id: create_release

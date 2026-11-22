@@ -104,6 +104,29 @@ fn mysql_family_database_names_follow_the_server_identifier_limit() {
     ));
 }
 
+#[tokio::test]
+async fn remote_qdrant_api_key_requires_tls_even_when_plaintext_is_allowed() -> anyhow::Result<()> {
+    let mut config = crate::config::Config::default();
+    config.security.remote_import.enabled = true;
+    config.security.remote_import.allow_plaintext = true;
+    let (state, _dir) = crate::subsystems::test_support::database(config).await;
+
+    let mut request: RemoteImportRequest = serde_json::from_value(serde_json::json!({
+        "host": "8.8.8.8",
+        "api_key": "sample-source-key"
+    }))?;
+    validate_remote_source(&state, Protocol::Qdrant, request.clone()).await?;
+    request.tls = false;
+    let error = validate_remote_source(&state, Protocol::Qdrant, request.clone())
+        .await
+        .expect_err("plaintext with a key must fail");
+    assert!(error.to_string().contains("require TLS"));
+    assert!(!error.to_string().contains("sample-source-key"));
+    request.api_key = None;
+    validate_remote_source(&state, Protocol::Qdrant, request).await?;
+    Ok(())
+}
+
 #[test]
 fn qdrant_api_key_must_be_a_valid_http_header_value() {
     let valid = SecretString::from("opaque-api-key_123".to_string());

@@ -44,7 +44,7 @@ impl QdrantHttp {
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(policy.connect_timeout_seconds))
             .timeout(Duration::from_secs(policy.operation_timeout_seconds))
-            .https_only(source.endpoint.tls);
+            .https_only(source.endpoint.tls || source.api_key.is_some());
         builder =
             builder.resolve_to_addrs(&source.endpoint.host, source.endpoint.addresses.as_slice());
         let client = builder
