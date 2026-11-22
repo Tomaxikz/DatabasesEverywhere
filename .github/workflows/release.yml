@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag, e.g. v1.0.0. Publishing from main updates an existing tag."
+        description: "Version, e.g. 1.0.0, v1.0.0, or V1.0.0. Publishing from main updates the tag."
         required: true
         type: string
       prerelease:
@@ -76,6 +76,9 @@ jobs:
           if [[ "$VERSION" == *$'\r'* || "$VERSION" == *$'\n'* ]]; then
             echo "version must not contain CR or LF characters" >&2
             exit 1
+          fi
+          if [[ "$RELEASE_EVENT" == workflow_dispatch ]]; then
+            VERSION="v${VERSION#[vV]}"
           fi
           if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
             echo "version must be a complete SemVer tag prefixed with v" >&2
