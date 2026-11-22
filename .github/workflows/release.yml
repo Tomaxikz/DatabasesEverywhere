@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag, e.g. v1.2.0 or v1.2.0-rc.1"
+        description: "Version tag, e.g. v1.0.0. Publishing from main updates an existing tag."
         required: true
         type: string
       prerelease:
@@ -51,6 +51,8 @@ jobs:
       version: ${{ steps.validate.outputs.version }}
       prerelease: ${{ steps.validate.outputs.prerelease }}
       draft: ${{ steps.validate.outputs.draft }}
+      previous_tag: ${{ steps.validate.outputs.previous_tag }}
+      target_tag: ${{ steps.validate.outputs.target_tag }}
     steps:
       - name: Checkout release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,6 +66,7 @@ jobs:
           VERSION: ${{ inputs.version || github.ref_name }}
           DRAFT: ${{ inputs.draft || false }}
           PRERELEASE: ${{ inputs.prerelease || false }}
+          RELEASE_EVENT: ${{ github.event_name }}
           RELEASE_REF: ${{ github.ref }}
           RELEASE_SHA: ${{ github.sha }}
         shell: bash
@@ -97,10 +100,15 @@ jobs:
               ;;
           esac
 
-          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
-            tag_commit="$(git rev-list -n 1 "$VERSION")"
-            if [[ "$tag_commit" != "$RELEASE_SHA" ]]; then
-              echo "existing tag $VERSION points to $tag_commit, not selected commit $RELEASE_SHA" >&2
+          previous_tag=""
+          target_tag="$RELEASE_SHA"
+          ref="refs/tags/$VERSION"
+          if git show-ref --verify --quiet "$ref"; then
+            previous_tag="$(git rev-parse "$ref")"
+            if [[ "$(git rev-parse "$ref^{commit}")" == "$RELEASE_SHA" ]]; then
+              target_tag="$previous_tag"  # Preserve annotated tags on same-commit reruns.
+            elif [[ "$RELEASE_EVENT" != workflow_dispatch || "$RELEASE_REF" != refs/heads/main || "$DRAFT" == true ]]; then
+              echo "Publish manually from main to move existing tag $VERSION." >&2
               exit 1
             fi
           elif [[ "$RELEASE_REF" == refs/tags/* ]]; then
@@ -113,6 +121,8 @@ jobs:
             prerelease=true
           fi
           {
+            echo "previous_tag=$previous_tag"
+            echo "target_tag=$target_tag"
             echo "version=$VERSION"
             echo "prerelease=$prerelease"
             echo "draft=$DRAFT"
@@ -264,6 +274,34 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/dbev-*-linux
+
+      - name: Checkout verified source for tagging
+        if: needs.release-gate.outputs.draft != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: release-source
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Publish version tag
+        if: needs.release-gate.outputs.draft != 'true'
+        working-directory: release-source
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
+          PREVIOUS_TAG: ${{ needs.release-gate.outputs.previous_tag }}
+          TARGET_TAG: ${{ needs.release-gate.outputs.target_tag }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="refs/tags/$VERSION"
+          refs=("$TARGET_TAG:$ref")
+          if [[ -n "$PREVIOUS_TAG" && "$PREVIOUS_TAG" != "$TARGET_TAG" ]]; then
+            refs+=("$PREVIOUS_TAG:refs/tags/archive/releases/$VERSION/$PREVIOUS_TAG")
+          fi
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push \
+            --atomic --force-with-lease="$ref:$PREVIOUS_TAG" origin "${refs[@]}"
 
       - name: Create release
         id: create_release

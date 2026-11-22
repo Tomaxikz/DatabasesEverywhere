@@ -200,3 +200,9 @@ gh workflow run release.yml --ref main -f version=vX.Y.Z \
 ```
 
 The version must match Cargo.toml. The notes file need not be committed.
+
+Publishing manually from `main` builds the commit selected when the run starts.
+If the version tag already points elsewhere, the workflow archives the original
+tag at `archive/releases/<version>/<old-tag-object-id>` and moves the version
+tag after the release checks pass. It updates the existing release and its Linux
+binaries. Draft runs require a new version or a tag on the selected commit.
