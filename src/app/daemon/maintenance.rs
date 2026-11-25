@@ -590,9 +590,7 @@ pub(crate) async fn disk_test(
     let _daemon_lock = lock_daemon(&config).await?;
     let _log_guard = init_logging(&config)?;
     log_disk_mode(&mut config)?;
-    validate_runtime_support(&config).await?;
-
-    let limiter = DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root());
+    let limiter = validate_runtime_support(&config, false).await?;
     let run_id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

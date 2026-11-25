@@ -6,16 +6,10 @@ use super::{
     privileged_command,
 };
 
-pub(super) async fn verify_startup(mount: &Path) -> Result<(), DiskLimitError> {
-    ensure_quota_enabled(mount).await
-}
+mod quota;
+pub(super) use quota::verify_startup;
 
-pub(super) async fn apply(
-    data_path: &Path,
-    disk_mib: u64,
-    mount: &Path,
-) -> Result<String, DiskLimitError> {
-    ensure_quota_enabled(mount).await?;
+pub(super) async fn apply(data_path: &Path, disk_mib: u64) -> Result<String, DiskLimitError> {
     ensure_subvolume(data_path).await?;
     run_limit(data_path, disk_mib).await?;
     Ok("host_btrfs_qgroup".to_string())
@@ -33,38 +27,6 @@ pub(super) async fn destroy(data_path: &Path) -> Result<(), DiskLimitError> {
     .await
 }
 
-async fn ensure_quota_enabled(mount: &Path) -> Result<(), DiskLimitError> {
-    if qgroups_available(mount).await? {
-        return Ok(());
-    }
-    run(mount, &["quota", "enable"], "btrfs quota enable").await?;
-    if qgroups_available(mount).await? {
-        Ok(())
-    } else {
-        Err(DiskLimitError::CommandFailed {
-            command: format!("btrfs qgroup show {}", mount.display()),
-            stderr: "qgroups are still unavailable after enabling btrfs quotas".to_string(),
-        })
-    }
-}
-
-async fn qgroups_available(mount: &Path) -> Result<bool, DiskLimitError> {
-    btrfs_succeeds(&["qgroup", "show"], mount).await
-}
-
-async fn btrfs_succeeds(args: &[&str], path: &Path) -> Result<bool, DiskLimitError> {
-    let output = privileged_command("btrfs")
-        .args(args)
-        .arg(path)
-        .output()
-        .await
-        .map_err(|source| DiskLimitError::CommandIo {
-            command: "btrfs",
-            source,
-        })?;
-    Ok(output.status.success())
-}
-
 async fn ensure_subvolume(path: &Path) -> Result<(), DiskLimitError> {
     if is_subvolume(path).await? {
         return Ok(());
@@ -77,13 +39,68 @@ async fn ensure_subvolume(path: &Path) -> Result<(), DiskLimitError> {
         .map_err(|error| DiskLimitError::Task(error.to_string()))??;
 
     run(&path, &["subvolume", "create"], "btrfs subvolume create").await?;
+    // Files inherit NOCOW at creation. Existing subvolumes keep their attributes.
+    let result = privileged_command("chattr")
+        .arg("+C")
+        .arg(&path)
+        .output()
+        .await;
+    match result {
+        Ok(output) if !output.status.success() => tracing::warn!(
+            path = %path.display(), stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "could not set NOCOW on new Btrfs volume"
+        ),
+        Err(error) => tracing::warn!(path = %path.display(), %error, "could not run chattr +C"),
+        Ok(_) => {}
+    }
     tokio::task::spawn_blocking(move || restore_replaced_directory(&path, replaced))
         .await
         .map_err(|error| DiskLimitError::Task(error.to_string()))?
 }
 
 pub(super) async fn is_subvolume(path: &Path) -> Result<bool, DiskLimitError> {
-    btrfs_succeeds(&["subvolume", "show"], path).await
+    #[cfg(target_os = "linux")]
+    {
+        // "subvolume show" also lists snapshots. Check the root inode directly
+        // so deletes and resizes do not enumerate snapshots on a busy filesystem.
+        let target = path.to_owned();
+        let result = tokio::task::spawn_blocking(move || is_subvolume_root(&target))
+            .await
+            .map_err(|error| DiskLimitError::Task(error.to_string()))?;
+        match result {
+            Ok(found) => return Ok(found),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            // Preserve the privileged probe for root-owned volume paths.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(super::path_io_error(path)(error)),
+        }
+    }
+    let output = privileged_command("btrfs")
+        .args(["subvolume", "show"])
+        .arg(path)
+        .output()
+        .await
+        .map_err(|source| DiskLimitError::CommandIo {
+            command: "btrfs",
+            source,
+        })?;
+    Ok(output.status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn is_subvolume_root(path: &Path) -> std::io::Result<bool> {
+    use linux_raw_sys::btrfs::BTRFS_FIRST_FREE_OBJECTID;
+    use rustix::fs::{FileType, Mode, OFlags, fstat, fstatfs, open};
+
+    let fd = open(
+        path,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let stat = fstat(&fd)?;
+    Ok(FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+        && stat.st_ino == u64::from(BTRFS_FIRST_FREE_OBJECTID)
+        && fstatfs(&fd)?.f_type == linux_raw_sys::general::BTRFS_SUPER_MAGIC as rustix::fs::FsWord)
 }
 
 async fn run_limit(path: &Path, disk_mib: u64) -> Result<(), DiskLimitError> {

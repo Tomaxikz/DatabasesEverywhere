@@ -23,7 +23,13 @@ impl DiskLimiter {
                 let mount = mounts::find_mount(data_root)?;
                 match mount.fstype.as_str() {
                     "xfs" => xfs::verify_startup(&mount.mountpoint).await,
-                    "btrfs" => btrfs::verify_startup(&mount.mountpoint).await,
+                    "btrfs" => {
+                        btrfs::verify_startup(
+                            data_root,
+                            self.config.btrfs_allow_enable_simple_quotas,
+                        )
+                        .await
+                    }
                     "zfs" => zfs::verify_startup().await,
                     "ext4" | "f2fs" => {
                         linux_project::verify_startup(

@@ -44,7 +44,7 @@ pub(crate) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     log_disk_mode(&mut config)?;
     configure_fuse_host(&config)?;
     remove_old_sudoers()?;
-    validate_runtime_support(&config).await?;
+    validate_runtime_support(&config, true).await?;
     check_container_engine(&config).await?;
     write_systemd_service(&config_path, &config.daemon)?;
     reload_systemd()?;

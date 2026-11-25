@@ -27,7 +27,6 @@ use crate::{
     routes::http::router::build_router,
     runtime::docker::DockerRuntime,
     server::{
-        disk::DiskLimiter,
         jobs::import_export::ImportExportJobs,
         manager::InstanceManager,
         placement::lifecycle::{
@@ -96,7 +95,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         phase = "host_preflight",
         "startup phase 2/5: validating host capabilities and storage"
     );
-    validate_runtime_support(&config).await?;
+    let disk_limiter = validate_runtime_support(&config, true).await?;
     tracing::info!(
         mode = %config.disk.mode.method(),
         enforced = config.disk.mode.enforced(),
@@ -302,11 +301,6 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         engine = %docker.engine_name(),
         "database containers will run with network_mode=none and private Unix sockets"
     );
-    let disk_limiter = DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root());
-    disk_limiter
-        .verify_startup(std::path::Path::new(&volumes_root))
-        .await
-        .context("failed to verify disk limiter support")?;
     let instance_locks = crate::server::locks::InstanceLocks::default();
     let shutdown_jobs = import_export_jobs.clone();
     let install_progress =

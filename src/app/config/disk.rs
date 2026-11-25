@@ -9,6 +9,7 @@ pub struct DiskConfig {
     /// that fallback would otherwise be FUSE-backed.
     #[serde(rename = "mode")]
     pub selection: DiskLimitSelection,
+    pub btrfs_allow_enable_simple_quotas: bool,
     pub project_id_base: u32,
     pub fuse_quota_binary: String,
     pub fuse_quota_binary_sha256: String,
@@ -20,6 +21,7 @@ pub struct DiskConfig {
 #[serde(default, deny_unknown_fields)]
 struct DiskFileConfig {
     mode: DiskLimitSelection,
+    btrfs_allow_enable_simple_quotas: bool,
     project_id_base: u32,
     fuse_quota_binary: String,
     fuse_quota_binary_sha256: String,
@@ -32,6 +34,7 @@ impl Default for DiskFileConfig {
         let defaults = DiskConfig::default();
         Self {
             mode: defaults.selection,
+            btrfs_allow_enable_simple_quotas: defaults.btrfs_allow_enable_simple_quotas,
             project_id_base: defaults.project_id_base,
             fuse_quota_binary: defaults.fuse_quota_binary,
             fuse_quota_binary_sha256: defaults.fuse_quota_binary_sha256,
@@ -50,6 +53,7 @@ impl<'de> Deserialize<'de> for DiskConfig {
         Ok(Self {
             mode: DiskLimitMode::default(),
             selection: file.mode,
+            btrfs_allow_enable_simple_quotas: file.btrfs_allow_enable_simple_quotas,
             project_id_base: file.project_id_base,
             fuse_quota_binary: file.fuse_quota_binary,
             fuse_quota_binary_sha256: file.fuse_quota_binary_sha256,
@@ -75,6 +79,7 @@ impl Default for DiskConfig {
         Self {
             mode: DiskLimitMode::FuseQuota,
             selection: DiskLimitSelection::Auto,
+            btrfs_allow_enable_simple_quotas: false,
             project_id_base: 200_000,
             fuse_quota_binary: "embedded".to_string(),
             fuse_quota_binary_sha256: String::new(),

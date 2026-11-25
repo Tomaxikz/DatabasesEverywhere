@@ -227,6 +227,12 @@ disk:
   mode: auto
   # DBE detects native XFS, Btrfs, ZFS, ext4, or f2fs quota support from the
   # filesystem backing paths.volumes. It falls back to FuseQuota automatically.
+  # Allow DBE to enable simple quotas on the Btrfs volumes filesystem during setup or startup.
+  # Enabling sets a filesystem-wide incompatibility flag requiring Linux 6.7+
+  # and accounts newly allocated extents. Enable before provisioning volumes.
+  # Existing full quotas stay active. New Btrfs data subvolumes request NOCOW,
+  # which disables data checksums and compression for files inheriting it.
+  btrfs_allow_enable_simple_quotas: false
   # Native quota modes allocate at most 1,000,000 consecutive IDs from this
   # base. Reserve that range exclusively for DBE on the host.
   project_id_base: 200000

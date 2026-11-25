@@ -71,7 +71,7 @@ pub(super) async fn set_host_quota(
                 .await
             }
         },
-        "btrfs" => btrfs::apply(&data_path, disk_mib, &mount.mountpoint).await,
+        "btrfs" => btrfs::apply(&data_path, disk_mib).await,
         "zfs" => zfs::apply(instance_id, &data_path, disk_mib).await,
         "ext4" | "f2fs" => match change {
             HostQuotaChange::Apply => {

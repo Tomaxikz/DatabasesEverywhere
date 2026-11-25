@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiskLimitError {
+    #[error("Btrfs quota setup at {path}: {reason}")]
+    BtrfsQuota { path: PathBuf, reason: String },
     #[error("FuseQuota mount {} requires an offline recovery or cache-policy update; stop the database before remounting (daemon boot performs this safely)", .0.display())]
     FuseRequiresRestart(PathBuf),
     #[error(

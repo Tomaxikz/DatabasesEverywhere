@@ -572,11 +572,18 @@ pub(super) fn runtime_roots(config: &Config) -> Vec<String> {
     ]
 }
 
-pub(crate) async fn validate_runtime_support(config: &Config) -> anyhow::Result<()> {
-    DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root())
+pub(crate) async fn validate_runtime_support(
+    config: &Config,
+    allow_btrfs_enable: bool,
+) -> anyhow::Result<DiskLimiter> {
+    let mut disk = config.disk.clone();
+    disk.btrfs_allow_enable_simple_quotas &= allow_btrfs_enable;
+    let limiter = DiskLimiter::with_fuse_root(disk, config.paths.fuse_root());
+    limiter
         .verify_startup(Path::new(&config.paths.volumes_root()))
         .await
-        .context("failed to verify disk limiter support")
+        .context("failed to verify disk limiter support")?;
+    Ok(limiter)
 }
 
 pub(crate) fn log_disk_mode(config: &mut Config) -> anyhow::Result<()> {

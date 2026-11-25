@@ -89,6 +89,9 @@ parking_lot = "0.12.5"
 sha2 = "0.11.1"
 zstd = { version = "0.14.4", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-raw-sys = { version = "0.12.1", features = ["btrfs", "ioctl"] }
+
 [dev-dependencies]
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 criterion = { version = "0.8.2", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
