@@ -247,6 +247,7 @@ async fn loopback_quota_and_volume_lifecycle() -> anyhow::Result<()> {
             .arg(&snap)
             .status()?
             .success()
+    );
     super::destroy(&volume).await?;
     assert!(!volume.exists());
     assert!(snap.join("payload").is_file());
