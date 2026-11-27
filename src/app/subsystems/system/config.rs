@@ -24,6 +24,9 @@ const FORBIDDEN_PATCH_PATHS: &[&[&str]] = &[
     &["uuid"],
     &["paths"],
     &["images"],
+    // Node identity and where it connects: a remote patch must not repoint a node at another
+    // cluster, add peers, or open forwards.
+    &["tether"],
     &["disk", "fuse_quota_binary"],
     &["disk", "fuse_quota_binary_sha256"],
     &["backups", "storage", "s3", "endpoint"],
@@ -58,7 +61,7 @@ impl ConfigPatchCoordinator {
     path = "/api/system/config",
     tag = "system",
     summary = "Merge a validated config patch into the daemon config file.",
-    description = "Writes config.yml and returns restart_required=true. Refuses identity/token, managed-path, container-image, S3-endpoint, executable-helper, and Fuse helper edits, including replacement or removal of their ancestors. The allocation.prevent_cpu_overallocation, allocation.prevent_memory_overallocation, and allocation.prevent_disk_overallocation booleans may be changed independently; all default to true.",
+    description = "Writes config.yml and returns restart_required=true. Refuses identity/token, managed-path, container-image, S3-endpoint, executable-helper, Fuse helper, and tether edits, including replacement or removal of their ancestors. The allocation.prevent_cpu_overallocation, allocation.prevent_memory_overallocation, and allocation.prevent_disk_overallocation booleans may be changed independently; all default to true.",
     extensions(("x-required-scope" = json!(scopes::CONFIG_ADMIN))),
     request_body = std::collections::HashMap<String, Value>,
     responses((status = 200, description = "Config patch applied.", body = ConfigPatchResponse))
@@ -230,6 +233,16 @@ mod tests {
                 }),
             ),
             ("disk ancestor removal", serde_json::json!({ "disk": null })),
+            (
+                "tether peers",
+                serde_json::json!({ "tether": { "peers": [{ "node": "x", "address": "10.0.0.9:7100" }] } }),
+            ),
+            (
+                "tether enable",
+                serde_json::json!({ "tether": { "enabled": true } }),
+            ),
+            ("tether removal", serde_json::json!({ "tether": null })),
+            ("tether replacement", serde_json::json!({ "tether": "off" })),
             (
                 "Kopia ancestor replacement",
                 serde_json::json!({ "backups": { "storage": { "kopia": null } } }),

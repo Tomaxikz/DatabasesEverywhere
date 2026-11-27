@@ -35,7 +35,7 @@ async fn omitted_speculative_reply_falls_back_without_early_accounting() -> anyh
     let backend_listener = UnixListener::bind(&socket)?;
     let (resolver, sessions, network) = resolver(&socket).await;
     let (mut client, gateway) = tcp_pair().await;
-    let handler = tokio::spawn(handle_mongodb_client(gateway, resolver, None));
+    let handler = tokio::spawn(handle_mongodb_client(gateway.into(), resolver, None));
 
     send_command(&mut client, speculative_hello()).await;
     let backend = tokio::spawn(async move {
@@ -99,7 +99,7 @@ async fn failed_sasl_never_opens_a_session_or_network_meter() -> anyhow::Result<
     let backend_listener = UnixListener::bind(&socket)?;
     let (resolver, sessions, network) = resolver(&socket).await;
     let (mut client, gateway) = tcp_pair().await;
-    let handler = tokio::spawn(handle_mongodb_client(gateway, resolver, None));
+    let handler = tokio::spawn(handle_mongodb_client(gateway.into(), resolver, None));
 
     send_plain_hello(&mut client).await;
     read_message(&mut client).await;
@@ -150,7 +150,7 @@ async fn run_successful_auth(speculative: bool) {
     let backend_listener = UnixListener::bind(&socket).expect("bind should succeed");
     let (resolver, sessions, network) = resolver(&socket).await;
     let (mut client, gateway) = tcp_pair().await;
-    let handler = tokio::spawn(handle_mongodb_client(gateway, resolver, None));
+    let handler = tokio::spawn(handle_mongodb_client(gateway.into(), resolver, None));
 
     if speculative {
         send_command(&mut client, speculative_hello()).await;

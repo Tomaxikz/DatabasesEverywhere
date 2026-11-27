@@ -6,5 +6,6 @@ pub mod resolver;
 pub mod security;
 pub mod sessions;
 pub mod supervisor;
+pub(crate) mod tether;
 pub mod tls;
 pub mod tunnel;

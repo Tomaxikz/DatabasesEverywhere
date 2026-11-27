@@ -1,6 +1,6 @@
 [package]
 name = "databases-everywhere"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 
 [workspace]
@@ -59,7 +59,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 percent-encoding = "2.3.2"
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
-rustix = { version = "1.1.6", features = ["fs", "process"] }
+rustix = { version = "1.1.6", features = ["fs", "net", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 yaml_serde = "0.10.7"
@@ -72,6 +72,7 @@ subtle = "2.6.1"
 flate2 = "1.1.11"
 tempfile = "3.27.0"
 tar = { version = "0.4.46", default-features = false }
+tether = { package = "dbev-tether", path = "tether" }
 thiserror = { workspace = true }
 time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
@@ -108,6 +109,7 @@ proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 criterion = { version = "0.8.2", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 [[bench]]
 name = "route_lookup"

@@ -52,6 +52,9 @@ pub struct GatewayReadinessSnapshot {
 struct GatewayConnections {
     accepting: AtomicBool,
     active: AtomicUsize,
+    /// Tether relay tasks. They are not gateway connections, but shutdown must drain and
+    /// force them like connections: a relay stuck on a stalled peer cannot hold it forever.
+    relays: AtomicUsize,
     drain_notify: Notify,
     force_shutdown: watch::Sender<bool>,
 }
@@ -63,6 +66,12 @@ pub struct GatewayConnectionTracker {
 
 #[derive(Debug)]
 pub struct GatewayConnectionGuard {
+    inner: Arc<GatewayConnections>,
+}
+
+/// Held while a tether relay task runs; see [`GatewayConnectionTracker::track_relay`].
+#[derive(Debug)]
+pub struct GatewayRelayGuard {
     inner: Arc<GatewayConnections>,
 }
 
@@ -80,6 +89,7 @@ impl GatewayConnectionTracker {
             inner: Arc::new(GatewayConnections {
                 accepting: AtomicBool::new(false),
                 active: AtomicUsize::new(0),
+                relays: AtomicUsize::new(0),
                 drain_notify: Notify::new(),
                 force_shutdown,
             }),
@@ -93,6 +103,10 @@ impl GatewayConnectionTracker {
 
     fn stop_accepting(&self) {
         self.inner.accepting.store(false, Ordering::Release);
+    }
+
+    pub fn is_accepting(&self) -> bool {
+        self.inner.accepting.load(Ordering::Acquire)
     }
 
     pub fn try_track(&self) -> Option<GatewayConnectionGuard> {
@@ -109,6 +123,21 @@ impl GatewayConnectionTracker {
         })
     }
 
+    /// Counts a tether relay task. Unlike [`try_track`](Self::try_track) this never refuses:
+    /// callers take the guard first and then check whether the gateway is still accepting, so
+    /// shutdown can never see zero relays while one is being admitted.
+    pub fn track_relay(&self) -> GatewayRelayGuard {
+        self.inner.relays.fetch_add(1, Ordering::AcqRel);
+        GatewayRelayGuard {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Gateway connections plus tether relay tasks.
+    pub fn pending(&self) -> usize {
+        self.inner.active.load(Ordering::Acquire) + self.inner.relays.load(Ordering::Acquire)
+    }
+
     pub fn subscribe_force_shutdown(&self) -> watch::Receiver<bool> {
         self.inner.force_shutdown.subscribe()
     }
@@ -121,7 +150,7 @@ impl GatewayConnectionTracker {
         let drained = async {
             loop {
                 let notified = self.inner.drain_notify.notified();
-                if self.active_connections() == 0 {
+                if self.pending() == 0 {
                     return;
                 }
                 notified.await;
@@ -141,6 +170,14 @@ impl Drop for GatewayConnectionGuard {
     }
 }
 
+impl Drop for GatewayRelayGuard {
+    fn drop(&mut self) {
+        let previous = self.inner.relays.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "tether relay count underflow");
+        self.inner.drain_notify.notify_waiters();
+    }
+}
+
 fn release_connection(connections: &GatewayConnections) {
     let previous = connections.active.fetch_sub(1, Ordering::AcqRel);
     debug_assert!(previous > 0, "gateway connection count underflow");
@@ -149,12 +186,21 @@ fn release_connection(connections: &GatewayConnections) {
     }
 }
 
+#[derive(Debug, Default)]
+struct Background {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Set once `wait_background` has found nothing left to wait for.
+    sealed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewaySupervisor {
     state: Arc<RwLock<GatewayState>>,
     shutdown: watch::Sender<bool>,
     connections: GatewayConnectionTracker,
     tenant_sessions: crate::gateway::sessions::TenantSessions,
+    /// Tasks the daemon must wait for before exiting, such as the tether endpoint's close.
+    background: Arc<parking_lot::Mutex<Background>>,
 }
 
 impl Default for GatewaySupervisor {
@@ -180,6 +226,7 @@ impl GatewaySupervisor {
             shutdown,
             connections: GatewayConnectionTracker::new(),
             tenant_sessions: crate::gateway::sessions::TenantSessions::with_config(config),
+            background: Arc::default(),
         }
     }
 
@@ -259,7 +306,7 @@ impl GatewaySupervisor {
         force_close_timeout: Duration,
     ) -> GatewayDrainOutcome {
         self.connections.stop_accepting();
-        let active_at_start = self.connections.active_connections();
+        let active_at_start = self.connections.pending();
         if self.connections.wait_for_drain(graceful_timeout).await {
             return GatewayDrainOutcome {
                 active_at_start,
@@ -273,7 +320,40 @@ impl GatewaySupervisor {
         GatewayDrainOutcome {
             active_at_start,
             gracefully_drained: false,
-            remaining: self.connections.active_connections(),
+            remaining: self.connections.pending(),
+        }
+    }
+
+    /// Registers a task that [`wait_background`](Self::wait_background) will wait for.
+    /// Returns the task back if shutdown has already finished waiting; the caller must then
+    /// do the task's work itself.
+    pub fn track_background(
+        &self,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Result<(), tokio::task::JoinHandle<()>> {
+        let mut background = self.background.lock();
+        if background.sealed {
+            return Err(task);
+        }
+        background.tasks.push(task);
+        Ok(())
+    }
+
+    /// Waits for every registered background task, including ones registered while it
+    /// waits, such as closing the tether endpoint. Later registrations are refused.
+    pub async fn wait_background(&self) {
+        loop {
+            let tasks = {
+                let mut background = self.background.lock();
+                if background.tasks.is_empty() {
+                    background.sealed = true;
+                    return;
+                }
+                std::mem::take(&mut background.tasks)
+            };
+            for task in tasks {
+                let _ = task.await;
+            }
         }
     }
 
@@ -309,6 +389,52 @@ mod tests {
     use anyhow::Context as _;
 
     use super::*;
+
+    #[tokio::test]
+    async fn background_tasks_registered_during_the_wait_are_awaited_and_late_ones_refused() {
+        let supervisor = GatewaySupervisor::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        supervisor
+            .track_background(tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }))
+            .expect("registered");
+        let waiting = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.wait_background().await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Registered while the wait is already under way.
+        let flag = finished.clone();
+        supervisor
+            .track_background(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                flag.store(true, Ordering::SeqCst);
+            }))
+            .expect("registered during the wait");
+        waiting.await.expect("wait");
+        assert!(finished.load(Ordering::SeqCst));
+        // After the wait has completed nobody would await a new task.
+        assert!(supervisor.track_background(tokio::spawn(async {})).is_err());
+    }
+
+    #[tokio::test]
+    async fn relays_hold_the_drain_open_and_are_forced_like_connections() {
+        let supervisor = GatewaySupervisor::new();
+        supervisor.begin(0);
+        supervisor.mark_ready();
+        let tracker = supervisor.connection_tracker();
+        let relay = tracker.track_relay();
+        assert_eq!((tracker.active_connections(), tracker.pending()), (0, 1));
+        let outcome = supervisor
+            .drain_connections(Duration::from_millis(50), Duration::from_millis(50))
+            .await;
+        assert!(!outcome.gracefully_drained);
+        assert_eq!(outcome.remaining, 1);
+        assert!(*tracker.subscribe_force_shutdown().borrow());
+        drop(relay);
+        assert_eq!(tracker.pending(), 0);
+    }
 
     #[test]
     fn readiness_tracks_start_failure_and_shutdown() {

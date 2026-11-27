@@ -1,11 +1,8 @@
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_rustls::TlsAcceptor;
 
 use crate::gateway::{
-    listeners::{GatewayStream, ListenerError, listener_io::MAX_HANDSHAKE_BYTES},
+    listeners::{ClientSocket, GatewayStream, ListenerError, listener_io::MAX_HANDSHAKE_BYTES},
     protocols::{clickhouse, redis},
 };
 
@@ -88,7 +85,7 @@ where
 }
 
 pub(in super::super) async fn accept_direct_tls(
-    client: TcpStream,
+    client: ClientSocket,
     tls: Option<TlsAcceptor>,
 ) -> Result<GatewayStream, std::io::Error> {
     if let Some(tls) = tls {

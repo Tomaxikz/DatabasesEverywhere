@@ -1,4 +1,5 @@
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+use super::ClientSocket;
+use tokio::io::AsyncWriteExt;
 use tokio_rustls::TlsAcceptor;
 
 use super::{
@@ -13,7 +14,7 @@ use crate::{
 };
 
 pub(super) async fn handle_clickhouse_client(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
@@ -68,7 +69,7 @@ pub(super) async fn handle_clickhouse_client(
 }
 
 pub(super) async fn handle_clickhouse_http(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {

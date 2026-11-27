@@ -69,6 +69,28 @@ impl Stream {
         let _ = self.recv.stop(ABORT);
     }
 
+    /// Resolves once the peer has acknowledged every byte this stream sent, including its
+    /// end, after the write half has been shut down. Acknowledged means the peer's QUIC
+    /// stack has received the data, not that the application has read it. Before the write
+    /// half is shut down this stays pending, because the end of the stream is not yet sent.
+    ///
+    /// Fails with `ConnectionReset` if the peer stopped the stream first (it dropped or
+    /// refused the stream, so the tail may never have been read), and with the connection's
+    /// error kind if the connection was lost before the acknowledgment.
+    pub async fn delivered(&self) -> io::Result<()> {
+        match self.send.stopped().await {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "the peer stopped the stream before acknowledging all data",
+            )),
+            Err(quinn::StoppedError::ConnectionLost(lost)) => {
+                Err(io::Error::new(connection_kind(&lost), lost))
+            }
+            Err(error) => Err(io::Error::new(io::ErrorKind::NotConnected, error)),
+        }
+    }
+
     fn finish(&mut self) -> Result<(), quinn::ClosedStream> {
         // Set first: whatever finish reports, the send side is done and must not be reset.
         self.finished = true;

@@ -99,6 +99,8 @@ pub enum ConfigValidationError {
         field: &'static str,
         message: String,
     },
+    #[error("tether.{field} is invalid: {message}")]
+    InvalidTether { field: String, message: String },
     #[error("{field} must include a non-latest tag or valid sha256 digest: {image}")]
     InvalidImageReference { field: &'static str, image: String },
     #[error(

@@ -93,7 +93,7 @@ paths:
       tags:
       - system
       summary: Merge a validated config patch into the daemon config file.
-      description: Writes config.yml and returns restart_required=true. Refuses identity/token, managed-path, container-image, S3-endpoint, executable-helper, and Fuse helper edits, including replacement or removal of their ancestors. The allocation.prevent_cpu_overallocation, allocation.prevent_memory_overallocation, and allocation.prevent_disk_overallocation booleans may be changed independently; all default to true.
+      description: Writes config.yml and returns restart_required=true. Refuses identity/token, managed-path, container-image, S3-endpoint, executable-helper, Fuse helper, and tether edits, including replacement or removal of their ancestors. The allocation.prevent_cpu_overallocation, allocation.prevent_memory_overallocation, and allocation.prevent_disk_overallocation booleans may be changed independently; all default to true.
       operationId: patch_config
       requestBody:
         content:

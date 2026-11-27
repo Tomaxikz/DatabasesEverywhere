@@ -54,6 +54,34 @@ qdrant:
   bind: 127.0.0.1:6334
   tls: false
 
+tether:
+  # Links this node to other dbev nodes so a client of one node can reach a
+  # database held by another. The node holding the database authenticates the
+  # client with its own gateway; the entry node only forwards bytes. Needs UDP
+  # reachability between nodes. Nothing below is read, and no socket opens,
+  # unless enabled is true.
+  enabled: false
+  bind: 0.0.0.0:7100
+  # This node's id; must equal the single DNS name in its certificate.
+  node: ""
+  # PEM files: the cluster CA, and this node's certificate and key.
+  ca: ""
+  cert: ""
+  key: ""
+  # Other nodes, by id and IP:port. inbound lets that peer open streams to this
+  # node's gateways.
+  #   - node: node-b
+  #     address: 10.0.0.2:7100
+  #     inbound: false
+  peers: []
+  # TCP listeners on this node whose clients are carried to a peer's gateway.
+  # protocol: postgres, redis, valkey, mariadb, mysql, mongodb, clickhouse,
+  # clickhouse_http or qdrant.
+  #   - bind: 0.0.0.0:15432
+  #     node: node-b
+  #     protocol: postgres
+  forwards: []
+
 api:
   # The network (TCP) API the panel calls. Set false on a standalone node: no
   # TCP listener opens, the panel cannot reach the node, and only the socket

@@ -197,3 +197,37 @@ async fn dropping_a_stream_resets_the_other_side() {
         ErrorKind::ConnectionReset
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delivered_resolves_once_the_peer_has_all_the_data_and_fails_if_it_stops() {
+    let authority = authority();
+    let (kit_a, kit_b) = (authority.kit("a"), authority.kit("b"));
+    let (a, b) = (start(&kit_a), start(&kit_b));
+    let (mut accepted, _task) = acceptor(&b);
+
+    let mut opened = a.open(&peer(&b), &target("db"), b"").await.expect("open");
+    let mut theirs = next(&mut accepted).await.stream;
+    opened.write_all(b"tail").await.expect("write");
+    // Not finished yet, so nothing can be acknowledged to completion.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), opened.delivered())
+            .await
+            .is_err()
+    );
+    opened.shutdown().await.expect("shutdown");
+    within(opened.delivered()).await.expect("delivered");
+    let mut received = Vec::new();
+    within(theirs.read_to_end(&mut received))
+        .await
+        .expect("read");
+    assert_eq!(received, b"tail");
+
+    // A peer that drops the stream unread stops it instead of acknowledging.
+    let mut opened = a.open(&peer(&b), &target("db"), b"").await.expect("open");
+    let theirs = next(&mut accepted).await.stream;
+    drop(theirs);
+    let _ = opened.write_all(b"lost").await;
+    let _ = opened.shutdown().await;
+    let error = within(opened.delivered()).await.expect_err("stopped");
+    assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+}

@@ -10,19 +10,23 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{Semaphore, watch},
     time::{Duration, timeout},
 };
 
+mod admission;
 mod clickhouse_listener;
+mod client_socket;
 mod listener_io;
 mod mongodb_listener;
 mod mysql_listener;
 mod postgres_listener;
 mod qdrant_listener;
 mod resp_listener;
+pub(crate) use admission::{Origin, ProtocolEntry};
 use clickhouse_listener::{handle_clickhouse_client, handle_clickhouse_http};
+pub(crate) use client_socket::ClientSocket;
 use mongodb_listener::handle_mongodb_client;
 use mysql_listener::{handle_mariadb_client, handle_mysql_client};
 use postgres_listener::handle_postgres_client;
@@ -32,9 +36,7 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 use super::{
     resolver::RouteResolver,
-    security::{
-        GatewayConnectionLimiter, GatewayConnectionRejection, GatewayConnectionRejectionReason,
-    },
+    security::{GatewayConnectionLimiter, GatewayConnectionRejectionReason},
     supervisor::GatewayConnectionTracker,
     tunnel,
 };
@@ -86,8 +88,8 @@ pub enum ListenerError {
 }
 
 enum GatewayStream {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Plain(ClientSocket),
+    Tls(Box<TlsStream<ClientSocket>>),
 }
 
 impl AsyncRead for GatewayStream {
@@ -137,6 +139,7 @@ const MAX_BACKEND_FAILURE_LOG_KEYS: usize = 4_096;
 
 static BACKEND_FAILURE_LOGS: OnceLock<Mutex<HashMap<String, BackendFailureLogWindow>>> =
     OnceLock::new();
+static TETHER_FAILURE_LOGS: OnceLock<Mutex<LogWindows>> = OnceLock::new();
 
 #[derive(Debug)]
 struct BackendFailureLogWindow {
@@ -144,272 +147,82 @@ struct BackendFailureLogWindow {
     suppressed: u64,
 }
 
-struct ListenerRuntime {
-    listener: TcpListener,
-    bind: String,
+pub(crate) fn protocol_entry(
     protocol: &'static str,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
     connections: GatewayConnectionTracker,
+) -> Option<Arc<ProtocolEntry>> {
+    macro_rules! entry {
+        ($handler:expr) => {
+            Some(ProtocolEntry::new(
+                protocol,
+                $handler,
+                resolver,
+                tls,
+                limiter,
+                connections,
+            ))
+        };
+    }
+    match protocol {
+        "postgres" => entry!(handle_postgres_client),
+        "redis" => entry!(handle_redis_client),
+        "valkey" => entry!(handle_valkey_client),
+        "mariadb" => entry!(handle_mariadb_client),
+        "mysql" => entry!(handle_mysql_client),
+        "mongodb" => entry!(handle_mongodb_client),
+        "clickhouse" => entry!(handle_clickhouse_client),
+        "clickhouse_http" => entry!(handle_clickhouse_http),
+        "qdrant" => entry!(handle_qdrant_client),
+        _ => None,
+    }
 }
 
-pub async fn run_postgres_listener(
+macro_rules! public_listener {
+    ($function:ident, $protocol:literal) => {
+        pub async fn $function(
+            listener: TcpListener,
+            bind: &str,
+            resolver: RouteResolver,
+            tls: Option<TlsAcceptor>,
+            limiter: GatewayConnectionLimiter,
+            shutdown: watch::Receiver<bool>,
+            connections: GatewayConnectionTracker,
+        ) -> Result<(), ListenerError> {
+            let entry = protocol_entry($protocol, resolver, tls, limiter, connections)
+                .ok_or_else(|| IoError::other(concat!("no handler for ", $protocol)))?;
+            run_listener(listener, bind, entry, shutdown).await
+        }
+    };
+}
+
+public_listener!(run_postgres_listener, "postgres");
+public_listener!(run_redis_listener, "redis");
+public_listener!(run_valkey_listener, "valkey");
+public_listener!(run_mariadb_listener, "mariadb");
+public_listener!(run_mysql_listener, "mysql");
+public_listener!(run_mongodb_listener, "mongodb");
+public_listener!(run_clickhouse_listener, "clickhouse");
+public_listener!(run_clickhouse_http_listener, "clickhouse_http");
+public_listener!(run_qdrant_listener, "qdrant");
+
+/// Accepts public TCP clients of one protocol until shutdown.
+pub(crate) async fn run_listener(
     listener: TcpListener,
     bind: &str,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
-    connections: GatewayConnectionTracker,
+    entry: Arc<ProtocolEntry>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), ListenerError> {
-    run_listener(
-        ListenerRuntime {
-            listener,
-            bind: bind.to_string(),
-            protocol: "postgres",
-            resolver,
-            tls,
-            limiter,
-            shutdown,
-            connections,
-        },
-        handle_postgres_client,
-    )
-    .await
-}
-
-pub async fn run_redis_listener(
-    listener: TcpListener,
-    bind: &str,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
-    connections: GatewayConnectionTracker,
-) -> Result<(), ListenerError> {
-    run_listener(
-        ListenerRuntime {
-            listener,
-            bind: bind.to_string(),
-            protocol: "redis",
-            resolver,
-            tls,
-            limiter,
-            shutdown,
-            connections,
-        },
-        handle_redis_client,
-    )
-    .await
-}
-
-pub async fn run_valkey_listener(
-    listener: TcpListener,
-    bind: &str,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
-    connections: GatewayConnectionTracker,
-) -> Result<(), ListenerError> {
-    run_listener(
-        ListenerRuntime {
-            listener,
-            bind: bind.to_string(),
-            protocol: "valkey",
-            resolver,
-            tls,
-            limiter,
-            shutdown,
-            connections,
-        },
-        handle_valkey_client,
-    )
-    .await
-}
-
-pub async fn run_mariadb_listener(
-    listener: TcpListener,
-    bind: &str,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
-    connections: GatewayConnectionTracker,
-) -> Result<(), ListenerError> {
-    run_listener(
-        ListenerRuntime {
-            listener,
-            bind: bind.to_string(),
-            protocol: "mariadb",
-            resolver,
-            tls,
-            limiter,
-            shutdown,
-            connections,
-        },
-        handle_mariadb_client,
-    )
-    .await
-}
-
-pub async fn run_mysql_listener(
-    listener: TcpListener,
-    bind: &str,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
-    connections: GatewayConnectionTracker,
-) -> Result<(), ListenerError> {
-    run_listener(
-        ListenerRuntime {
-            listener,
-            bind: bind.to_string(),
-            protocol: "mysql",
-            resolver,
-            tls,
-            limiter,
-            shutdown,
-            connections,
-        },
-        handle_mysql_client,
-    )
-    .await
-}
-
-pub async fn run_mongodb_listener(
-    listener: TcpListener,
-    bind: &str,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
-    connections: GatewayConnectionTracker,
-) -> Result<(), ListenerError> {
-    run_listener(
-        ListenerRuntime {
-            listener,
-            bind: bind.to_string(),
-            protocol: "mongodb",
-            resolver,
-            tls,
-            limiter,
-            shutdown,
-            connections,
-        },
-        handle_mongodb_client,
-    )
-    .await
-}
-
-pub async fn run_clickhouse_listener(
-    listener: TcpListener,
-    bind: &str,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
-    connections: GatewayConnectionTracker,
-) -> Result<(), ListenerError> {
-    run_listener(
-        ListenerRuntime {
-            listener,
-            bind: bind.to_string(),
-            protocol: "clickhouse",
-            resolver,
-            tls,
-            limiter,
-            shutdown,
-            connections,
-        },
-        handle_clickhouse_client,
-    )
-    .await
-}
-
-pub async fn run_clickhouse_http_listener(
-    listener: TcpListener,
-    bind: &str,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
-    connections: GatewayConnectionTracker,
-) -> Result<(), ListenerError> {
-    run_listener(
-        ListenerRuntime {
-            listener,
-            bind: bind.to_string(),
-            protocol: "clickhouse_http",
-            resolver,
-            tls,
-            limiter,
-            shutdown,
-            connections,
-        },
-        handle_clickhouse_http,
-    )
-    .await
-}
-
-pub async fn run_qdrant_listener(
-    listener: TcpListener,
-    bind: &str,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
-    shutdown: watch::Receiver<bool>,
-    connections: GatewayConnectionTracker,
-) -> Result<(), ListenerError> {
-    run_listener(
-        ListenerRuntime {
-            listener,
-            bind: bind.to_string(),
-            protocol: "qdrant",
-            resolver,
-            tls,
-            limiter,
-            shutdown,
-            connections,
-        },
-        handle_qdrant_client,
-    )
-    .await
-}
-
-async fn run_listener<H, F>(runtime: ListenerRuntime, handler: H) -> Result<(), ListenerError>
-where
-    H: Fn(TcpStream, RouteResolver, Option<TlsAcceptor>) -> F + Copy + Send + Sync + 'static,
-    F: Future<Output = Result<(), ListenerError>> + Send + 'static,
-{
-    let ListenerRuntime {
-        listener,
-        bind,
-        protocol,
-        resolver,
-        tls,
-        limiter,
-        mut shutdown,
-        connections,
-    } = runtime;
-    let max_active_connections = resolver
-        .config()
-        .daemon
-        .limits
-        .gateway_connections_per_listener;
+    let protocol = entry.protocol();
     tracing::info!(
         bind,
-        tls = tls.is_some(),
+        tls = entry.has_tls(),
         protocol,
-        max_active_connections,
+        max_active_connections = entry.max_active_connections(),
         "database listener started"
     );
-    let active_connections = Arc::new(Semaphore::new(max_active_connections));
-    let mut global_limit_logged = false;
-
     loop {
         if *shutdown.borrow() {
             tracing::info!(bind, protocol, "database listener stopping");
@@ -430,47 +243,13 @@ where
             tracing::debug!(%peer, %error, protocol, "failed to configure client socket");
             continue;
         }
-        let Ok(global_permit) = Arc::clone(&active_connections).try_acquire_owned() else {
-            if !global_limit_logged {
-                tracing::warn!(%peer, protocol, "audit database_connection_global_limit_reached");
-                global_limit_logged = true;
-            }
-            continue;
-        };
-        global_limit_logged = false;
-        let ip_permit = match limiter.try_acquire(peer.ip()) {
-            Ok(permit) => permit,
-            Err(GatewayConnectionRejection { reason, should_log }) => {
-                let reason = rejection_reason_label(reason);
-                if should_log {
-                    tracing::warn!(%peer, protocol, reason, "audit database_connection_limited");
-                }
-                continue;
-            }
-        };
-        let resolver = resolver.clone();
-        let tls = tls.clone();
-        let Some(connection) = connections.try_track() else {
-            continue;
-        };
-        let mut force_shutdown = connections.subscribe_force_shutdown();
-        tokio::spawn(async move {
-            let _permits = (global_permit, ip_permit, connection);
-            tokio::select! {
-                result = handler(client, resolver, tls) => {
-                    if let Err(error) = result {
-                        log_connection_failure(protocol, peer, &error);
-                    }
-                }
-                _ = wait_for_shutdown(&mut force_shutdown) => {
-                    tracing::debug!(%peer, protocol, "database connection closed for daemon shutdown");
-                }
-            }
-        });
+        // A refused connection is simply dropped; the entry logged why.
+        // The handler task owns the slots; a refused connection is simply dropped.
+        let _ = entry.admit(ClientSocket::Tcp(client), Origin::public(peer));
     }
 }
 
-fn rejection_reason_label(reason: GatewayConnectionRejectionReason) -> &'static str {
+pub(crate) fn rejection_reason_label(reason: GatewayConnectionRejectionReason) -> &'static str {
     match reason {
         GatewayConnectionRejectionReason::RateLimited => "rate",
         GatewayConnectionRejectionReason::TooManyActive => "active",
@@ -478,7 +257,7 @@ fn rejection_reason_label(reason: GatewayConnectionRejectionReason) -> &'static 
     }
 }
 
-async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+pub(super) async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
     while !*shutdown.borrow() {
         if shutdown.changed().await.is_err() {
             return;
@@ -505,22 +284,32 @@ async fn client_handshake<T>(
     })?
 }
 
-fn log_connection_failure(
+pub(super) fn log_connection_failure(
     protocol: &'static str,
-    peer: std::net::SocketAddr,
+    origin: &Origin,
     error: &ListenerError,
 ) {
+    let peer = origin.client;
+    let (client, via_node) = (origin.client_field(), origin.via_field());
     if expected_client_failure(error) {
-        tracing::debug!(%peer, %error, protocol, "database connection rejected");
+        tracing::debug!(%peer, client, via_node, %error, protocol, "database connection rejected");
     } else if let ListenerError::Backend {
         instance_id,
         source,
     } = error
     {
-        match backend_log_permit(protocol, instance_id) {
+        // Tunnelled failures are limited by tether's own policy; public ones by the original.
+        let permit = if origin.via_node.is_some() {
+            tether_log_permit(protocol, instance_id)
+        } else {
+            backend_log_permit(protocol, instance_id)
+        };
+        match permit {
             Some(suppressed) => tracing::warn!(
                 event = "database_backend_connection_failed",
                 %peer,
+                client,
+                via_node,
                 %source,
                 protocol,
                 instance_id,
@@ -529,6 +318,8 @@ fn log_connection_failure(
             ),
             None => tracing::debug!(
                 %peer,
+                client,
+                via_node,
                 %source,
                 protocol,
                 instance_id,
@@ -536,11 +327,11 @@ fn log_connection_failure(
             ),
         }
     } else {
-        tracing::warn!(%peer, %error, protocol, "database connection failed");
+        tracing::warn!(%peer, client, via_node, %error, protocol, "database connection failed");
     }
 }
 
-fn backend_log_permit(protocol: &str, instance_id: &str) -> Option<u64> {
+pub(crate) fn backend_log_permit(protocol: &str, instance_id: &str) -> Option<u64> {
     let now = StdInstant::now();
     let key = format!("{protocol}\0{instance_id}");
     let mut windows = BACKEND_FAILURE_LOGS
@@ -577,6 +368,79 @@ fn backend_log_permit(protocol: &str, instance_id: &str) -> Option<u64> {
                 },
             );
             Some(0)
+        }
+    }
+}
+
+/// The same one-warning-per-key-per-window limit for tether's failures (failed opens on the
+/// entry node, tunnelled failures on the data node), with one shared window for the keys
+/// that do not fit once the table is full.
+pub(crate) fn tether_log_permit(scope: &str, key: &str) -> Option<u64> {
+    let key = format!("{scope}\0{key}");
+    let mut windows = TETHER_FAILURE_LOGS
+        .get_or_init(|| Mutex::new(LogWindows::default()))
+        .lock();
+    windows.permit(StdInstant::now(), key, MAX_BACKEND_FAILURE_LOG_KEYS)
+}
+
+#[derive(Debug, Default)]
+struct LogWindows {
+    keys: HashMap<String, BackendFailureLogWindow>,
+    /// Shared by every key that does not fit in `keys`.
+    overflow: Option<BackendFailureLogWindow>,
+}
+
+impl LogWindows {
+    fn permit(&mut self, now: StdInstant, key: String, max_keys: usize) -> Option<u64> {
+        let expired = |window: &BackendFailureLogWindow| {
+            now.duration_since(window.last_logged) >= BACKEND_FAILURE_WARNING_INTERVAL
+        };
+        if self.keys.len() >= max_keys && !self.keys.contains_key(&key) {
+            self.keys.retain(|_, window| !expired(window));
+            if self.keys.len() >= max_keys {
+                // Too many distinct keys to track each: they share one window, so a flood of
+                // new keys cannot log on every failure either.
+                match &mut self.overflow {
+                    Some(window) if !expired(window) => {
+                        window.suppressed = window.suppressed.saturating_add(1);
+                    }
+                    window => {
+                        let suppressed = window.as_ref().map_or(0, |window| window.suppressed);
+                        tracing::warn!(
+                            suppressed_since_last_warning = suppressed,
+                            "many distinct failing peers or backends; individual failures are suppressed"
+                        );
+                        *window = Some(BackendFailureLogWindow {
+                            last_logged: now,
+                            suppressed: 0,
+                        });
+                    }
+                }
+                return None;
+            }
+        }
+
+        match self.keys.get_mut(&key) {
+            Some(window) if !expired(window) => {
+                window.suppressed = window.suppressed.saturating_add(1);
+                None
+            }
+            Some(window) => {
+                let suppressed = window.suppressed;
+                window.last_logged = now;
+                window.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                self.keys.insert(
+                    key,
+                    BackendFailureLogWindow {
+                        last_logged: now,
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
         }
     }
 }
@@ -619,6 +483,8 @@ fn is_disconnect(kind: ErrorKind) -> bool {
 mod tests {
     use super::*;
 
+    use tokio::net::TcpStream;
+
     #[tokio::test]
     async fn listener_applies_configured_connection_capacity() -> anyhow::Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -636,23 +502,22 @@ mod tests {
         );
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let task = tokio::spawn(run_listener(
-            ListenerRuntime {
-                listener,
-                bind: address.to_string(),
-                protocol: "mysql",
-                resolver,
-                tls: None,
-                limiter: GatewayConnectionLimiter::default(),
-                shutdown: supervisor.subscribe_shutdown(),
-                connections: supervisor.connection_tracker(),
-            },
+        let entry = ProtocolEntry::new(
+            "mysql",
             |mut client, _, _| async move {
                 client.write_all(b"x").await?;
                 let _ = client.read_u8().await;
                 Ok(())
             },
-        ));
+            resolver,
+            None,
+            GatewayConnectionLimiter::default(),
+            supervisor.connection_tracker(),
+        );
+        let task = tokio::spawn({
+            let shutdown = supervisor.subscribe_shutdown();
+            async move { run_listener(listener, &address.to_string(), entry, shutdown).await }
+        });
         let mut clients = Vec::new();
         for _ in 0..2 {
             let mut client = TcpStream::connect(address).await?;
@@ -680,6 +545,38 @@ mod tests {
         timeout(Duration::from_secs(5), task).await???;
 
         Ok(())
+    }
+
+    #[test]
+    fn the_backend_failure_log_keeps_its_original_full_table_behaviour() {
+        // A full table makes an unseen key log its own warning, as before tether existed.
+        for index in 0..MAX_BACKEND_FAILURE_LOG_KEYS {
+            let _ = backend_log_permit("full-table-test", &format!("instance-{index}"));
+        }
+        for _ in 0..3 {
+            assert_eq!(backend_log_permit("full-table-test", "never-seen"), Some(0));
+        }
+    }
+
+    #[test]
+    fn log_windows_share_one_overflow_window_when_the_table_is_full() {
+        let start = StdInstant::now();
+        let mut windows = LogWindows::default();
+        let key = |index: usize| format!("tether\0peer-{index}");
+        // Normal behaviour: the first failure of a key logs, repeats inside the window don't.
+        assert_eq!(windows.permit(start, key(0), 2), Some(0));
+        assert_eq!(windows.permit(start, key(0), 2), None);
+        assert_eq!(windows.permit(start, key(1), 2), Some(0));
+        // Table full: unseen keys no longer log individually, however many there are.
+        for index in 2..50 {
+            assert_eq!(windows.permit(start, key(index), 2), None, "key {index}");
+        }
+        assert_eq!(windows.overflow.as_ref().map(|w| w.suppressed), Some(47));
+        // Known keys are unaffected.
+        assert_eq!(windows.permit(start, key(1), 2), None);
+        // After the window, expired keys make room again.
+        let later = start + BACKEND_FAILURE_WARNING_INTERVAL + Duration::from_secs(1);
+        assert_eq!(windows.permit(later, key(60), 2), Some(0));
     }
 
     #[tokio::test(start_paused = true)]

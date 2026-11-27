@@ -1,5 +1,6 @@
+use super::ClientSocket;
 use secrecy::ExposeSecret;
-use tokio::{io::AsyncWrite, net::TcpStream};
+use tokio::io::AsyncWrite;
 use tokio_rustls::TlsAcceptor;
 
 use super::{
@@ -15,7 +16,7 @@ use crate::{
 };
 
 pub(super) async fn handle_mariadb_client(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
@@ -41,7 +42,7 @@ pub(super) async fn handle_mariadb_client(
 }
 
 pub(super) async fn handle_mysql_client(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
@@ -59,7 +60,7 @@ pub(super) async fn handle_mysql_client(
 }
 
 async fn prepare_mariadb_tunnel(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<Option<MysqlTunnel>, ListenerError> {
@@ -67,7 +68,7 @@ async fn prepare_mariadb_tunnel(
 }
 
 async fn prepare_mysql_tunnel(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<Option<MysqlTunnel>, ListenerError> {
@@ -75,7 +76,7 @@ async fn prepare_mysql_tunnel(
 }
 
 async fn prepare_mysql_connection(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
     mysql: bool,

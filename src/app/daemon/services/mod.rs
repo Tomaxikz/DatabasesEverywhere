@@ -141,6 +141,9 @@ impl BackgroundServices {
                 )
             })),
         );
+        // Every exit path ends here, so this is where the tether endpoint's close is joined:
+        // after the gateway drain and the lifecycle join, before any early error return.
+        gateway_supervisor.wait_background().await;
         let drained = |name: &str| {
             lifecycle
                 .iter()
@@ -240,6 +243,38 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_an_api_error_still_joins_the_background_closer() -> anyhow::Result<()> {
+        let (state, _directory) =
+            crate::subsystems::test_support::database(crate::config::Config::default()).await;
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closed);
+        let mut shutdown = state.gateway_supervisor.subscribe_shutdown();
+        // Stands in for the tether closer: it starts only once shutdown is signalled and takes
+        // a while to finish.
+        let closer = tokio::spawn(async move {
+            let _ = shutdown.wait_for(|stopping| *stopping).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        state
+            .gateway_supervisor
+            .track_background(closer)
+            .map_err(|_| anyhow::anyhow!("closer refused"))?;
+
+        let services = BackgroundServices {
+            maintenance: Vec::new(),
+            lifecycle: Vec::new(),
+        };
+        // `true`: the API server returned an error rather than a shutdown signal.
+        services.shutdown(&state, true).await?;
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "shutdown returned before the closer finished"
+        );
+        Ok(())
     }
 
     #[tokio::test]

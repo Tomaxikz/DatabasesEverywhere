@@ -11,12 +11,11 @@ use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
-    net::TcpStream,
     task::JoinSet,
 };
 use tokio_rustls::TlsAcceptor;
 
-use super::listener_io::accept_direct_tls;
+use super::{ClientSocket, Origin, listener_io::accept_direct_tls};
 use crate::{
     gateway::{
         listeners::{
@@ -89,10 +88,11 @@ impl AsyncWrite for PrefixedGatewayStream {
 }
 
 pub(super) async fn handle_qdrant_client(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
+    let origin = client.origin();
     let (client, h2) = client_handshake("qdrant", resolver.handshake_slots(), async move {
         let mut client = accept_direct_tls(client, tls).await?;
         let alpn = client.alpn_protocol().map(<[u8]>::to_vec);
@@ -116,7 +116,7 @@ pub(super) async fn handle_qdrant_client(
     if h2 {
         handle_qdrant_h2_client(client, resolver).await
     } else {
-        handle_qdrant_http1_client(client, resolver).await
+        handle_qdrant_http1_client(client, resolver, origin).await
     }
 }
 
@@ -224,10 +224,12 @@ type QdrantHttpBody = BoxBody<Bytes, QdrantHttpError>;
 async fn handle_qdrant_http1_client(
     client: PrefixedGatewayStream,
     resolver: RouteResolver,
+    origin: Option<Origin>,
 ) -> Result<(), ListenerError> {
     let service = service_fn(move |request| {
         let resolver = resolver.clone();
-        async move { proxy_qdrant_http1(request, resolver).await }
+        let origin = origin.clone();
+        async move { proxy_qdrant_http1(request, resolver, origin).await }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
@@ -245,7 +247,12 @@ async fn handle_qdrant_http1_client(
 async fn proxy_qdrant_http1(
     mut request: http::Request<Incoming>,
     resolver: RouteResolver,
+    origin: Option<Origin>,
 ) -> Result<http::Response<QdrantHttpBody>, Infallible> {
+    // Present only for tunnelled connections: the client the entry node asserted (unverified)
+    // and that node. Public connections' events do not carry the fields at all.
+    let client = origin.as_ref().and_then(Origin::client_field);
+    let via_node = origin.as_ref().and_then(Origin::via_field);
     let Ok(api_key) = qdrant::api_key_from_request(&request) else {
         return Ok(qdrant_http_error(
             http::StatusCode::UNAUTHORIZED,
@@ -264,6 +271,8 @@ async fn proxy_qdrant_http1(
         Err(error) => {
             tracing::error!(
                 instance_id = %target.instance_id,
+                client,
+                via_node,
                 %error,
                 "qdrant REST route has no valid private HTTP socket"
             );
@@ -275,6 +284,8 @@ async fn proxy_qdrant_http1(
         Err(error) => {
             tracing::warn!(
                 instance_id = %target.instance_id,
+                client,
+                via_node,
                 %error,
                 "qdrant REST backend connection failed"
             );
@@ -288,6 +299,8 @@ async fn proxy_qdrant_http1(
             Err(error) => {
                 tracing::warn!(
                     instance_id = %target.instance_id,
+                    client,
+                    via_node,
                     %error,
                     "qdrant REST backend HTTP handshake failed"
                 );
@@ -315,6 +328,8 @@ async fn proxy_qdrant_http1(
         Err(error) => {
             tracing::warn!(
                 instance_id = %target.instance_id,
+                client,
+                via_node,
                 %error,
                 "qdrant REST request failed"
             );
@@ -574,7 +589,7 @@ mod tests {
         let address = listener.local_addr()?;
         let gateway = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept should succeed");
-            handle_qdrant_client(stream, resolver, None)
+            handle_qdrant_client(stream.into(), resolver, None)
                 .await
                 .expect("handle qdrant client should succeed");
         });

@@ -1,4 +1,4 @@
-use tokio::net::TcpStream;
+use super::ClientSocket;
 use tokio_rustls::TlsAcceptor;
 
 use super::{
@@ -8,7 +8,7 @@ use super::{
 use crate::gateway::{resolver::RouteResolver, tunnel};
 
 pub(super) async fn handle_redis_client(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
@@ -36,7 +36,7 @@ pub(super) async fn handle_redis_client(
 }
 
 pub(super) async fn handle_valkey_client(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
@@ -64,7 +64,7 @@ pub(super) async fn handle_valkey_client(
 }
 
 async fn prepare_resp_tunnel(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
     valkey: bool,

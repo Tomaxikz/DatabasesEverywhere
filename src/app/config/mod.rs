@@ -15,6 +15,7 @@ mod security;
 mod sensitive;
 #[cfg(test)]
 mod tests;
+mod tether;
 pub mod validate;
 
 pub use allocation::AllocationConfig;
@@ -33,6 +34,7 @@ pub use paths::PathConfig;
 pub use scheduler::ImportExportSchedulerConfig;
 pub use security::{PidsLimitConfig, RemoteImportSecurityConfig, SecurityConfig};
 pub use sensitive::SensitiveString;
+pub use tether::{TETHER_PROTOCOLS, TetherConfig, TetherForwardConfig, TetherPeerConfig};
 
 use std::{ops::Deref, sync::Arc};
 
@@ -69,6 +71,7 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub images: ImageConfig,
     pub paths: PathConfig,
+    pub tether: TetherConfig,
 }
 
 impl Default for Config {
@@ -98,6 +101,7 @@ impl Default for Config {
             daemon: DaemonConfig::default(),
             images: ImageConfig::default(),
             paths: PathConfig::default(),
+            tether: TetherConfig::default(),
         }
     }
 }

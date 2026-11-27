@@ -21,7 +21,7 @@ use crate::{
     },
     gateway::{
         listeners, resolver::RouteResolver, security::GatewayConnectionLimiter,
-        supervisor::GatewaySupervisor,
+        supervisor::GatewaySupervisor, tether::Dispatch,
     },
     server::{jobs::import_export::ImportExportJobs, state::InstanceStore},
     subsystems::instances::progress::InstallProgressStore,
@@ -61,7 +61,6 @@ pub(super) struct PreparedGatewayListener {
     bind: String,
     listener: TcpListener,
     tls: Option<tokio_rustls::TlsAcceptor>,
-    limiter: GatewayConnectionLimiter,
 }
 
 impl PreparedGatewayListener {
@@ -69,7 +68,6 @@ impl PreparedGatewayListener {
         kind: GatewayListenerKind,
         bind: String,
         tls: Option<tokio_rustls::TlsAcceptor>,
-        limiter: GatewayConnectionLimiter,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(&bind)
             .await
@@ -79,133 +77,7 @@ impl PreparedGatewayListener {
             bind,
             listener,
             tls,
-            limiter,
         })
-    }
-
-    async fn run(
-        self,
-        resolver: RouteResolver,
-        shutdown: tokio::sync::watch::Receiver<bool>,
-        connections: crate::gateway::supervisor::GatewayConnectionTracker,
-    ) -> Result<(), listeners::ListenerError> {
-        let Self {
-            kind,
-            bind,
-            listener,
-            tls,
-            limiter,
-        } = self;
-        match kind {
-            GatewayListenerKind::Postgres => {
-                listeners::run_postgres_listener(
-                    listener,
-                    &bind,
-                    resolver,
-                    tls,
-                    limiter,
-                    shutdown,
-                    connections,
-                )
-                .await
-            }
-            GatewayListenerKind::Redis => {
-                listeners::run_redis_listener(
-                    listener,
-                    &bind,
-                    resolver,
-                    tls,
-                    limiter,
-                    shutdown,
-                    connections,
-                )
-                .await
-            }
-            GatewayListenerKind::Valkey => {
-                listeners::run_valkey_listener(
-                    listener,
-                    &bind,
-                    resolver,
-                    tls,
-                    limiter,
-                    shutdown,
-                    connections,
-                )
-                .await
-            }
-            GatewayListenerKind::Mariadb => {
-                listeners::run_mariadb_listener(
-                    listener,
-                    &bind,
-                    resolver,
-                    tls,
-                    limiter,
-                    shutdown,
-                    connections,
-                )
-                .await
-            }
-            GatewayListenerKind::Mysql => {
-                listeners::run_mysql_listener(
-                    listener,
-                    &bind,
-                    resolver,
-                    tls,
-                    limiter,
-                    shutdown,
-                    connections,
-                )
-                .await
-            }
-            GatewayListenerKind::Mongodb => {
-                listeners::run_mongodb_listener(
-                    listener,
-                    &bind,
-                    resolver,
-                    tls,
-                    limiter,
-                    shutdown,
-                    connections,
-                )
-                .await
-            }
-            GatewayListenerKind::Clickhouse => {
-                listeners::run_clickhouse_listener(
-                    listener,
-                    &bind,
-                    resolver,
-                    tls,
-                    limiter,
-                    shutdown,
-                    connections,
-                )
-                .await
-            }
-            GatewayListenerKind::ClickhouseHttp => {
-                listeners::run_clickhouse_http_listener(
-                    listener,
-                    &bind,
-                    resolver,
-                    tls,
-                    limiter,
-                    shutdown,
-                    connections,
-                )
-                .await
-            }
-            GatewayListenerKind::Qdrant => {
-                listeners::run_qdrant_listener(
-                    listener,
-                    &bind,
-                    resolver,
-                    tls,
-                    limiter,
-                    shutdown,
-                    connections,
-                )
-                .await
-            }
-        }
     }
 }
 
@@ -216,7 +88,7 @@ pub(super) async fn start_gateway_listeners(
     supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
     let connection_limit = config.security.db_connection_limit_per_minute;
-    let expected = usize::from(config.postgres.enabled)
+    let public = usize::from(config.postgres.enabled)
         + usize::from(config.redis.enabled)
         + usize::from(config.valkey.enabled)
         + usize::from(config.mariadb.enabled)
@@ -224,37 +96,81 @@ pub(super) async fn start_gateway_listeners(
         + usize::from(config.mongodb.enabled)
         + usize::from(config.clickhouse.enabled) * 2
         + usize::from(config.qdrant.enabled);
+    // Tether adds one task per forward and, when some peer may open streams to this node,
+    // the task that accepts them. Tunnelled connections use the public listeners' handlers
+    // in process, so there are no further sockets.
+    let tether = &config.tether;
+    let expected = if tether.enabled {
+        public + tether.forwards.len() + usize::from(tether.peers.iter().any(|peer| peer.inbound))
+    } else {
+        public
+    };
     if !supervisor.begin(expected) {
         anyhow::bail!("daemon shutdown started before gateway listeners were bound");
     }
 
-    let prepared = prepare_gateway_listeners(config, connection_limit).await;
-    let prepared = match prepared {
+    // One per-client-IP limiter for everything client-facing: public listeners, forwards and
+    // tunnelled connections (keyed by the client the entry node asserts).
+    let limiter = GatewayConnectionLimiter::with_active_limit(
+        connection_limit,
+        config.daemon.limits.gateway_connections_per_peer,
+    );
+    let prepared = match prepare_gateway_listeners(config).await {
         Ok(prepared) => prepared,
         Err(error) => {
             supervisor.fail_and_stop("gateway listener bind failed");
             return Err(error);
         }
     };
-    if supervisor.is_stopping() {
-        anyhow::bail!("daemon shutdown started while gateway listeners were binding");
-    }
     let resolver = RouteResolver::new(
         store,
         resources,
         crate::gateway::protocols::qdrant::QdrantRouteKey::new(config.websocket_jwt_secret()),
         supervisor.tenant_sessions(),
     );
-    let mut listeners = tokio::task::JoinSet::new();
+    // Each listener's entry is also what tether dispatches tunnelled connections to, so the
+    // two share one connection cap per protocol.
+    let mut dispatch = Dispatch::new();
+    let mut serving = Vec::new();
     for listener in prepared {
-        let protocol = listener.kind.as_str();
-        let resolver = resolver.clone();
+        let name = listener.kind.as_str();
+        let entry = listeners::protocol_entry(
+            name,
+            resolver.clone(),
+            listener.tls.clone(),
+            limiter.clone(),
+            supervisor.connection_tracker(),
+        )
+        .with_context(|| format!("no handler for {name}"))?;
+        dispatch.insert(name, entry.clone());
+        serving.push((listener, entry));
+    }
+    let tether = if config.tether.enabled {
+        match crate::gateway::tether::bind(config, dispatch, limiter).await {
+            Ok(tether) => Some(tether),
+            Err(error) => {
+                supervisor.fail_and_stop("tether bind failed");
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if supervisor.is_stopping() {
+        anyhow::bail!("daemon shutdown started while gateway listeners were binding");
+    }
+    let mut listeners = tokio::task::JoinSet::new();
+    for (listener, entry) in serving {
+        let protocol = listener.kind.as_str().to_string();
         let shutdown = supervisor.subscribe_shutdown();
-        let connections = supervisor.connection_tracker();
         listeners.spawn(async move {
-            let result = listener.run(resolver, shutdown, connections).await;
+            let result =
+                listeners::run_listener(listener.listener, &listener.bind, entry, shutdown).await;
             (protocol, result)
         });
+    }
+    if let Some(tether) = tether {
+        tether.spawn(&supervisor, &mut listeners).await;
     }
     supervisor.mark_ready();
 
@@ -290,13 +206,8 @@ type GatewayProtocolListeners<'a> = (bool, bool, &'a [(GatewayListenerKind, &'a 
 
 pub(super) async fn prepare_gateway_listeners(
     config: &Config,
-    connection_limit: u32,
 ) -> anyhow::Result<Vec<PreparedGatewayListener>> {
     let mut prepared = Vec::new();
-    let limiter = GatewayConnectionLimiter::with_active_limit(
-        connection_limit,
-        config.daemon.limits.gateway_connections_per_peer,
-    );
     let protocols: [GatewayProtocolListeners<'_>; 8] = [
         (
             config.postgres.enabled,
@@ -351,10 +262,7 @@ pub(super) async fn prepare_gateway_listeners(
         }
         let tls = listener_tls(tls_enabled, config)?;
         for &(kind, bind) in endpoints {
-            prepared.push(
-                PreparedGatewayListener::bind(kind, bind.clone(), tls.clone(), limiter.clone())
-                    .await?,
-            );
+            prepared.push(PreparedGatewayListener::bind(kind, bind.clone(), tls.clone()).await?);
         }
     }
     Ok(prepared)
@@ -707,4 +615,174 @@ pub(super) fn startup_banner() -> String {
         release = env!("CARGO_PKG_VERSION"),
         api = crate::subsystems::system::API_VERSION,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loopback_config(tether: bool) -> Config {
+        let mut config = Config::default();
+        for listener in [
+            &mut config.postgres,
+            &mut config.mariadb,
+            &mut config.mysql,
+            &mut config.redis,
+            &mut config.valkey,
+            &mut config.mongodb,
+            &mut config.qdrant,
+        ] {
+            *listener = crate::config::ListenerConfig::disabled("127.0.0.1:0".to_string());
+        }
+        config.postgres.enabled = true;
+        config.redis.enabled = true;
+        config.clickhouse = crate::config::ClickhouseConfig::enabled(
+            "127.0.0.1:0".to_string(),
+            "127.0.0.1:0".to_string(),
+        );
+        config.tether.enabled = tether;
+        config
+    }
+
+    #[tokio::test]
+    async fn tunnelled_connections_add_no_listening_sockets() -> anyhow::Result<()> {
+        // Every TCP listener the gateway binds comes out of this one function; tether adds
+        // forward listeners elsewhere and none per protocol, whether enabled or not.
+        let plain = prepare_gateway_listeners(&loopback_config(false)).await?;
+        let linked = prepare_gateway_listeners(&loopback_config(true)).await?;
+        assert_eq!(plain.len(), 4);
+        assert_eq!(linked.len(), plain.len());
+        let mut names = linked
+            .iter()
+            .map(|listener| listener.kind.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["clickhouse", "clickhouse_http", "postgres", "redis"]
+        );
+        for listener in &linked {
+            assert!(crate::config::TETHER_PROTOCOLS.contains(&listener.kind.as_str()));
+        }
+        Ok(())
+    }
+
+    /// A tether-enabled config with one peer, one forward and no protocol listeners.
+    fn tether_config(
+        files: &crate::gateway::tether::test_support::IdentityFiles,
+        forward_bind: String,
+        udp_bind: String,
+    ) -> Config {
+        let mut config = loopback_config(true);
+        config.postgres.enabled = false;
+        config.redis.enabled = false;
+        config.clickhouse.enabled = false;
+        config.tether.bind = udp_bind;
+        config.tether.node = "node-a".to_string();
+        config.tether.ca = files.ca.clone();
+        config.tether.cert = files.cert.clone();
+        config.tether.key = files.key.clone();
+        config.tether.peers = vec![crate::config::TetherPeerConfig {
+            node: "node-b".to_string(),
+            address: "127.0.0.1:7100".to_string(),
+            inbound: false,
+        }];
+        config.tether.forwards = vec![crate::config::TetherForwardConfig {
+            bind: forward_bind,
+            node: "node-b".to_string(),
+            protocol: "postgres".to_string(),
+        }];
+        config
+    }
+
+    async fn start(config: &Config, supervisor: &GatewaySupervisor) -> anyhow::Result<()> {
+        start_gateway_listeners(
+            config,
+            InstanceStore::default(),
+            crate::subsystems::monitoring::resources::ResourceCache::default(),
+            supervisor.clone(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn expected_listeners_count_public_listeners_forwards_and_the_receiver()
+    -> anyhow::Result<()> {
+        let authority = crate::gateway::tether::test_support::authority();
+        let files = authority.files("node-a", authority.pem());
+
+        // Only a forward: 1.
+        let config = tether_config(&files, "127.0.0.1:0".to_string(), "127.0.0.1:0".to_string());
+        let supervisor = GatewaySupervisor::new();
+        start(&config, &supervisor).await?;
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.status, "ready");
+        assert_eq!(
+            (snapshot.expected_listeners, snapshot.ready_listeners),
+            (1, 1)
+        );
+        supervisor.shutdown();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            supervisor.wait_background(),
+        )
+        .await?;
+
+        // Two public listeners, a forward, and an inbound peer (so a receiver): 2 + 1 + 1.
+        let mut config =
+            tether_config(&files, "127.0.0.1:0".to_string(), "127.0.0.1:0".to_string());
+        config.postgres.enabled = true;
+        config.redis.enabled = true;
+        config.tether.peers[0].inbound = true;
+        let supervisor = GatewaySupervisor::new();
+        start(&config, &supervisor).await?;
+        assert_eq!(supervisor.snapshot().expected_listeners, 4);
+        assert!(supervisor.is_ready());
+        supervisor.shutdown();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            supervisor.wait_background(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_forward_that_cannot_bind_fails_startup_before_the_endpoint_is_bound()
+    -> anyhow::Result<()> {
+        let authority = crate::gateway::tether::test_support::authority();
+        let files = authority.files("node-a", authority.pem());
+        // Both addresses stay held for the whole test. If the endpoint were bound before the
+        // forwards, startup would fail on the held UDP address instead, with another message.
+        let occupied_tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let occupied_udp = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let mut config = tether_config(
+            &files,
+            occupied_tcp.local_addr()?.to_string(),
+            occupied_udp.local_addr()?.to_string(),
+        );
+        config.postgres.enabled = true;
+
+        let supervisor = GatewaySupervisor::new();
+        let error = start(&config, &supervisor)
+            .await
+            .expect_err("the forward address is taken");
+        assert!(format!("{error:#}").contains("tether forward"), "{error:#}");
+        assert!(!supervisor.is_ready());
+        assert_eq!(supervisor.snapshot().status, "failed");
+        assert_eq!(supervisor.snapshot().ready_listeners, 0);
+
+        // With the forward free, the held UDP address is what stops startup.
+        config.tether.forwards[0].bind = "127.0.0.1:0".to_string();
+        let supervisor = GatewaySupervisor::new();
+        let error = start(&config, &supervisor)
+            .await
+            .expect_err("the endpoint address is taken");
+        assert!(
+            format!("{error:#}").contains("tether endpoint"),
+            "{error:#}"
+        );
+        assert_eq!(supervisor.snapshot().status, "failed");
+        Ok(())
+    }
 }

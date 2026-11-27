@@ -13,6 +13,7 @@ mod network;
 mod secrets;
 #[cfg(test)]
 mod tests;
+mod tether;
 
 use backups::validate_backups;
 use disk::validate_disk;
@@ -24,6 +25,7 @@ use network::{
     validate_security,
 };
 use secrets::{validate_api_token, validate_jwt_signing_key};
+use tether::validate_tether;
 
 const MAX_REMOTE_IMPORT_JOBS: usize = 64;
 const MAX_REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS: u64 = 5 * 60;
@@ -63,6 +65,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_clickhouse(&config.clickhouse, &config.tls)?;
     validate_listener("qdrant", &config.qdrant, &config.tls)?;
     validate_security(&config.security)?;
+    validate_tether(&config.tether)?;
     validate_allocation(&config.allocation)?;
     validate_disk(&config.disk)?;
     if config.artifacts.retention_keep_latest == 0 {

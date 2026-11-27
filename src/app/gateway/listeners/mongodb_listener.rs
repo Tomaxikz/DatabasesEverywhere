@@ -1,4 +1,5 @@
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+use super::ClientSocket;
+use tokio::io::AsyncWriteExt;
 use tokio_rustls::TlsAcceptor;
 
 use super::{
@@ -14,7 +15,7 @@ const MAX_HELLO_MESSAGES: usize = 8;
 const AUTHENTICATION_FAILED_CODE: i32 = 18;
 
 pub(super) async fn handle_mongodb_client(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {

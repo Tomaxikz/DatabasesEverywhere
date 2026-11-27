@@ -1,11 +1,8 @@
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 
 use super::{
-    GatewayStream, ListenerError, MAX_ROUTING_HANDSHAKE_BYTES, client_handshake,
+    ClientSocket, GatewayStream, ListenerError, MAX_ROUTING_HANDSHAKE_BYTES, client_handshake,
     listener_io::proxy_postgres_session,
 };
 use crate::{
@@ -17,7 +14,7 @@ use crate::{
 const TLS_HANDSHAKE_RECORD_TYPE: u8 = 0x16;
 
 pub(super) async fn handle_postgres_client(
-    client: TcpStream,
+    client: ClientSocket,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
@@ -167,7 +164,7 @@ pub(super) async fn handle_postgres_client(
         })
 }
 
-async fn postgres_wants_direct_tls(client: &TcpStream) -> Result<bool, std::io::Error> {
+async fn postgres_wants_direct_tls(client: &ClientSocket) -> Result<bool, std::io::Error> {
     let mut first = [0_u8; 1];
     let read = client.peek(&mut first).await?;
     Ok(read == 1 && first[0] == TLS_HANDSHAKE_RECORD_TYPE)

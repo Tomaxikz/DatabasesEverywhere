@@ -7,7 +7,7 @@ use hyper::{Response, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, UnixListener},
+    net::{TcpListener, TcpStream, UnixListener},
 };
 
 use super::*;
@@ -89,7 +89,7 @@ async fn http_streams_split_chunked_uploads_and_rejects_wrong_tenant_routes() ->
                 socket = gateway.accept() => {
                     let (socket, _) = socket.expect("http streams split chunked uploads and rejects wrong tenant routes should succeed");
                     let routes = routes.clone();
-                    clients.spawn(async move { handle_clickhouse_http(socket, routes, None).await });
+                    clients.spawn(async move { handle_clickhouse_http(socket.into(), routes, None).await });
                 }
                 _ = clients.join_next(), if !clients.is_empty() => {}
             }
@@ -157,10 +157,14 @@ async fn native_route_denials_use_database_errors_instead_of_connection_resets()
             let (socket, _) = listener.accept().await.expect("accept should succeed");
             let routes = resolver(InstanceStore::default());
             match protocol {
-                Protocol::Clickhouse => handle_clickhouse_client(socket, routes, None).await,
+                Protocol::Clickhouse => handle_clickhouse_client(socket.into(), routes, None).await,
                 Protocol::Postgres => {
-                    super::super::postgres_listener::handle_postgres_client(socket, routes, None)
-                        .await
+                    super::super::postgres_listener::handle_postgres_client(
+                        socket.into(),
+                        routes,
+                        None,
+                    )
+                    .await
                 }
                 _ => unreachable!(),
             }
