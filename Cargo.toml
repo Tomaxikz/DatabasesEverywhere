@@ -4,8 +4,19 @@ version = "1.0.0"
 edition = "2024"
 
 [workspace]
-members = ["tools/helper-packer", "tools/release-builder"]
+members = ["tether", "tools/helper-packer", "tools/release-builder"]
 resolver = "3"
+
+# Dependencies used by more than one workspace crate are declared once here and
+# inherited with `workspace = true`, so their versions cannot drift apart.
+[workspace.dependencies]
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs"] }
+rustls-pki-types = { version = "1.16.0", features = ["std"] }
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = "1.54.1"
+tracing = "0.1.44"
+zstd = { version = "0.14.4", default-features = false }
 
 [lib]
 path = "src/app/mod.rs"
@@ -46,8 +57,8 @@ libc = "0.2.191"
 notify = { version = "8.2.2", default-features = false }
 secrecy = { version = "0.10.3", features = ["serde"] }
 percent-encoding = "2.3.2"
-rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs"] }
-rustls-pki-types = { version = "1.16.0", features = ["std"] }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 rustix = { version = "1.1.6", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
@@ -55,19 +66,19 @@ yaml_serde = "0.10.7"
 serde_ignored = "0.1.14"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "json", "multipart", "stream"] }
 sha1 = "0.11.0"
-sha2 = "0.11.1"
+sha2 = { workspace = true }
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 subtle = "2.6.1"
 flate2 = "1.1.11"
 tempfile = "3.27.0"
 tar = { version = "0.4.46", default-features = false }
-thiserror = "2.0.21"
+thiserror = { workspace = true }
 time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tokio-util = { version = "0.7.20", features = ["io", "io-util", "rt"] }
 tower-http = { version = "0.7.1", features = ["cors", "timeout", "trace"] }
-tracing = "0.1.44"
+tracing = { workspace = true }
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.3", features = ["v4"] }
@@ -75,7 +86,7 @@ walkdir = "2.5.0"
 webpki-root-certs = "1.0.12"
 webpki-roots = "1.0.12"
 zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2"] }
-zstd = { version = "0.14.4", default-features = false }
+zstd = { workspace = true }
 governor = "0.10.4"
 procfs = { version = "0.18.0", default-features = false }
 backon = "1.6.0"
@@ -86,8 +97,8 @@ utoipa = { version = "6.0.0", features = ["preserve_order", "preserve_path_order
 parking_lot = "0.12.5"
 
 [build-dependencies]
-sha2 = "0.11.1"
-zstd = { version = "0.14.4", default-features = false }
+sha2 = { workspace = true }
+zstd = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-raw-sys = { version = "0.12.1", features = ["btrfs", "ioctl"] }
@@ -95,7 +106,7 @@ linux-raw-sys = { version = "0.12.1", features = ["btrfs", "ioctl"] }
 [dev-dependencies]
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 criterion = { version = "0.8.2", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
-tokio = { version = "1.54.1", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 [[bench]]

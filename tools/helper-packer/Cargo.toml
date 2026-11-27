@@ -5,4 +5,5 @@ edition = "2024"
 publish = false
 
 [dependencies]
-zstd = "0.14.4"
+# The packer keeps zstd's default features, as it had before the version moved to the workspace table.
+zstd = { workspace = true, default-features = true }

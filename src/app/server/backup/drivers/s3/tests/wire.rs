@@ -323,27 +323,34 @@ async fn resume_requires_one_strong_quoted_etag() -> anyhow::Result<()> {
 
 #[test]
 fn signer_trace_contains_only_the_payload_digest() -> anyhow::Result<()> {
-    let trace = tempfile::NamedTempFile::new()?;
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_ansi(false)
-        .with_writer(trace.reopen()?)
-        .finish();
     let body = Bytes::from_static(b"private backup payload");
     let digest = hex::encode(Sha256::digest(&body));
-    let request =
-        http::Request::put("https://bkt.example/archive").body(signing::ReplayBody::new(body))?;
-    tracing::subscriber::with_default(subscriber, || {
-        signing::sign_request(
-            request,
-            &client::credentials(&config()).expect("config should succeed"),
-            "us-east-1",
-            UNIX_EPOCH,
-        )
-        .expect("config should succeed")
-    });
-    let log = std::fs::read_to_string(trace.path())?;
-    assert!(log.contains(&format!("Precomputed(\"{digest}\")")));
+    let expected = format!("Precomputed(\"{digest}\")");
+    let credentials = client::credentials(&config()).expect("config should succeed");
+    let mut log = String::new();
+    // Callsite interest is process-wide and other test threads install and drop their own
+    // subscribers, so one attempt can find the signer's trace callsite disabled. Sign until
+    // the trace line is captured; the payload must never appear in any attempt.
+    for _ in 0..200 {
+        let trace = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(trace.reopen()?)
+            .finish();
+        let request = http::Request::put("https://bkt.example/archive")
+            .body(signing::ReplayBody::new(body.clone()))?;
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            signing::sign_request(request, &credentials, "us-east-1", UNIX_EPOCH)
+                .expect("signing should succeed")
+        });
+        log.push_str(&std::fs::read_to_string(trace.path())?);
+        if log.contains(&expected) {
+            break;
+        }
+    }
+    assert!(log.contains(&expected));
     assert!(!log.contains("private backup payload"));
 
     Ok(())

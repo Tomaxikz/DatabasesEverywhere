@@ -13,6 +13,6 @@ while IFS= read -r -d '' source_file; do
       "$relative_path" "$line_count" "$maximum_lines" >&2
     failed=1
   fi
-done < <(find "$repository_root/src" -type f -name '*.rs' -print0)
+done < <(find "$repository_root/src" "$repository_root/tether/src" -type f -name '*.rs' -print0)
 
 exit "$failed"
