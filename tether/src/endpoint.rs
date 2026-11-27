@@ -23,7 +23,10 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub use config::Config;
+pub use config::{
+    Config, MAX_ACCEPT_BACKLOG_LIMIT, MAX_CONNECTIONS_LIMIT, MAX_DURATION,
+    MAX_STREAMS_PER_PEER_LIMIT, MAX_WINDOW, MIN_STREAM_WINDOW,
+};
 pub use incoming::Incoming;
 pub use stream::Stream;
 
